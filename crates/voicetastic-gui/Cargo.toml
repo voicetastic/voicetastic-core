@@ -1,0 +1,23 @@
+[package]
+name = "voicetastic-gui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Voicetastic desktop GUI"
+
+[[bin]]
+name = "voicetastic-gui"
+path = "src/main.rs"
+
+[dependencies]
+voicetastic-core = { workspace = true }
+tokio = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }

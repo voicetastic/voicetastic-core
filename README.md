@@ -1,93 +1,96 @@
-# voicetastic-desktop
+# Voicetastic Desktop
 
+Linux desktop companion for [Voicetastic](https://github.com/nicogig/Voicetastic) (Android).
+Communicates with Meshtastic radios over BLE or USB serial, providing text
+messaging and AMR-NB voice message exchange — wire-compatible with the Android app.
 
+## Workspace Layout
 
-## Getting started
+| Crate | Description |
+|---|---|
+| `voicetastic-core` | Shared library: BLE + serial transport, Meshtastic protobuf codec, voice chunker/assembler, `MeshService` façade |
+| `voicetastic-cli` | CLI (`clap`): `scan`, `text send/listen`, `voice send/listen`, `device reboot/factory-reset` |
+| `voicetastic-gui` | GUI (`eframe`/`egui`): three-tab app (Devices, Chat, Settings) |
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## Prerequisites
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+- **Rust 1.80+** (edition 2024 workspace)
+- **Linux** with BlueZ (D-Bus BLE stack)
+- **protoc** (Protocol Buffers compiler)
 
-## Add your files
+```bash
+# Arch
+sudo pacman -S bluez bluez-utils protobuf
 
-* [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
-
+# Debian / Ubuntu
+sudo apt install bluez libdbus-1-dev protobuf-compiler
 ```
-cd existing_repo
-git remote add origin https://git.cha-sam.re/acarteron/voicetastic-desktop.git
-git branch -M main
-git push -uf origin main
+
+### BLE permissions
+
+Either run as root, or grant your user the `net_admin` capability / add to the
+`bluetooth` group, then ensure the BlueZ D-Bus policy allows access:
+
+```bash
+sudo usermod -aG bluetooth $USER
+# or, per-binary:
+sudo setcap cap_net_admin+ep target/debug/voicetastic-cli
 ```
 
-## Integrate with your tools
+## Build
 
-* [Set up project integrations](https://git.cha-sam.re/acarteron/voicetastic-desktop/-/settings/integrations)
+```bash
+cargo build --workspace
+```
 
-## Collaborate with your team
+## Run
 
-* [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### CLI
 
-## Test and Deploy
+The `--device` flag accepts either a BLE address (`AA:BB:CC:DD:EE:FF`) or a
+serial port path (`/dev/ttyUSB0`, `/dev/ttyACM0`).
 
-Use the built-in continuous integration in GitLab.
+```bash
+# Scan for nearby Meshtastic devices (BLE + serial ports)
+cargo run -p voicetastic-cli -- scan
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+# Connect via BLE
+cargo run -p voicetastic-cli -- --device AA:BB:CC:DD:EE:FF text send --message "Hello mesh!"
 
-***
+# Connect via USB serial
+cargo run -p voicetastic-cli -- --device /dev/ttyUSB0 text send --message "Hello mesh!"
 
-# Editing this README
+# Listen for incoming texts
+cargo run -p voicetastic-cli -- --device AA:BB:CC:DD:EE:FF text listen
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# Send a voice message (.amr file)
+cargo run -p voicetastic-cli -- --device AA:BB:CC:DD:EE:FF voice send --file msg.amr
 
-## Suggestions for a good README
+# Listen and save incoming voice messages
+cargo run -p voicetastic-cli -- --device AA:BB:CC:DD:EE:FF voice listen --out-dir ./received
+```
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### GUI
 
-## Name
-Choose a self-explaining name for your project.
+```bash
+cargo run -p voicetastic-gui
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Test
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+## Voice Protocol
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+Voice messages use AMR-NB (Adaptive Multi-Rate Narrowband) codec at 8 kHz.
+Audio is chunked into ≤ 200-byte Meshtastic data packets sent over
+`PortNum::PRIVATE_APP` with a 4-byte header (`msgId · chunkIndex · totalChunks · bitrateIndex`).
+The desktop app reads/writes standard `.amr` files — no live microphone support
+in this version.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+MIT

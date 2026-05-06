@@ -1,0 +1,32 @@
+[package]
+name = "voicetastic-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared core library for voicetastic-desktop: BLE transport, Meshtastic protobuf I/O, voice protocol."
+
+[dependencies]
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+btleplug = { workspace = true }
+uuid = { workspace = true }
+tokio-serial = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
