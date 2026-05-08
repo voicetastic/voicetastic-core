@@ -18,7 +18,14 @@ use tracing::warn;
 
 use crate::ble::{BleManager, CONFIG_REQUEST_DELAY, Connection, DiscoveredDevice};
 use crate::error::Result;
-use crate::proto::{MyNodeInfo, NodeInfo, to_radio};
+use crate::proto::{
+    Channel, DeviceMetadata, MyNodeInfo, NodeInfo, User,
+    config::{
+        BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
+        PowerConfig,
+    },
+    to_radio,
+};
 use crate::serial::SerialConnection;
 
 use transport::Transport;
@@ -41,6 +48,18 @@ struct Inner {
     incoming_text_tx: broadcast::Sender<IncomingText>,
     incoming_data_tx: broadcast::Sender<IncomingData>,
     next_packet_id: Mutex<u32>,
+    // Configuration sections, each updated when the device emits its
+    // matching `Config` chunk during the want-config burst.
+    pub(super) lora_tx: watch::Sender<Option<LoRaConfig>>,
+    pub(super) device_tx: watch::Sender<Option<DeviceConfig>>,
+    pub(super) position_tx: watch::Sender<Option<PositionConfig>>,
+    pub(super) power_tx: watch::Sender<Option<PowerConfig>>,
+    pub(super) network_tx: watch::Sender<Option<NetworkConfig>>,
+    pub(super) display_tx: watch::Sender<Option<DisplayConfig>>,
+    pub(super) bluetooth_tx: watch::Sender<Option<BluetoothConfig>>,
+    pub(super) channels_tx: watch::Sender<Vec<Channel>>,
+    pub(super) owner_tx: watch::Sender<Option<User>>,
+    pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
 }
 
 impl MeshService {
@@ -52,6 +71,16 @@ impl MeshService {
         let (config_complete_tx, _) = broadcast::channel(8);
         let (incoming_text_tx, _) = broadcast::channel(64);
         let (incoming_data_tx, _) = broadcast::channel(128);
+        let (lora_tx, _) = watch::channel(None);
+        let (device_tx, _) = watch::channel(None);
+        let (position_tx, _) = watch::channel(None);
+        let (power_tx, _) = watch::channel(None);
+        let (network_tx, _) = watch::channel(None);
+        let (display_tx, _) = watch::channel(None);
+        let (bluetooth_tx, _) = watch::channel(None);
+        let (channels_tx, _) = watch::channel(Vec::new());
+        let (owner_tx, _) = watch::channel(None);
+        let (metadata_tx, _) = watch::channel(None);
         Ok(Self {
             inner: Arc::new(Inner {
                 ble,
@@ -63,6 +92,16 @@ impl MeshService {
                 incoming_text_tx,
                 incoming_data_tx,
                 next_packet_id: Mutex::new(1),
+                lora_tx,
+                device_tx,
+                position_tx,
+                power_tx,
+                network_tx,
+                display_tx,
+                bluetooth_tx,
+                channels_tx,
+                owner_tx,
+                metadata_tx,
             }),
         })
     }
@@ -91,6 +130,61 @@ impl MeshService {
     }
     pub fn subscribe_config_complete(&self) -> broadcast::Receiver<u32> {
         self.inner.config_complete_tx.subscribe()
+    }
+
+    pub fn watch_lora_config(&self) -> watch::Receiver<Option<LoRaConfig>> {
+        self.inner.lora_tx.subscribe()
+    }
+    pub fn watch_device_config(&self) -> watch::Receiver<Option<DeviceConfig>> {
+        self.inner.device_tx.subscribe()
+    }
+    pub fn watch_position_config(&self) -> watch::Receiver<Option<PositionConfig>> {
+        self.inner.position_tx.subscribe()
+    }
+    pub fn watch_power_config(&self) -> watch::Receiver<Option<PowerConfig>> {
+        self.inner.power_tx.subscribe()
+    }
+    pub fn watch_network_config(&self) -> watch::Receiver<Option<NetworkConfig>> {
+        self.inner.network_tx.subscribe()
+    }
+    pub fn watch_display_config(&self) -> watch::Receiver<Option<DisplayConfig>> {
+        self.inner.display_tx.subscribe()
+    }
+    pub fn watch_bluetooth_config(&self) -> watch::Receiver<Option<BluetoothConfig>> {
+        self.inner.bluetooth_tx.subscribe()
+    }
+    pub fn watch_channels(&self) -> watch::Receiver<Vec<Channel>> {
+        self.inner.channels_tx.subscribe()
+    }
+    pub fn watch_owner(&self) -> watch::Receiver<Option<User>> {
+        self.inner.owner_tx.subscribe()
+    }
+    pub fn watch_metadata(&self) -> watch::Receiver<Option<DeviceMetadata>> {
+        self.inner.metadata_tx.subscribe()
+    }
+
+    /// Local node number, if known. Required as `to=` for admin writes.
+    pub fn my_node_num(&self) -> Option<u32> {
+        self.inner
+            .my_info_tx
+            .borrow()
+            .as_ref()
+            .map(|i| i.my_node_num)
+    }
+
+    /// Re-request the entire configuration burst.
+    pub async fn refresh_config(&self) -> Result<()> {
+        // Clear local snapshots so callers can detect a fresh burst.
+        let _ = self.inner.lora_tx.send(None);
+        let _ = self.inner.device_tx.send(None);
+        let _ = self.inner.position_tx.send(None);
+        let _ = self.inner.power_tx.send(None);
+        let _ = self.inner.network_tx.send(None);
+        let _ = self.inner.display_tx.send(None);
+        let _ = self.inner.bluetooth_tx.send(None);
+        let _ = self.inner.channels_tx.send(Vec::new());
+        self.set_state(ConnectionState::Configuring);
+        self.send_want_config().await
     }
 
     /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).

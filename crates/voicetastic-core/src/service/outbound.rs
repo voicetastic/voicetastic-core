@@ -6,8 +6,11 @@ use prost::Message as _;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::ports::{BROADCAST_ADDR, PRIVATE_APP, TEXT_MESSAGE_APP};
-use crate::proto::{Data, MeshPacket, ToRadio, mesh_packet, to_radio};
+use crate::ports::{ADMIN_APP, BROADCAST_ADDR, PRIVATE_APP, TEXT_MESSAGE_APP};
+use crate::proto::{
+    AdminMessage, Channel, Config, Data, MeshPacket, Position, ToRadio, User, admin_message,
+    config, mesh_packet, to_radio,
+};
 
 use super::MeshService;
 use super::transport::Transport;
@@ -107,6 +110,86 @@ impl MeshService {
             *g = 1;
         }
         id
+    }
+
+    /// Send an [`AdminMessage`] payload to the local node on
+    /// [`ADMIN_APP`]. `to=` defaults to our own node number, which is the
+    /// only correct destination for config writes; if `my_node_num` is not
+    /// yet known the call returns [`Error::NotConnected`].
+    pub async fn send_admin(&self, payload: admin_message::PayloadVariant) -> Result<u32> {
+        let to = self.my_node_num().ok_or(Error::NotConnected)?;
+        let admin = AdminMessage {
+            payload_variant: Some(payload),
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(admin.encoded_len());
+        admin.encode(&mut bytes)?;
+        let id = self.next_id().await;
+        let pkt = MeshPacket {
+            from: 0,
+            to,
+            channel: 0,
+            id,
+            want_ack: true,
+            hop_limit: 0,
+            priority: mesh_packet::Priority::Reliable as i32,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+                portnum: ADMIN_APP as i32,
+                payload: bytes,
+                want_response: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        self.send_to_radio(to_radio::PayloadVariant::Packet(pkt))
+            .await?;
+        Ok(id)
+    }
+
+    /// Write a [`Config`] section (LoRa, Device, …) to the local node.
+    pub async fn write_config(&self, cfg: config::PayloadVariant) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::SetConfig(Config {
+            payload_variant: Some(cfg),
+        }))
+        .await
+    }
+
+    /// Update the device owner / user record.
+    pub async fn write_owner(&self, user: User) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::SetOwner(user))
+            .await
+    }
+
+    /// Write a single channel definition.
+    pub async fn write_channel(&self, channel: Channel) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::SetChannel(channel))
+            .await
+    }
+
+    /// Set the device's manually-fixed location. The firmware also flips
+    /// `position.fixed_position = true` as a side effect.
+    pub async fn set_fixed_position(&self, position: Position) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::SetFixedPosition(position))
+            .await
+    }
+
+    /// Clear the manually-fixed location and flip
+    /// `position.fixed_position = false`.
+    pub async fn remove_fixed_position(&self) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::RemoveFixedPosition(true))
+            .await
+    }
+
+    /// Schedule a reboot in `secs` seconds.
+    pub async fn reboot(&self, secs: i32) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::RebootSeconds(secs))
+            .await
+    }
+
+    /// Factory-reset the device's configuration (preserves BLE bonds).
+    pub async fn factory_reset(&self) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::FactoryResetConfig(1))
+            .await
     }
 
     async fn send_to_radio(&self, payload: to_radio::PayloadVariant) -> Result<()> {
