@@ -24,6 +24,7 @@ hex = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+getrandom = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

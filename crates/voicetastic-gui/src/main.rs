@@ -161,8 +161,8 @@ fn spawn_watchers(
 // ---------------------------------------------------------------------------
 
 impl eframe::App for VoicetasticApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::Panel::top("tabs").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Devices, "Devices");
                 ui.selectable_value(&mut self.tab, Tab::Chat, "Chat");
@@ -182,7 +182,7 @@ impl eframe::App for VoicetasticApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        egui::CentralPanel::default().show_inside(ui, |ui| match self.tab {
             Tab::Devices => self.ui_devices(ui),
             Tab::Chat => self.ui_chat(ui),
             Tab::Settings => self.ui_settings(ui),
