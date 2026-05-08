@@ -5,3 +5,4 @@ Cargo.lock.bak
 .idea/
 *.swp
 .DS_Store
+.github/

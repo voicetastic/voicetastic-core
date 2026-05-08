@@ -36,10 +36,16 @@ type SerialReader = tokio::io::ReadHalf<tokio_serial::SerialStream>;
 /// Discover serial ports that look like Meshtastic devices.
 ///
 /// Returns paths like `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.
+///
+/// Only ports with an actual device behind them are returned: USB-serial
+/// adapters (CP210x, CH340, FTDI, native CDC, …) are kept, while built-in
+/// `Unknown` ports such as `/dev/ttyS*` on Linux — which appear even when
+/// nothing is plugged in — are filtered out.
 pub fn available_ports() -> Vec<PathBuf> {
     tokio_serial::available_ports()
         .unwrap_or_default()
         .into_iter()
+        .filter(|p| matches!(p.port_type, tokio_serial::SerialPortType::UsbPort(_)))
         .map(|p| PathBuf::from(p.port_name))
         .collect()
 }
