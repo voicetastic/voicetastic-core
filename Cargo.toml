@@ -8,8 +8,8 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://git.cha-sam.re/acarteron/voicetastic-desktop"
 
@@ -17,47 +17,48 @@ repository = "https://git.cha-sam.re/acarteron/voicetastic-desktop"
 voicetastic-core = { path = "crates/voicetastic-core" }
 
 # Async runtime
-tokio = { version = "1.40", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std", "fs", "signal"] }
-tokio-stream = "0.1"
-futures = "0.3"
-async-trait = "0.1"
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std", "fs", "signal"] }
+tokio-stream = "0.1.18"
+futures = "0.3.32"
+async-trait = "0.1.89"
 
 # Errors / logging
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 # Protobuf
-prost = "0.13"
-prost-build = "0.13"
-prost-types = "0.13"
+prost = "0.14"
+prost-build = "0.14"
+prost-types = "0.14"
 
 # BLE
-btleplug = "0.11"
-uuid = { version = "1", features = ["v4"] }
+btleplug = "0.12"
+uuid = { version = "1.23", features = ["v4"] }
 
 # Serial
-tokio-serial = "5.4"
+tokio-serial = "5.4.5"
 
 # Serde
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2+spec-1.1.0"
 
 # Utility
-bytes = "1"
-hex = "0.4"
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
-parking_lot = "0.12"
+bytes = "1.11"
+hex = "0.4.3"
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
+parking_lot = "0.12.5"
+getrandom = "0.4.2"
 
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
-indicatif = "0.17"
+clap = { version = "4.6", features = ["derive", "env"] }
+indicatif = "0.18"
 
 # GUI
-eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
-egui = "0.29"
+eframe = { version = "0.34", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.34.2"
 
 [profile.release]
 lto = "thin"
