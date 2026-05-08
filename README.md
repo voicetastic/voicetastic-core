@@ -39,6 +39,18 @@ sudo setcap cap_net_admin+ep target/debug/voicetastic-cli
 
 ## Build
 
+Protobuf definitions are pulled from the upstream
+[meshtastic/protobufs](https://github.com/meshtastic/protobufs) repo via a git
+submodule. Make sure to initialise it:
+
+```bash
+git clone --recurse-submodules https://github.com/<you>/voicetastic-desktop.git
+# or, if already cloned:
+git submodule update --init
+```
+
+Then build:
+
 ```bash
 cargo build --workspace
 ```
