@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, warn};
 

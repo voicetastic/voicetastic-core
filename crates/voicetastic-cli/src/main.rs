@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
@@ -17,7 +17,11 @@ use voicetastic_core::voice::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "voicetastic", version, about = "Voicetastic — Meshtastic text + voice CLI")]
+#[command(
+    name = "voicetastic",
+    version,
+    about = "Voicetastic — Meshtastic text + voice CLI"
+)]
 struct Cli {
     /// BLE address (`AA:BB:CC:DD:EE:FF`) or serial port path (`/dev/ttyUSB0`).
     #[arg(long, global = true)]
@@ -96,9 +100,7 @@ enum VoiceCmd {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_new(&cli.log).unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(EnvFilter::try_new(&cli.log).unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
     match cli.command {
@@ -125,8 +127,8 @@ async fn main() -> Result<()> {
                 to,
             } => {
                 let device = require_device(cli.device)?;
-                let bitrate = AmrNbBitrate::from_ordinal(bitrate)
-                    .context("--bitrate must be 0..=7")?;
+                let bitrate =
+                    AmrNbBitrate::from_ordinal(bitrate).context("--bitrate must be 0..=7")?;
                 run_voice_send(&device, channel, to, &file, bitrate).await
             }
             VoiceCmd::Listen { out_dir } => {
@@ -138,7 +140,9 @@ async fn main() -> Result<()> {
 }
 
 fn require_device(d: Option<String>) -> Result<String> {
-    d.context("missing --device <BLE address or serial port>; run `voicetastic scan` to discover one")
+    d.context(
+        "missing --device <BLE address or serial port>; run `voicetastic scan` to discover one",
+    )
 }
 
 /// Returns `true` if the device string looks like a serial port path rather

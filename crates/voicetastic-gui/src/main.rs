@@ -215,8 +215,7 @@ impl VoicetasticApp {
                             shared.lock().status_msg = Some("Connected!".into());
                         }
                         Err(e) => {
-                            shared.lock().status_msg =
-                                Some(format!("Connection failed: {e}"));
+                            shared.lock().status_msg = Some(format!("Connection failed: {e}"));
                         }
                     }
                 });
@@ -226,8 +225,7 @@ impl VoicetasticApp {
                 let shared = Arc::clone(&self.shared);
                 self.rt.spawn(async move {
                     if let Err(e) = svc.disconnect().await {
-                        shared.lock().status_msg =
-                            Some(format!("Disconnect failed: {e}"));
+                        shared.lock().status_msg = Some(format!("Disconnect failed: {e}"));
                     }
                 });
             }
@@ -265,8 +263,7 @@ impl VoicetasticApp {
                                 }
                             }
                             Err(e) => {
-                                shared.lock().status_msg =
-                                    Some(format!("Scan failed: {e}"));
+                                shared.lock().status_msg = Some(format!("Scan failed: {e}"));
                             }
                         }
                         shared.lock().scanning = false;
@@ -289,10 +286,7 @@ impl VoicetasticApp {
         ui.heading("Discovered Devices");
         let results = self.shared.lock().scan_results.clone();
         for dev in &results {
-            let label = dev
-                .name
-                .as_deref()
-                .unwrap_or(&dev.address);
+            let label = dev.name.as_deref().unwrap_or(&dev.address);
             if ui.button(label).clicked() {
                 self.device_addr = dev.address.clone();
             }
@@ -325,7 +319,11 @@ impl VoicetasticApp {
             .max_height(ui.available_height() - 40.0)
             .show(ui, |ui| {
                 for entry in &log {
-                    let prefix = if entry.outgoing { "→ You" } else { &entry.from_id };
+                    let prefix = if entry.outgoing {
+                        "→ You"
+                    } else {
+                        &entry.from_id
+                    };
                     ui.label(format!("{prefix}: {}", entry.text));
                 }
             });
@@ -356,8 +354,7 @@ impl VoicetasticApp {
                                 });
                             }
                             Err(e) => {
-                                shared.lock().status_msg =
-                                    Some(format!("Send failed: {e}"));
+                                shared.lock().status_msg = Some(format!("Send failed: {e}"));
                             }
                         }
                     });
@@ -393,9 +390,7 @@ fn main() -> eframe::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let rt = Arc::new(
-        Runtime::new().expect("failed to create tokio runtime"),
-    );
+    let rt = Arc::new(Runtime::new().expect("failed to create tokio runtime"));
 
     let service = rt.block_on(async { MeshService::new().await.expect("MeshService::new") });
 

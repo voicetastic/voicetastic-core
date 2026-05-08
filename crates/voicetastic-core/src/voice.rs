@@ -174,10 +174,16 @@ impl VoiceChunk {
     /// bitrate index.
     pub fn parse(bytes: &[u8]) -> Result<Self, VoiceError> {
         if bytes.len() < HEADER_SIZE {
-            return Err(VoiceError::TooShort { len: bytes.len(), needed: HEADER_SIZE });
+            return Err(VoiceError::TooShort {
+                len: bytes.len(),
+                needed: HEADER_SIZE,
+            });
         }
         if bytes.len() > MAX_PACKET_SIZE {
-            return Err(VoiceError::TooLarge { len: bytes.len(), max: MAX_PACKET_SIZE });
+            return Err(VoiceError::TooLarge {
+                len: bytes.len(),
+                max: MAX_PACKET_SIZE,
+            });
         }
         let version = bytes[0];
         if version != PROTOCOL_VERSION {
@@ -190,10 +196,13 @@ impl VoiceChunk {
             return Err(VoiceError::BadTotal(total_chunks));
         }
         if chunk_index >= total_chunks {
-            return Err(VoiceError::BadIndex { idx: chunk_index, total: total_chunks });
+            return Err(VoiceError::BadIndex {
+                idx: chunk_index,
+                total: total_chunks,
+            });
         }
-        let bitrate = AmrNbBitrate::from_ordinal(bytes[5])
-            .ok_or(VoiceError::BadBitrate(bytes[5]))?;
+        let bitrate =
+            AmrNbBitrate::from_ordinal(bytes[5]).ok_or(VoiceError::BadBitrate(bytes[5]))?;
         Ok(Self {
             version,
             message_id,
@@ -229,7 +238,14 @@ impl VoiceChunker {
         bitrate: AmrNbBitrate,
     ) -> [u8; HEADER_SIZE] {
         let id = message_id.to_be_bytes();
-        [PROTOCOL_VERSION, id[0], id[1], chunk_index, total_chunks, bitrate.ordinal()]
+        [
+            PROTOCOL_VERSION,
+            id[0],
+            id[1],
+            chunk_index,
+            total_chunks,
+            bitrate.ordinal(),
+        ]
     }
 
     /// Chunk an AMR-NB byte stream (with or without the file header) into
@@ -336,19 +352,15 @@ impl VoiceAssembler {
     }
 
     /// Feed a chunk into the assembler.
-    pub fn accept(
-        &self,
-        from: &str,
-        to: &str,
-        channel: u32,
-        chunk: VoiceChunk,
-    ) -> AssemblyEvent {
+    pub fn accept(&self, from: &str, to: &str, channel: u32, chunk: VoiceChunk) -> AssemblyEvent {
         let key = (from.to_string(), chunk.message_id);
         let mut inner = self.inner.lock();
 
         // Drop blacklist entries past TTL while we're here.
         let now = Instant::now();
-        inner.blacklist.retain(|(_, t)| now.duration_since(*t) < BLACKLIST_TTL);
+        inner
+            .blacklist
+            .retain(|(_, t)| now.duration_since(*t) < BLACKLIST_TTL);
         if inner.blacklist.iter().any(|(k, _)| *k == key) {
             return AssemblyEvent::Rejected;
         }
@@ -382,7 +394,9 @@ impl VoiceAssembler {
     pub fn tick(&self) -> Vec<VoiceMessage> {
         let mut inner = self.inner.lock();
         let now = Instant::now();
-        inner.blacklist.retain(|(_, t)| now.duration_since(*t) < BLACKLIST_TTL);
+        inner
+            .blacklist
+            .retain(|(_, t)| now.duration_since(*t) < BLACKLIST_TTL);
 
         let timeout = self.timeout;
         let expired_keys: Vec<(String, u16)> = inner
@@ -417,7 +431,8 @@ fn finalize(from: &str, state: &AssemblyState, complete: bool) -> VoiceMessage {
     // timeline stays aligned (`floor(MAX_PAYLOAD_SIZE / frame_size)` frames per
     // chunk, each one byte = `0x7C`).
     let frames_per_chunk = MAX_PAYLOAD_SIZE / state.bitrate.frame_size();
-    let mut audio = Vec::with_capacity(AMR_FILE_HEADER.len() + state.chunks.len() * MAX_PAYLOAD_SIZE);
+    let mut audio =
+        Vec::with_capacity(AMR_FILE_HEADER.len() + state.chunks.len() * MAX_PAYLOAD_SIZE);
     audio.extend_from_slice(AMR_FILE_HEADER);
     for slot in &state.chunks {
         match slot {
@@ -496,19 +511,28 @@ mod tests {
     fn parse_rejects_bad_version() {
         let mut pkt = vec![2u8, 0, 0, 0, 1, 5];
         pkt.extend_from_slice(b"hi");
-        assert!(matches!(VoiceChunk::parse(&pkt), Err(VoiceError::BadVersion(2))));
+        assert!(matches!(
+            VoiceChunk::parse(&pkt),
+            Err(VoiceError::BadVersion(2))
+        ));
     }
 
     #[test]
     fn parse_rejects_bad_bitrate() {
         let pkt = [PROTOCOL_VERSION, 0, 0, 0, 1, 99];
-        assert!(matches!(VoiceChunk::parse(&pkt), Err(VoiceError::BadBitrate(99))));
+        assert!(matches!(
+            VoiceChunk::parse(&pkt),
+            Err(VoiceError::BadBitrate(99))
+        ));
     }
 
     #[test]
     fn parse_rejects_index_out_of_range() {
         let pkt = [PROTOCOL_VERSION, 0, 0, 5, 3, 5];
-        assert!(matches!(VoiceChunk::parse(&pkt), Err(VoiceError::BadIndex { .. })));
+        assert!(matches!(
+            VoiceChunk::parse(&pkt),
+            Err(VoiceError::BadIndex { .. })
+        ));
     }
 
     #[test]
@@ -529,7 +553,10 @@ mod tests {
         let m = completed.expect("complete");
         assert!(m.is_complete);
         assert!(m.audio_data.starts_with(AMR_FILE_HEADER));
-        assert_eq!(&m.audio_data[AMR_FILE_HEADER.len()..], &src[AMR_FILE_HEADER.len()..]);
+        assert_eq!(
+            &m.audio_data[AMR_FILE_HEADER.len()..],
+            &src[AMR_FILE_HEADER.len()..]
+        );
     }
 
     #[test]
@@ -550,9 +577,15 @@ mod tests {
         }
         let dup = VoiceChunk::parse(&pkts[0]).unwrap();
         // Already finalized → blacklisted.
-        assert!(matches!(asm.accept("!cafebabe", "broadcast", 1, dup), AssemblyEvent::Rejected));
+        assert!(matches!(
+            asm.accept("!cafebabe", "broadcast", 1, dup),
+            AssemblyEvent::Rejected
+        ));
         let m = completed.expect("complete");
-        assert_eq!(&m.audio_data[AMR_FILE_HEADER.len()..], &src[AMR_FILE_HEADER.len()..]);
+        assert_eq!(
+            &m.audio_data[AMR_FILE_HEADER.len()..],
+            &src[AMR_FILE_HEADER.len()..]
+        );
     }
 
     #[test]
@@ -562,7 +595,10 @@ mod tests {
         let src = raw_amr(700);
         let pkts = VoiceChunker::chunk(&src, 9, AmrNbBitrate::Mr795).unwrap();
         let c0 = VoiceChunk::parse(&pkts[0]).unwrap();
-        assert!(matches!(asm.accept("!11111111", "broadcast", 0, c0), AssemblyEvent::Pending));
+        assert!(matches!(
+            asm.accept("!11111111", "broadcast", 0, c0),
+            AssemblyEvent::Pending
+        ));
         let c0_dup = VoiceChunk::parse(&pkts[0]).unwrap();
         assert!(matches!(
             asm.accept("!11111111", "broadcast", 0, c0_dup),
@@ -582,7 +618,10 @@ mod tests {
         let src = raw_amr(300);
         let pkts = VoiceChunker::chunk(&src, 4, AmrNbBitrate::Mr795).unwrap();
         let c1 = VoiceChunk::parse(&pkts[1]).unwrap();
-        assert!(matches!(asm.accept("!deadbeef", "broadcast", 0, c1), AssemblyEvent::Pending));
+        assert!(matches!(
+            asm.accept("!deadbeef", "broadcast", 0, c1),
+            AssemblyEvent::Pending
+        ));
         // Timeout sweep
         std::thread::sleep(Duration::from_millis(5));
         let out = asm.tick();
@@ -592,7 +631,12 @@ mod tests {
         // The first slot was missing → frames_per_chunk NO_DATA bytes (each 0x7C).
         let frames_per_chunk = MAX_PAYLOAD_SIZE / AmrNbBitrate::Mr795.frame_size();
         let after_header = &m.audio_data[AMR_FILE_HEADER.len()..];
-        assert!(after_header.iter().take(frames_per_chunk).all(|b| *b == AMR_NO_DATA_FRAME));
+        assert!(
+            after_header
+                .iter()
+                .take(frames_per_chunk)
+                .all(|b| *b == AMR_NO_DATA_FRAME)
+        );
     }
 
     #[test]
@@ -615,8 +659,14 @@ mod tests {
     fn frame_sizes_match_spec() {
         use AmrNbBitrate::*;
         for (b, s) in [
-            (Mr475, 13), (Mr515, 14), (Mr59, 16), (Mr67, 18),
-            (Mr74, 20), (Mr795, 21), (Mr102, 27), (Mr122, 32),
+            (Mr475, 13),
+            (Mr515, 14),
+            (Mr59, 16),
+            (Mr67, 18),
+            (Mr74, 20),
+            (Mr795, 21),
+            (Mr102, 27),
+            (Mr122, 32),
         ] {
             assert_eq!(b.frame_size(), s);
         }

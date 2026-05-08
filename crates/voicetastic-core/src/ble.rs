@@ -5,12 +5,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use btleplug::api::{
-    Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType,
-};
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use futures::stream::StreamExt;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -62,22 +60,28 @@ impl BleManager {
     /// Begin scanning for Meshtastic peripherals. Yields each device once
     /// discovered. The scan continues until the returned receiver is dropped.
     pub async fn scan(&self) -> Result<mpsc::Receiver<DiscoveredDevice>> {
-        let filter = ScanFilter { services: vec![SERVICE_UUID] };
+        let filter = ScanFilter {
+            services: vec![SERVICE_UUID],
+        };
         self.adapter.start_scan(filter).await?;
         let mut events = self.adapter.events().await?;
         let adapter = self.adapter.clone();
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
             while let Some(ev) = events.next().await {
-                if let CentralEvent::DeviceDiscovered(id) = ev {
-                    if let Ok(p) = adapter.peripheral(&id).await {
-                        let props = p.properties().await.ok().flatten();
-                        let name = props.as_ref().and_then(|p| p.local_name.clone());
-                        let address = p.address().to_string();
-                        let dev = DiscoveredDevice { id: id.clone(), name, address };
-                        if tx.send(dev).await.is_err() {
-                            break;
-                        }
+                if let CentralEvent::DeviceDiscovered(id) = ev
+                    && let Ok(p) = adapter.peripheral(&id).await
+                {
+                    let props = p.properties().await.ok().flatten();
+                    let name = props.as_ref().and_then(|p| p.local_name.clone());
+                    let address = p.address().to_string();
+                    let dev = DiscoveredDevice {
+                        id: id.clone(),
+                        name,
+                        address,
+                    };
+                    if tx.send(dev).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -224,12 +228,12 @@ impl Connection {
         let conn_notify = conn.clone();
         tokio::spawn(async move {
             while let Some(n) = notifs.next().await {
-                if n.uuid == FROMNUM_UUID {
-                    if let Ok(payloads) = conn_notify.drain_from_radio().await {
-                        for p in payloads {
-                            if tx_notify.send(p).await.is_err() {
-                                return;
-                            }
+                if n.uuid == FROMNUM_UUID
+                    && let Ok(payloads) = conn_notify.drain_from_radio().await
+                {
+                    for p in payloads {
+                        if tx_notify.send(p).await.is_err() {
+                            return;
                         }
                     }
                 }

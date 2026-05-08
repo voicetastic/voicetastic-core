@@ -13,7 +13,9 @@ pub fn node_num_to_id(num: u32) -> String {
 
 /// Parse a `!aabbccdd` node id into a node number.
 pub fn node_id_to_num(id: &str) -> Result<u32> {
-    let trimmed = id.strip_prefix('!').ok_or_else(|| Error::InvalidNodeId(id.into()))?;
+    let trimmed = id
+        .strip_prefix('!')
+        .ok_or_else(|| Error::InvalidNodeId(id.into()))?;
     if trimmed.len() != 8 {
         return Err(Error::InvalidNodeId(id.into()));
     }

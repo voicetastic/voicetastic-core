@@ -13,17 +13,17 @@ mod types;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::warn;
 
-use crate::ble::{BleManager, Connection, DiscoveredDevice, CONFIG_REQUEST_DELAY};
+use crate::ble::{BleManager, CONFIG_REQUEST_DELAY, Connection, DiscoveredDevice};
 use crate::error::Result;
-use crate::proto::{to_radio, MyNodeInfo, NodeInfo};
+use crate::proto::{MyNodeInfo, NodeInfo, to_radio};
 use crate::serial::SerialConnection;
 
 use transport::Transport;
 
-pub use types::{node_long_name, ConnectionState, IncomingData, IncomingText};
+pub use types::{ConnectionState, IncomingData, IncomingText, node_long_name};
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]

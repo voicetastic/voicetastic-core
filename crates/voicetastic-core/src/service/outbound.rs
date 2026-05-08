@@ -7,11 +7,11 @@ use tracing::debug;
 
 use crate::error::{Error, Result};
 use crate::ports::{BROADCAST_ADDR, PRIVATE_APP, TEXT_MESSAGE_APP};
-use crate::proto::{mesh_packet, to_radio, Data, MeshPacket, ToRadio};
+use crate::proto::{Data, MeshPacket, ToRadio, mesh_packet, to_radio};
 
+use super::MeshService;
 use super::transport::Transport;
 use super::types::rand_u32;
-use super::MeshService;
 
 impl MeshService {
     pub(super) async fn send_want_config(&self) -> Result<()> {

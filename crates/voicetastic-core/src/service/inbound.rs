@@ -5,7 +5,7 @@ use tracing::{debug, info};
 
 use crate::error::Result;
 use crate::ids::node_num_to_id;
-use crate::proto::{from_radio, mesh_packet, FromRadio, MeshPacket, PortNum};
+use crate::proto::{FromRadio, MeshPacket, PortNum, from_radio, mesh_packet};
 
 use super::{ConnectionState, IncomingData, IncomingText, MeshService};
 
@@ -44,21 +44,21 @@ impl MeshService {
         };
         let portnum = data.portnum;
         let payload = data.payload.clone();
-        if portnum == PortNum::TextMessageApp as i32 {
-            if let Ok(text) = String::from_utf8(payload.clone()) {
-                let from_id = node_num_to_id(pkt.from);
-                let _ = self.inner.incoming_text_tx.send(IncomingText {
-                    from: pkt.from,
-                    from_id,
-                    to: pkt.to,
-                    channel: pkt.channel,
-                    text,
-                    rx_time: pkt.rx_time,
-                    rx_snr: pkt.rx_snr,
-                    rx_rssi: pkt.rx_rssi,
-                });
-                return;
-            }
+        if portnum == PortNum::TextMessageApp as i32
+            && let Ok(text) = String::from_utf8(payload.clone())
+        {
+            let from_id = node_num_to_id(pkt.from);
+            let _ = self.inner.incoming_text_tx.send(IncomingText {
+                from: pkt.from,
+                from_id,
+                to: pkt.to,
+                channel: pkt.channel,
+                text,
+                rx_time: pkt.rx_time,
+                rx_snr: pkt.rx_snr,
+                rx_rssi: pkt.rx_rssi,
+            });
+            return;
         }
         let _ = self.inner.incoming_data_tx.send(IncomingData {
             from: pkt.from,

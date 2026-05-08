@@ -23,11 +23,18 @@ fn main() {
     for p in &protos {
         println!("cargo:rerun-if-changed={}", p.display());
     }
-    println!("cargo:rerun-if-changed={}", proto_root.join("nanopb.proto").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        proto_root.join("nanopb.proto").display()
+    );
 
     let rel_protos: Vec<PathBuf> = protos
         .iter()
-        .map(|p| p.strip_prefix(&proto_root).expect("under proto root").to_path_buf())
+        .map(|p| {
+            p.strip_prefix(&proto_root)
+                .expect("under proto root")
+                .to_path_buf()
+        })
         .collect();
 
     let prev_cwd = std::env::current_dir().expect("cwd");
