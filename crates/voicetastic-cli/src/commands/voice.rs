@@ -27,7 +27,9 @@ pub async fn send(
         .with_context(|| format!("reading {}", file.display()))?;
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let message_id: u16 = (chrono::Utc::now().timestamp_millis() as u16).max(1);
+    let mut id_buf = [0u8; 2];
+    getrandom::fill(&mut id_buf).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+    let message_id: u16 = u16::from_ne_bytes(id_buf).max(1);
     let chunks = VoiceChunker::chunk(&bytes, message_id, bitrate)?;
     info!(chunks = chunks.len(), "sending voice");
     let ids = svc.send_voice_chunks(chunks, channel, to).await?;
@@ -68,7 +70,10 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
                         AssemblyEvent::Rejected => warn!("rejected voice chunk"),
                     }
                 }
-                Err(_) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(skipped = n, "voice listener lagged, dropped chunks");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
         }
     }

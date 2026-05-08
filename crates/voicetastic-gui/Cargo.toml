@@ -16,8 +16,6 @@ voicetastic-core = { workspace = true }
 tokio = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
-anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-chrono = { workspace = true }
 parking_lot = { workspace = true }

@@ -17,7 +17,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             let shared = Arc::clone(&app.shared);
             app.rt.spawn(async move {
                 shared.lock().status_msg = Some("Connecting…".into());
-                let result = if addr.starts_with('/') || addr.starts_with("COM") {
+                let result = if voicetastic_core::serial::is_serial_path(&addr) {
                     svc.connect_by_serial(&addr).await
                 } else {
                     svc.connect_by_address(&addr).await

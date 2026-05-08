@@ -30,6 +30,13 @@ const MAX_PAYLOAD: usize = 512;
 /// Default baud rate for Meshtastic USB-serial devices.
 pub const DEFAULT_BAUD: u32 = 115_200;
 
+/// Heuristic: returns `true` if `device` looks like a serial port path
+/// rather than a BLE address. Linux paths begin with `/`, Windows ports
+/// with `COM`.
+pub fn is_serial_path(device: &str) -> bool {
+    device.starts_with('/') || device.starts_with("COM")
+}
+
 type SerialWriter = tokio::io::WriteHalf<tokio_serial::SerialStream>;
 type SerialReader = tokio::io::ReadHalf<tokio_serial::SerialStream>;
 

@@ -382,8 +382,8 @@ impl VoiceAssembler {
 
         if state.received == state.total_chunks {
             let state = inner.in_progress.remove(&key).expect("just inserted");
-            push_blacklist(&mut inner.blacklist, key, now);
-            let msg = finalize(from, &state, true);
+            push_blacklist(&mut inner.blacklist, key.clone(), now);
+            let msg = finalize(from, key.1, &state, true);
             return AssemblyEvent::Complete(Box::new(msg));
         }
         AssemblyEvent::Pending
@@ -411,7 +411,7 @@ impl VoiceAssembler {
             let state = inner.in_progress.remove(&key).expect("just listed");
             push_blacklist(&mut inner.blacklist, key.clone(), now);
             if self.partial_on_timeout {
-                out.push(finalize(&key.0, &state, false));
+                out.push(finalize(&key.0, key.1, &state, false));
             }
         }
         out
@@ -426,7 +426,7 @@ fn push_blacklist(bl: &mut Vec<((String, u16), Instant)>, key: (String, u16), no
     }
 }
 
-fn finalize(from: &str, state: &AssemblyState, complete: bool) -> VoiceMessage {
+fn finalize(from: &str, message_id: u16, state: &AssemblyState, complete: bool) -> VoiceMessage {
     // For each missing chunk, substitute AMR NO_DATA frames sized so the audio
     // timeline stays aligned (`floor(MAX_PAYLOAD_SIZE / frame_size)` frames per
     // chunk, each one byte = `0x7C`).
@@ -444,7 +444,7 @@ fn finalize(from: &str, state: &AssemblyState, complete: bool) -> VoiceMessage {
     }
 
     VoiceMessage {
-        message_id: 0, // overwritten below via key
+        message_id,
         from: from.to_string(),
         to: state.to.clone(),
         audio_data: audio,

@@ -26,7 +26,10 @@ pub async fn listen(device: &str) -> Result<()> {
             _ = tokio::signal::ctrl_c() => break,
             msg = rx.recv() => match msg {
                 Ok(t) => println!("[ch{} {} -> {}] {}", t.channel, t.from_id, t.to, t.text),
-                Err(_) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "text listener lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
         }
     }

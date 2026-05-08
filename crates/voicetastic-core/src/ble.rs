@@ -124,6 +124,7 @@ pub struct Connection {
     from_radio: btleplug::api::Characteristic,
     write_lock: Arc<Mutex<()>>,
     write_sema: Arc<Semaphore>,
+    read_lock: Arc<Mutex<()>>,
 }
 
 impl Connection {
@@ -178,6 +179,7 @@ impl Connection {
             from_radio,
             write_lock: Arc::new(Mutex::new(())),
             write_sema: Arc::new(Semaphore::new(1)),
+            read_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -203,7 +205,11 @@ impl Connection {
     }
 
     /// Drain `FROMRADIO` until empty. Returns each non-empty payload in order.
+    ///
+    /// Read calls are serialised via `read_lock` so concurrent drains (notify
+    /// task + safety-net poll) cannot interleave frames out of order.
     pub async fn drain_from_radio(&self) -> Result<Vec<Vec<u8>>> {
+        let _g = self.read_lock.lock().await;
         let mut out = Vec::new();
         loop {
             let payload = self.peripheral.read(&self.from_radio).await?;
