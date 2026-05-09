@@ -1,10 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use eframe::egui;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use voicetastic_core::ids::node_num_to_id;
+use voicetastic_core::ports::PRIVATE_APP;
 use voicetastic_core::service::MeshService;
+use voicetastic_core::voice::{
+    AssemblyEvent, VoiceAssembler, VoiceChunk, VoiceConfig, VoiceMessage,
+};
 
 use crate::state::{ChatEntry, Section, SharedState};
 
@@ -93,12 +99,12 @@ pub fn spawn_watchers(
         let kept: Vec<_> = st
             .channels
             .iter()
-            .filter(|c| st.dirty.contains(&Section::Channel(c.index as u32)))
+            .filter(|c| st.dirty.contains(&Section::Channel(c.index)))
             .cloned()
             .collect();
         let mut next: Vec<_> = v
             .into_iter()
-            .filter(|c| !st.dirty.contains(&Section::Channel(c.index as u32)))
+            .filter(|c| !st.dirty.contains(&Section::Channel(c.index)))
             .collect();
         next.extend(kept);
         next.sort_by_key(|c| c.index);
@@ -150,4 +156,68 @@ pub fn spawn_watchers(
             }
         });
     }
+
+    // Inbound voice (PRIVATE_APP) -> reassemble and post a chat notification
+    // when a message completes (or partially completes on timeout).
+    {
+        let mut rx = svc.subscribe_data();
+        let s = Arc::clone(&shared);
+        let c = ctx.clone();
+        rt.spawn(async move {
+            let assembler = VoiceAssembler::new(&VoiceConfig::default());
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        for completed in assembler.tick() {
+                            push_voice_entry(&s, &c, &completed);
+                        }
+                    }
+                    msg = rx.recv() => match msg {
+                        Ok(d) => {
+                            if d.portnum != PRIVATE_APP as i32 { continue; }
+                            let from_id = node_num_to_id(d.from);
+                            let to_id = node_num_to_id(d.to);
+                            let chunk = match VoiceChunk::parse(&d.payload) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            if let AssemblyEvent::Complete(m) =
+                                assembler.accept(&from_id, &to_id, d.channel, chunk)
+                            {
+                                push_voice_entry(&s, &c, &m);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Err(_) => {} // lagged
+                    },
+                }
+            }
+        });
+    }
+}
+
+fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceMessage) {
+    let label = if msg.is_complete {
+        format!(
+            "🎙 voice message ({} bytes, {} chunks)",
+            msg.audio_data.len(),
+            msg.total_chunks
+        )
+    } else {
+        format!(
+            "🎙 voice message (partial: {}/{} chunks, {} bytes)",
+            msg.received_chunks,
+            msg.total_chunks,
+            msg.audio_data.len()
+        )
+    };
+    s.lock().chat_log.push(ChatEntry {
+        from_id: msg.from.clone(),
+        text: label,
+        rx_time: 0,
+        outgoing: false,
+    });
+    c.request_repaint();
 }

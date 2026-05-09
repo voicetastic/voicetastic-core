@@ -183,8 +183,14 @@ impl MeshService {
         let _ = self.inner.display_tx.send(None);
         let _ = self.inner.bluetooth_tx.send(None);
         let _ = self.inner.channels_tx.send(Vec::new());
+        let prev = *self.inner.state_tx.borrow();
         self.set_state(ConnectionState::Configuring);
-        self.send_want_config().await
+        if let Err(e) = self.send_want_config().await {
+            // Don't strand the UI in `Configuring` if we can't actually ask.
+            self.set_state(prev);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).

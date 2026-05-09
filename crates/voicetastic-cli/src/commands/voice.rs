@@ -10,7 +10,7 @@ use voicetastic_core::ports::PRIVATE_APP;
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
     AmrNbBitrate, AssemblyEvent, VoiceAssembler, VoiceChunk, VoiceChunker, VoiceConfig,
-    VoiceMessage,
+    VoiceMessage, random_message_id,
 };
 
 use crate::connect::connect;
@@ -27,9 +27,7 @@ pub async fn send(
         .with_context(|| format!("reading {}", file.display()))?;
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let mut id_buf = [0u8; 2];
-    getrandom::fill(&mut id_buf).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
-    let message_id: u16 = u16::from_ne_bytes(id_buf).max(1);
+    let message_id = random_message_id();
     let chunks = VoiceChunker::chunk(&bytes, message_id, bitrate)?;
     info!(chunks = chunks.len(), "sending voice");
     let ids = svc.send_voice_chunks(chunks, channel, to).await?;

@@ -9,12 +9,23 @@ use eframe::egui;
 // Numeric / text fields
 // --------------------------------------------------------------------------
 
-fn parsed_field<T: std::str::FromStr + std::fmt::Display>(
+fn parsed_field<T: std::str::FromStr + std::fmt::Display + PartialEq>(
     ui: &mut egui::Ui,
     label: &str,
     value: &mut T,
 ) -> bool {
-    let mut buf = value.to_string();
+    // Persist the in-flight buffer so transient unparseable states like
+    // "1.", "-", or "1e" don't snap the field back to the last valid value
+    // while the user is still typing.
+    let id = ui.id().with(("parsed_field", label));
+    let mut buf: String = ui
+        .data_mut(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| value.to_string());
+    // If the external value changed (device push) and the buffer no longer
+    // parses to it, re-seed from the new value.
+    if buf.parse::<T>().ok().as_ref() != Some(value) {
+        buf = value.to_string();
+    }
     let changed = ui
         .horizontal(|ui| {
             ui.label(label);
@@ -22,7 +33,12 @@ fn parsed_field<T: std::str::FromStr + std::fmt::Display>(
                 .changed()
         })
         .inner;
-    if changed && let Ok(n) = buf.parse::<T>() {
+    let parsed = buf.parse::<T>().ok();
+    ui.data_mut(|d| d.insert_temp(id, buf));
+    if changed
+        && let Some(n) = parsed
+        && n != *value
+    {
         *value = n;
         return true;
     }

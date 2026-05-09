@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use voicetastic_core::voice::AmrNbBitrate;
 
-use crate::cli::{Cli, Command, TextCmd, VoiceCmd};
+use crate::cli::{Cli, Command, DeviceCmd, TextCmd, VoiceCmd};
 use crate::util::{read_stdin_line, require_device};
 
 #[tokio::main]
@@ -54,5 +54,15 @@ async fn main() -> Result<()> {
                 commands::voice::listen(&device, &out_dir).await
             }
         },
+        Command::Device { cmd } => {
+            let device = require_device(cli.device)?;
+            match cmd {
+                DeviceCmd::Info => commands::device::info(&device).await,
+                DeviceCmd::Reboot { secs } => commands::device::reboot(&device, secs).await,
+                DeviceCmd::FactoryReset { yes } => {
+                    commands::device::factory_reset(&device, yes).await
+                }
+            }
+        }
     }
 }

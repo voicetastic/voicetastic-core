@@ -35,6 +35,14 @@ pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
 const BLACKLIST_TTL: Duration = Duration::from_secs(60);
 const BLACKLIST_MAX: usize = 100;
 
+/// Generate a non-zero random `u16` suitable for use as a voice
+/// `message_id`. Zero is reserved as "unset" by the chunk header convention.
+pub fn random_message_id() -> u16 {
+    let mut buf = [0u8; 2];
+    getrandom::fill(&mut buf).expect("OS RNG");
+    u16::from_ne_bytes(buf).max(1)
+}
+
 /// AMR-NB bitrate modes. The ordinal **must** match the Kotlin
 /// `AmrNbBitrate` enum order, since we serialise the ordinal in the chunk
 /// header (`bitrateIndex`).

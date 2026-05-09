@@ -41,6 +41,11 @@ pub enum Command {
         #[command(subcommand)]
         cmd: VoiceCmd,
     },
+    /// Device commands (info, reboot, factory reset).
+    Device {
+        #[command(subcommand)]
+        cmd: DeviceCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -81,5 +86,23 @@ pub enum VoiceCmd {
         /// Output directory.
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DeviceCmd {
+    /// Print local node info, firmware metadata, and known nodes.
+    Info,
+    /// Schedule a reboot.
+    Reboot {
+        /// Seconds until reboot.
+        #[arg(long, default_value_t = 5)]
+        secs: i32,
+    },
+    /// Factory-reset the device's configuration (preserves BLE bonds).
+    FactoryReset {
+        /// Required confirmation flag.
+        #[arg(long)]
+        yes: bool,
     },
 }

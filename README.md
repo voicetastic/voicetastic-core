@@ -14,7 +14,7 @@ messaging and AMR-NB voice message exchange — wire-compatible with the Android
 
 ## Prerequisites
 
-- **Rust 1.80+** (edition 2024 workspace)
+- **Rust 1.95+** (edition 2024 workspace)
 - **Linux** with BlueZ (D-Bus BLE stack)
 - **protoc** (Protocol Buffers compiler)
 

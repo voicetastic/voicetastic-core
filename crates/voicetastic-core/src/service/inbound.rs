@@ -1,15 +1,30 @@
 //! Decode `FromRadio` payloads and fan them out to typed observers.
 
 use prost::Message as _;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::error::Result;
 use crate::ids::node_num_to_id;
+use crate::ports::MAX_TEXT_BYTES;
 use crate::proto::{
     AdminMessage, FromRadio, MeshPacket, PortNum, admin_message, config, from_radio, mesh_packet,
 };
 
 use super::{ConnectionState, IncomingData, IncomingText, MeshService};
+
+/// Latitude bounds in fixed-point 1e-7 degrees: [-90°, +90°].
+const LAT_I_MIN: i32 = -900_000_000;
+const LAT_I_MAX: i32 = 900_000_000;
+/// Longitude bounds in fixed-point 1e-7 degrees: [-180°, +180°].
+const LON_I_MIN: i32 = -1_800_000_000;
+const LON_I_MAX: i32 = 1_800_000_000;
+
+fn lat_i_in_range(v: i32) -> bool {
+    (LAT_I_MIN..=LAT_I_MAX).contains(&v)
+}
+fn lon_i_in_range(v: i32) -> bool {
+    (LON_I_MIN..=LON_I_MAX).contains(&v)
+}
 
 impl MeshService {
     pub(super) async fn handle_from_radio(&self, bytes: &[u8]) -> Result<()> {
@@ -23,6 +38,23 @@ impl MeshService {
                 let _ = self.inner.my_info_tx.send(Some(info));
             }
             from_radio::PayloadVariant::NodeInfo(ni) => {
+                let mut ni = ni;
+                // Sanitise position fields against absurd values from a
+                // misbehaving radio so downstream UI never sees garbage.
+                if let Some(pos) = ni.position.as_mut() {
+                    if let Some(lat) = pos.latitude_i
+                        && !lat_i_in_range(lat)
+                    {
+                        warn!(node = ni.num, lat, "dropping out-of-range latitude_i");
+                        pos.latitude_i = None;
+                    }
+                    if let Some(lon) = pos.longitude_i
+                        && !lon_i_in_range(lon)
+                    {
+                        warn!(node = ni.num, lon, "dropping out-of-range longitude_i");
+                        pos.longitude_i = None;
+                    }
+                }
                 // If this is our own node, surface the User as the "owner".
                 let my_num = self
                     .inner
@@ -126,21 +158,29 @@ impl MeshService {
             }
             return;
         }
-        if portnum == PortNum::TextMessageApp as i32
-            && let Ok(text) = String::from_utf8(payload.clone())
-        {
-            let from_id = node_num_to_id(pkt.from);
-            let _ = self.inner.incoming_text_tx.send(IncomingText {
-                from: pkt.from,
-                from_id,
-                to: pkt.to,
-                channel: pkt.channel,
-                text,
-                rx_time: pkt.rx_time,
-                rx_snr: pkt.rx_snr,
-                rx_rssi: pkt.rx_rssi,
-            });
-            return;
+        if portnum == PortNum::TextMessageApp as i32 {
+            if payload.len() > MAX_TEXT_BYTES {
+                warn!(
+                    from = pkt.from,
+                    len = payload.len(),
+                    "dropping oversized text payload"
+                );
+                return;
+            }
+            if let Ok(text) = String::from_utf8(payload.clone()) {
+                let from_id = node_num_to_id(pkt.from);
+                let _ = self.inner.incoming_text_tx.send(IncomingText {
+                    from: pkt.from,
+                    from_id,
+                    to: pkt.to,
+                    channel: pkt.channel,
+                    text,
+                    rx_time: pkt.rx_time,
+                    rx_snr: pkt.rx_snr,
+                    rx_rssi: pkt.rx_rssi,
+                });
+                return;
+            }
         }
         let _ = self.inner.incoming_data_tx.send(IncomingData {
             from: pkt.from,

@@ -16,6 +16,7 @@ pub mod error;
 pub mod ids;
 pub mod ports;
 pub mod proto;
+pub mod settings;
 pub mod voice;
 
 pub mod ble;

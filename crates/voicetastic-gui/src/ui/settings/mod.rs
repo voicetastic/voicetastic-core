@@ -272,7 +272,11 @@ fn owner_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
             let mut ch = false;
             ch |= str_field(ui, "Long name", &mut c.long_name);
             if str_field(ui, "Short name", &mut c.short_name) {
-                c.short_name.truncate(4);
+                // Cap by *characters*, not bytes — `truncate(4)` would panic
+                // if it landed mid-codepoint on a multibyte character.
+                if c.short_name.chars().count() > 4 {
+                    c.short_name = c.short_name.chars().take(4).collect();
+                }
                 ch = true;
             }
             ch |= ui.checkbox(&mut c.is_licensed, "Licensed (HAM)").changed();
@@ -430,8 +434,11 @@ fn position_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
             ui.separator();
             ui.label(egui::RichText::new("Fixed coordinates").strong());
 
-            // Seed the edit buffer once from our own NodeInfo.position.
-            {
+            // Seed the edit buffer (once) from our own NodeInfo.position, then
+            // hand back a working copy. A single lock acquisition keeps the
+            // init + read atomic so the UI never observes a half-initialised
+            // state when watchers concurrently update `nodes`.
+            let mut edit = {
                 let mut s = ctx.shared.lock();
                 if s.fixed_pos_edit.is_none() {
                     let seed = s
@@ -441,6 +448,10 @@ fn position_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                         .and_then(|num| s.nodes.get(&num))
                         .and_then(|n| n.position.as_ref())
                         .map(|p| FixedPosEdit {
+                            // `unwrap_or(0)` here is intentional: the field is
+                            // `Option<i32>` in the proto but the edit buffer
+                            // needs a concrete starting value. Users can
+                            // immediately overwrite via the input fields.
                             latitude_deg: p.latitude_i.unwrap_or(0) as f64 * 1e-7,
                             longitude_deg: p.longitude_i.unwrap_or(0) as f64 * 1e-7,
                             altitude_m: p.altitude.unwrap_or(0),
@@ -448,9 +459,10 @@ fn position_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                         .unwrap_or_default();
                     s.fixed_pos_edit = Some(seed);
                 }
-            }
+                // Safe: we just ensured it is `Some`.
+                s.fixed_pos_edit.clone().unwrap_or_default()
+            };
 
-            let mut edit = ctx.shared.lock().fixed_pos_edit.clone().unwrap_or_default();
             let mut e_changed = false;
             e_changed |= f64_field(ui, "Latitude (°)", &mut edit.latitude_deg);
             e_changed |= f64_field(ui, "Longitude (°)", &mut edit.longitude_deg);
@@ -462,9 +474,13 @@ fn position_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button("Send Fixed Position").clicked() {
+                    // Clamp to valid WGS84 ranges so we never push absurd
+                    // coordinates to the radio.
+                    let lat_deg = edit.latitude_deg.clamp(-90.0, 90.0);
+                    let lon_deg = edit.longitude_deg.clamp(-180.0, 180.0);
                     let pos = Position {
-                        latitude_i: Some((edit.latitude_deg * 1e7).round() as i32),
-                        longitude_i: Some((edit.longitude_deg * 1e7).round() as i32),
+                        latitude_i: Some((lat_deg * 1e7).round() as i32),
+                        longitude_i: Some((lon_deg * 1e7).round() as i32),
                         altitude: Some(edit.altitude_m),
                         ..Default::default()
                     };
@@ -648,15 +664,45 @@ fn render_channel_row(ui: &mut egui::Ui, ctx: &Ctx<'_>, ch: voicetastic_core::pr
 
         let mut next = ch.clone();
         let mut settings = next.settings.unwrap_or_default();
-        let mut psk_hex = bytes_to_hex(&settings.psk);
+        // Persist the PSK hex buffer across frames so the user can type
+        // intermediate odd-length / partial states without the display
+        // snapping back to the on-device value.
+        let psk_id = ui.id().with(("ch_psk_buf", idx));
+        let stored_buf: Option<String> = ui.data_mut(|d| d.get_temp(psk_id));
+        let on_device_hex = bytes_to_hex(&settings.psk);
+        let mut psk_hex = stored_buf.unwrap_or_else(|| on_device_hex.clone());
+        // If the device just pushed a different PSK and we don't have an
+        // in-flight edit (i.e. our buffer matches some valid bytes), reseed.
+        if hex_to_bytes(&psk_hex)
+            .map(|b| b == settings.psk)
+            .unwrap_or(false)
+            && psk_hex.to_ascii_lowercase() != on_device_hex
+        {
+            psk_hex = on_device_hex.clone();
+        }
+
         let mut changed = false;
         changed |= str_field(ui, "Name", &mut settings.name);
-        if secret_field(ui, "PSK (hex)", &mut psk_hex, &format!("ch_psk_{idx}")) {
-            if let Some(b) = hex_to_bytes(&psk_hex) {
-                settings.psk = b;
-            }
+        let psk_changed = secret_field(ui, "PSK (hex)", &mut psk_hex, &format!("ch_psk_{idx}"));
+        let psk_bytes = hex_to_bytes(&psk_hex);
+        if psk_bytes.is_none() {
+            ui.colored_label(
+                ui.style().visuals.error_fg_color,
+                "PSK must be valid hex (even number of hex digits)",
+            );
+        }
+        if let Some(b) = psk_bytes.as_ref()
+            && b != &settings.psk
+        {
+            settings.psk = b.clone();
             changed = true;
         }
+        // Persist the buffer for the next frame regardless of validity.
+        ui.data_mut(|d| d.insert_temp(psk_id, psk_hex.clone()));
+        // Typing invalid hex still counts as a pending edit so watchers
+        // don't clobber it, but Apply should refuse to send.
+        let pending_edit = psk_changed && psk_bytes.is_none();
+
         changed |= ui
             .checkbox(&mut settings.uplink_enabled, "Uplink enabled")
             .changed();
@@ -665,15 +711,19 @@ fn render_channel_row(ui: &mut egui::Ui, ctx: &Ctx<'_>, ch: voicetastic_core::pr
             .changed();
         next.settings = Some(settings);
 
-        let section = Section::Channel(idx as u32);
-        if changed {
+        let section = Section::Channel(idx);
+        if changed || pending_edit {
             let mut s = ctx.shared.lock();
             s.dirty.insert(section);
-            if let Some(slot) = s.channels.iter_mut().find(|c| c.index == idx) {
+            if changed && let Some(slot) = s.channels.iter_mut().find(|c| c.index == idx) {
                 *slot = next.clone();
             }
         }
-        if ui.button(format!("Apply Channel {idx}")).clicked() {
+        let apply = ui.add_enabled(
+            psk_bytes.is_some(),
+            egui::Button::new(format!("Apply Channel {idx}")),
+        );
+        if apply.clicked() {
             spawn_apply(ctx, section, &format!("Channel {idx}"), next, |svc, c| {
                 Box::pin(async move { svc.write_channel(c).await.map(|_| ()) })
             });

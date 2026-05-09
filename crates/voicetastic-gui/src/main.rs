@@ -3,24 +3,34 @@ mod state;
 mod ui;
 mod watchers;
 
+use std::error::Error;
 use std::sync::Arc;
 
 use eframe::egui;
 use tokio::runtime::Runtime;
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use voicetastic_core::service::MeshService;
 
 use crate::app::VoicetasticApp;
 
-fn main() -> eframe::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let rt: Arc<Runtime> = Arc::new(Runtime::new().expect("failed to create tokio runtime"));
+    let rt: Arc<Runtime> = Arc::new(Runtime::new().map_err(|e| {
+        error!(error = %e, "failed to create tokio runtime");
+        e
+    })?);
 
-    let service = rt.block_on(async { MeshService::new().await.expect("MeshService::new") });
+    let service = rt
+        .block_on(async { MeshService::new().await })
+        .map_err(|e| {
+            error!(error = %e, "failed to initialise MeshService");
+            e
+        })?;
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -33,5 +43,6 @@ fn main() -> eframe::Result<()> {
         "Voicetastic",
         native_options,
         Box::new(move |cc| Ok(Box::new(VoicetasticApp::new(cc, rt, service)))),
-    )
+    )?;
+    Ok(())
 }

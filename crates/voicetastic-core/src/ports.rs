@@ -15,3 +15,11 @@ pub const PRIVATE_APP: u32 = 256;
 
 /// Meshtastic broadcast destination.
 pub const BROADCAST_ADDR: u32 = 0xFFFF_FFFF;
+
+/// Maximum accepted UTF-8 text payload size (bytes).
+///
+/// Meshtastic firmware caps text messages around 237 bytes; we accept a bit
+/// more to tolerate future bumps but reject anything obviously oversized to
+/// bound memory use. Used by both the inbound decoder and the outbound
+/// `send_text` guard.
+pub const MAX_TEXT_BYTES: usize = 1024;

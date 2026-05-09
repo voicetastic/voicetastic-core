@@ -38,7 +38,7 @@ pub enum Section {
     Network,
     Display,
     Bluetooth,
-    Channel(u32),
+    Channel(i32),
 }
 
 /// In-progress edit of the manually-fixed position. Stored as `f64` degrees

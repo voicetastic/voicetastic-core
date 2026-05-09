@@ -6,7 +6,7 @@ use prost::Message as _;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::ports::{ADMIN_APP, BROADCAST_ADDR, PRIVATE_APP, TEXT_MESSAGE_APP};
+use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, PRIVATE_APP, TEXT_MESSAGE_APP};
 use crate::proto::{
     AdminMessage, Channel, Config, Data, MeshPacket, Position, ToRadio, User, admin_message,
     config, mesh_packet, to_radio,
@@ -29,6 +29,14 @@ impl MeshService {
     /// `want_ack` is enabled only for direct messages; broadcasts are sent
     /// without ACK requests (the firmware would drop them anyway).
     pub async fn send_text(&self, text: &str, channel: u32, to: Option<u32>) -> Result<u32> {
+        // Meshtastic firmware rejects oversized text payloads; fail fast with
+        // a clear error rather than letting the radio silently drop it.
+        if text.len() > MAX_TEXT_BYTES {
+            return Err(Error::Other(format!(
+                "text payload too large: {} > {MAX_TEXT_BYTES} bytes",
+                text.len()
+            )));
+        }
         let id = self.next_id().await;
         let want_ack = to.is_some();
         let pkt = MeshPacket {
@@ -116,6 +124,13 @@ impl MeshService {
     /// [`ADMIN_APP`]. `to=` defaults to our own node number, which is the
     /// only correct destination for config writes; if `my_node_num` is not
     /// yet known the call returns [`Error::NotConnected`].
+    ///
+    /// All current callers are setters (`SetConfig`, `SetOwner`, …) which
+    /// don't need a response payload — `want_ack` already gives us
+    /// delivery confirmation. Asking for a response here would prompt the
+    /// firmware to echo every config write back as a fresh state push,
+    /// which the inbound handler would then mistake for a server-initiated
+    /// update.
     pub async fn send_admin(&self, payload: admin_message::PayloadVariant) -> Result<u32> {
         let to = self.my_node_num().ok_or(Error::NotConnected)?;
         let admin = AdminMessage {
@@ -136,7 +151,7 @@ impl MeshService {
             payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
                 portnum: ADMIN_APP as i32,
                 payload: bytes,
-                want_response: true,
+                want_response: false,
                 ..Default::default()
             })),
             ..Default::default()

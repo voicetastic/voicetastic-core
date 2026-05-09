@@ -5,6 +5,7 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use voicetastic_core::service::{ConnectionState, MeshService};
+use voicetastic_core::settings::AppSettings;
 
 use crate::state::{SharedState, Tab};
 use crate::ui;
@@ -27,12 +28,14 @@ impl VoicetasticApp {
         let shared = Arc::new(Mutex::new(SharedState::default()));
         spawn_watchers(&rt, &service, Arc::clone(&shared), cc.egui_ctx.clone());
 
+        let prefs = AppSettings::load();
+
         Self {
             rt,
             service,
             shared,
             tab: Tab::Devices,
-            device_addr: String::new(),
+            device_addr: prefs.last_device.unwrap_or_default(),
             chat_input: String::new(),
             chat_channel: 0,
         }
