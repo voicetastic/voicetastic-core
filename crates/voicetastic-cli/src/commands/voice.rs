@@ -1,7 +1,10 @@
-//! `voicetastic voice {send,listen}` — voice-message commands (raw AMR I/O).
+//! `voicetastic voice {send,listen}` — voice-message commands.
+//!
+//! The CLI uses the codec-agnostic voice protocol with codec=AMR-NB.
+//! `send` strips the `#!AMR\n` file header before chunking; `listen`
+//! re-prepends it before writing each received message back to disk.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
@@ -9,29 +12,64 @@ use tracing::{info, warn};
 use voicetastic_core::ports::PRIVATE_APP;
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
-    AmrNbBitrate, AssemblyEvent, VoiceAssembler, VoiceChunk, VoiceChunker, VoiceConfig,
-    VoiceMessage, random_message_id,
+    AssemblerConfig, AssemblyEvent, BuildConfig, MAX_BODY_SIZE, ModemPreset, VoiceAssembler,
+    VoiceCodec, VoiceDestination, VoiceMessage, build_message, detect_version, random_message_id,
 };
 
 use crate::connect::connect;
+
+/// AMR-NB file header — stripped on send, re-prepended on receive.
+const AMR_FILE_HEADER: &[u8] = b"#!AMR\n";
 
 pub async fn send(
     device: &str,
     channel: u32,
     to: Option<u32>,
     file: &Path,
-    bitrate: AmrNbBitrate,
+    bitrate: u8,
+    parity: u8,
 ) -> Result<()> {
+    if bitrate > 7 {
+        bail!("--bitrate must be 0..=7 (AMR-NB ordinal)");
+    }
     let bytes = tokio::fs::read(file)
         .await
         .with_context(|| format!("reading {}", file.display()))?;
+    // Strip optional AMR file header — the protocol carries raw codec bytes.
+    let audio = bytes
+        .strip_prefix(AMR_FILE_HEADER)
+        .unwrap_or(bytes.as_slice());
+    if audio.is_empty() {
+        bail!("file {} contains no audio frames", file.display());
+    }
+
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let message_id = random_message_id();
-    let chunks = VoiceChunker::chunk(&bytes, message_id, bitrate)?;
-    info!(chunks = chunks.len(), "sending voice");
-    let ids = svc.send_voice_chunks(chunks, channel, to).await?;
-    println!("sent voice message_id={message_id}, packet_ids={:?}", ids);
+
+    let cfg = BuildConfig {
+        message_id: random_message_id(),
+        stream_seq: 0,
+        codec: VoiceCodec::AmrNb,
+        codec_param: bitrate,
+        chunk_size: MAX_BODY_SIZE,
+        parity_count: parity,
+        last_in_stream: true,
+        encryption: None,
+    };
+    let encoded = build_message(audio, &cfg).context("chunking audio")?;
+    info!(
+        message_id = cfg.message_id,
+        data = encoded.total_data,
+        parity = encoded.parity_count,
+        "sending voice"
+    );
+    let ids = svc
+        .send_voice(&encoded, channel, to, ModemPreset::fallback_pacing())
+        .await?;
+    println!(
+        "sent voice message_id={}, packet_ids={:?}",
+        cfg.message_id, ids
+    );
     let _ = svc.disconnect().await;
     Ok(())
 }
@@ -49,32 +87,36 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
     }
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let assembler = VoiceAssembler::new(&VoiceConfig::default());
+    let assembler = VoiceAssembler::new(AssemblerConfig::default());
     let mut rx = svc.subscribe_data();
     info!("listening for voice messages, ctrl-c to stop");
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
             _ = tick.tick() => {
-                for completed in assembler.tick() {
+                let out = assembler.tick();
+                for completed in out.finalized {
                     save_amr(&base_dir, &completed).await?;
                 }
+                // NACKs would be transmitted here once we wire the
+                // sender-side selective-retransmission state machine.
             }
             data = rx.recv() => match data {
                 Ok(d) => {
                     if d.portnum != PRIVATE_APP as i32 { continue; }
+                    if detect_version(&d.payload) != Some(0x01) { continue; }
                     let from_id = voicetastic_core::ids::node_num_to_id(d.from);
-                    let to_id = voicetastic_core::ids::node_num_to_id(d.to);
-                    let chunk = match VoiceChunk::parse(&d.payload) {
-                        Ok(c) => c,
-                        Err(e) => { warn!(?e, "bad voice chunk"); continue; }
+                    let to = if d.to == voicetastic_core::ports::BROADCAST_ADDR {
+                        VoiceDestination::Broadcast
+                    } else {
+                        VoiceDestination::Node(d.to)
                     };
-                    match assembler.accept(&from_id, &to_id, d.channel, chunk) {
+                    match assembler.accept(&from_id, to, d.channel, &d.payload) {
                         AssemblyEvent::Complete(msg) => save_amr(&base_dir, &msg).await?,
-                        AssemblyEvent::Pending => {}
-                        AssemblyEvent::Duplicate => {}
-                        AssemblyEvent::Rejected => warn!("rejected voice chunk"),
+                        AssemblyEvent::Pending | AssemblyEvent::Duplicate => {}
+                        AssemblyEvent::Nack(_) => {}
+                        AssemblyEvent::Rejected(e) => warn!(?e, "rejected voice frame"),
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -91,7 +133,7 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
 /// Build a sanitized output path under `base_dir`. Returns an error if the
 /// constructed filename contains path separators or otherwise resolves
 /// outside `base_dir` (defense-in-depth — the filename comes from a `u32`
-/// node number formatted as `!aabbccdd` plus a `u16` message id, so this
+/// node number formatted as `!aabbccdd` plus a `u32` message id, so this
 /// should never fail in practice).
 fn safe_join(base_dir: &Path, filename: &str) -> Result<PathBuf> {
     if filename.is_empty()
@@ -115,17 +157,26 @@ fn safe_join(base_dir: &Path, filename: &str) -> Result<PathBuf> {
 }
 
 async fn save_amr(base_dir: &Path, msg: &VoiceMessage) -> Result<()> {
+    if msg.codec != VoiceCodec::AmrNb {
+        warn!(codec = ?msg.codec, "skipping non-AMR voice message");
+        return Ok(());
+    }
     let filename = format!(
         "{}_{}.amr",
         msg.from.trim_start_matches('!'),
         msg.message_id
     );
     let path = safe_join(base_dir, &filename)?;
-    tokio::fs::write(&path, &msg.audio_data).await?;
+    // Re-prepend the AMR file header so the resulting file is playable.
+    let mut out = Vec::with_capacity(AMR_FILE_HEADER.len() + msg.audio.len());
+    out.extend_from_slice(AMR_FILE_HEADER);
+    out.extend_from_slice(&msg.audio);
+    tokio::fs::write(&path, &out).await?;
     println!(
-        "received voice from {} ({} bytes) -> {}",
+        "received voice from {} ({} bytes, complete={}) -> {}",
         msg.from,
-        msg.audio_data.len(),
+        out.len(),
+        msg.is_complete,
         path.display()
     );
     Ok(())

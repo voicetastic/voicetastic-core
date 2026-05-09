@@ -89,21 +89,32 @@ impl MeshService {
         Ok(id)
     }
 
-    /// Send pre-chunked voice payloads, sleeping
-    /// [`crate::voice::INTER_CHUNK_DELAY_MS`] between each.
-    pub async fn send_voice_chunks(
+    /// Send a voice message.
+    ///
+    /// The caller pre-encodes the audio into wire frames via
+    /// [`crate::voice::build_message`] and supplies the resulting
+    /// [`crate::voice::EncodedMessage`] together with a `pacing` delay
+    /// derived from the current LoRa modem preset (see
+    /// [`crate::voice::ModemPreset::pacing`]).
+    ///
+    /// Each DATA / PARITY frame is sent via [`PRIVATE_APP`] with `want_ack`
+    /// set for direct messages and cleared for broadcasts (the firmware
+    /// drops broadcast ACK requests anyway).
+    pub async fn send_voice(
         &self,
-        chunks: Vec<Vec<u8>>,
+        message: &crate::voice::EncodedMessage,
         channel: u32,
         to: Option<u32>,
+        pacing: Duration,
     ) -> Result<Vec<u32>> {
-        let mut ids = Vec::with_capacity(chunks.len());
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            if i > 0 {
-                tokio::time::sleep(Duration::from_millis(crate::voice::INTER_CHUNK_DELAY_MS)).await;
+        let want_ack = to.is_some();
+        let mut ids = Vec::with_capacity(message.frames.len());
+        for (i, frame) in message.frames.iter().enumerate() {
+            if i > 0 && !pacing.is_zero() {
+                tokio::time::sleep(pacing).await;
             }
             ids.push(
-                self.send_data(PRIVATE_APP as i32, chunk, channel, to, false)
+                self.send_data(PRIVATE_APP as i32, frame.clone(), channel, to, want_ack)
                     .await?,
             );
         }

@@ -6,10 +6,10 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use voicetastic_core::ids::node_num_to_id;
-use voicetastic_core::ports::PRIVATE_APP;
+use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
-    AssemblyEvent, VoiceAssembler, VoiceChunk, VoiceConfig, VoiceMessage,
+    AssemblerConfig, AssemblyEvent, VoiceAssembler, VoiceDestination, VoiceMessage, detect_version,
 };
 
 use crate::state::{ChatEntry, Section, SharedState};
@@ -168,27 +168,29 @@ pub fn spawn_watchers(
         let s = Arc::clone(&shared);
         let c = ctx.clone();
         rt.spawn(async move {
-            let assembler = VoiceAssembler::new(&VoiceConfig::default());
-            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            let assembler = VoiceAssembler::new(AssemblerConfig::default());
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        for completed in assembler.tick() {
+                        let out = assembler.tick();
+                        for completed in out.finalized {
                             push_voice_entry(&s, &c, &completed);
                         }
                     }
                     msg = rx.recv() => match msg {
                         Ok(d) => {
                             if d.portnum != PRIVATE_APP as i32 { continue; }
+                            if detect_version(&d.payload) != Some(0x01) { continue; }
                             let from_id = node_num_to_id(d.from);
-                            let to_id = node_num_to_id(d.to);
-                            let chunk = match VoiceChunk::parse(&d.payload) {
-                                Ok(c) => c,
-                                Err(_) => continue,
+                            let to = if d.to == BROADCAST_ADDR {
+                                VoiceDestination::Broadcast
+                            } else {
+                                VoiceDestination::Node(d.to)
                             };
                             if let AssemblyEvent::Complete(m) =
-                                assembler.accept(&from_id, &to_id, d.channel, chunk)
+                                assembler.accept(&from_id, to, d.channel, &d.payload)
                             {
                                 push_voice_entry(&s, &c, &m);
                             }
@@ -208,15 +210,15 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
     let label = if msg.is_complete {
         format!(
             "🎙 voice message ({} bytes, {} chunks)",
-            msg.audio_data.len(),
-            msg.total_chunks
+            msg.audio.len(),
+            msg.total_data
         )
     } else {
         format!(
             "🎙 voice message (partial: {}/{} chunks, {} bytes)",
-            msg.received_chunks,
-            msg.total_chunks,
-            msg.audio_data.len()
+            msg.received_data,
+            msg.total_data,
+            msg.audio.len()
         )
     };
     s.lock().chat_log.push(ChatEntry {

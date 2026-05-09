@@ -5,11 +5,9 @@ mod commands;
 mod connect;
 mod util;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-
-use voicetastic_core::voice::AmrNbBitrate;
 
 use crate::cli::{Cli, Command, DeviceCmd, TextCmd, VoiceCmd};
 use crate::util::{read_stdin_line, require_device};
@@ -41,13 +39,12 @@ async fn main() -> Result<()> {
             VoiceCmd::Send {
                 file,
                 bitrate,
+                parity,
                 channel,
                 to,
             } => {
                 let device = require_device(cli.device)?;
-                let bitrate =
-                    AmrNbBitrate::from_ordinal(bitrate).context("--bitrate must be 0..=7")?;
-                commands::voice::send(&device, channel, to, &file, bitrate).await
+                commands::voice::send(&device, channel, to, &file, bitrate, parity).await
             }
             VoiceCmd::Listen { out_dir } => {
                 let device = require_device(cli.device)?;

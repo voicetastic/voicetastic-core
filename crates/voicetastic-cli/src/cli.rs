@@ -71,9 +71,13 @@ pub enum VoiceCmd {
     Send {
         /// Path to an existing AMR-NB file (must start with `#!AMR\n`).
         file: PathBuf,
-        /// AMR-NB bitrate ordinal (0..=7). Should match the file's frames.
+        /// AMR-NB bitrate ordinal (0..=7) carried in the `codec_param`
+        /// field. Should match the file's frames.
         #[arg(long, default_value_t = 5)]
         bitrate: u8,
+        /// Number of Reed-Solomon parity chunks (0..=128).
+        #[arg(long, default_value_t = 0)]
+        parity: u8,
         /// Channel index (0 = primary).
         #[arg(long, default_value_t = 0)]
         channel: u32,
