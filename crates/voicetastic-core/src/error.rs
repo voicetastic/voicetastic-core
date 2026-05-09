@@ -4,6 +4,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    /// btleplug-specific BLE failure. Only emitted by the built-in BLE
+    /// transport (`ble-btleplug` feature). Downstream `Transport`
+    /// implementations report their own failures via [`Error::Other`].
+    #[cfg(feature = "ble-btleplug")]
     #[error("BLE error: {0}")]
     Ble(#[from] btleplug::Error),
 

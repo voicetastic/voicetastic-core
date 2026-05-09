@@ -8,7 +8,12 @@
 //! - [`ids`]: node-number ↔ `!aabbccdd` text-id helpers.
 //! - [`ports`]: Meshtastic application port constants.
 //! - [`voice`]: AMR-NB chunker / assembler (no codec — bytes only).
-//! - [`ble`]: BLE GATT transport implementation (btleplug).
+//! - [`transport`]: [`Transport`] trait — the seam through which
+//!   [`service::MeshService`] talks to a radio. Built-in implementations
+//!   ([`ble`], [`serial`]) are feature-gated; downstream consumers
+//!   (Android, tests, …) can supply their own.
+//! - [`ble`]: BLE GATT transport (feature `ble-btleplug`, default on).
+//! - [`serial`]: USB-serial transport (feature `serial-tokio`, default on).
 //! - [`service`]: high-level [`MeshService`](service::MeshService) façade.
 //! - [`error`]: unified error type.
 
@@ -17,10 +22,14 @@ pub mod ids;
 pub mod ports;
 pub mod proto;
 pub mod settings;
+pub mod transport;
 pub mod voice;
 
+#[cfg(feature = "ble-btleplug")]
 pub mod ble;
+#[cfg(feature = "serial-tokio")]
 pub mod serial;
 pub mod service;
 
 pub use error::{Error, Result};
+pub use transport::Transport;

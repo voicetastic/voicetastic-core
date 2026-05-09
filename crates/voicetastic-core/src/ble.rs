@@ -292,3 +292,17 @@ impl Connection {
         Ok(())
     }
 }
+
+// Wire `Connection` into the cross-transport `MeshService` plumbing. The
+// inherent methods above are kept (and remain the canonical API for direct
+// BLE callers); this `impl` is a zero-cost forwarding shim so a
+// `Arc<Connection>` can be stored as `Arc<dyn crate::Transport>`.
+#[async_trait::async_trait]
+impl crate::Transport for Connection {
+    async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
+        Connection::write_to_radio(self, bytes).await
+    }
+    async fn disconnect(&self) -> Result<()> {
+        Connection::disconnect(self).await
+    }
+}

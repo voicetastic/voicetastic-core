@@ -158,6 +158,18 @@ impl SerialConnection {
     }
 }
 
+// Wire `SerialConnection` into the cross-transport `MeshService` plumbing.
+// See the analogous impl in `crate::ble`.
+#[async_trait::async_trait]
+impl crate::Transport for SerialConnection {
+    async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
+        SerialConnection::write_to_radio(self, bytes).await
+    }
+    async fn disconnect(&self) -> Result<()> {
+        SerialConnection::disconnect(self).await
+    }
+}
+
 /// Read one deframed protobuf payload from the serial stream.
 ///
 /// Scans for the `START1 START2` magic, reads the 2-byte big-endian length,

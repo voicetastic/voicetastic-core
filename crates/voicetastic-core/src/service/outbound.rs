@@ -13,8 +13,8 @@ use crate::proto::{
 };
 
 use super::MeshService;
-use super::transport::Transport;
 use super::types::rand_u32;
+use crate::transport::Transport;
 
 impl MeshService {
     pub(super) async fn send_want_config(&self) -> Result<()> {
@@ -211,17 +211,16 @@ impl MeshService {
         let transport = {
             let slot = self.inner.transport.lock().await;
             match slot.as_ref() {
-                Some(Transport::Ble(c)) => Transport::Ble(c.clone()),
-                Some(Transport::Serial(c)) => Transport::Serial(c.clone()),
+                Some(t) => t.clone(),
                 None => return Err(Error::NotConnected),
             }
         };
-        self.send_to_radio_via(&transport, payload).await
+        self.send_to_radio_via(transport.as_ref(), payload).await
     }
 
     pub(super) async fn send_to_radio_via(
         &self,
-        transport: &Transport,
+        transport: &dyn Transport,
         payload: to_radio::PayloadVariant,
     ) -> Result<()> {
         let msg = ToRadio {

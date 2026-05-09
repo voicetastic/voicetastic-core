@@ -1,13 +1,17 @@
-//! High-level façade over [`crate::ble`], [`crate::serial`], and [`crate::proto`].
+//! High-level façade over a [`crate::Transport`] and [`crate::proto`].
 //!
-//! [`MeshService`] owns either a BLE [`crate::ble::Connection`] or a
-//! [`crate::serial::SerialConnection`], sends a `WantConfigId` handshake on
-//! connect, fans incoming `FromRadio` messages out to typed observers, and
-//! exposes outbound helpers (`send_text`, `send_data`).
+//! [`MeshService`] owns an `Arc<dyn Transport>`, sends a `WantConfigId`
+//! handshake on connect, fans incoming `FromRadio` messages out to typed
+//! observers, and exposes outbound helpers (`send_text`, `send_data`).
+//!
+//! Two convenience constructors wrap the in-tree built-in transports:
+//! [`MeshService::connect_by_address`] (BLE, requires the `ble-btleplug`
+//! feature) and [`MeshService::connect_by_serial`] (USB-serial, requires
+//! `serial-tokio`). External transports — e.g. an Android JNI bridge —
+//! plug in via [`MeshService::connect_with_transport`].
 
 mod inbound;
 mod outbound;
-mod transport;
 mod types;
 
 use std::collections::HashMap;
@@ -22,6 +26,7 @@ use tracing::warn;
 /// `ConfigCompleteId`, we revert to `Connected` so the UI isn't stranded.
 const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(feature = "ble-btleplug")]
 use crate::ble::{BleManager, CONFIG_REQUEST_DELAY, Connection, DiscoveredDevice};
 use crate::error::Result;
 use crate::proto::{
@@ -32,9 +37,9 @@ use crate::proto::{
     },
     to_radio,
 };
+#[cfg(feature = "serial-tokio")]
 use crate::serial::SerialConnection;
-
-use transport::Transport;
+use crate::transport::Transport;
 
 pub use types::{ConnectionState, IncomingData, IncomingText, node_long_name};
 
@@ -45,8 +50,9 @@ pub struct MeshService {
 }
 
 struct Inner {
+    #[cfg(feature = "ble-btleplug")]
     ble: tokio::sync::OnceCell<BleManager>,
-    transport: Mutex<Option<Transport>>,
+    transport: Mutex<Option<Arc<dyn Transport>>>,
     state_tx: watch::Sender<ConnectionState>,
     my_info_tx: watch::Sender<Option<MyNodeInfo>>,
     nodes_tx: watch::Sender<HashMap<u32, NodeInfo>>,
@@ -70,7 +76,6 @@ struct Inner {
 
 impl MeshService {
     pub async fn new() -> Result<Self> {
-        let ble = tokio::sync::OnceCell::new();
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
         let (my_info_tx, _) = watch::channel(None);
         let (nodes_tx, _) = watch::channel(HashMap::new());
@@ -89,7 +94,8 @@ impl MeshService {
         let (metadata_tx, _) = watch::channel(None);
         Ok(Self {
             inner: Arc::new(Inner {
-                ble,
+                #[cfg(feature = "ble-btleplug")]
+                ble: tokio::sync::OnceCell::new(),
                 transport: Mutex::new(None),
                 state_tx,
                 my_info_tx,
@@ -115,9 +121,11 @@ impl MeshService {
         })
     }
 
+    #[cfg(feature = "ble-btleplug")]
     pub async fn scan(&self) -> Result<mpsc::Receiver<DiscoveredDevice>> {
         self.ble().await?.scan().await
     }
+    #[cfg(feature = "ble-btleplug")]
     pub async fn stop_scan(&self) -> Result<()> {
         self.ble().await?.stop_scan().await
     }
@@ -206,24 +214,34 @@ impl MeshService {
         Ok(())
     }
 
-    /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).
-    pub async fn connect_by_address(&self, address: &str) -> Result<()> {
-        self.set_state(ConnectionState::Connecting);
-        let peripheral = self.ble().await?.peripheral_by_address(address).await?;
-        let conn = Arc::new(Connection::open(peripheral).await?);
-        let transport = Transport::Ble(conn.clone());
+    /// Connect using a caller-supplied [`Transport`] and inbound stream.
+    ///
+    /// This is the transport-agnostic entry point — built-in helpers like
+    /// [`Self::connect_by_address`] / [`Self::connect_by_serial`] are thin
+    /// wrappers around it, and external consumers (Android JNI bridge, test
+    /// loopback, …) can call it directly.
+    ///
+    /// `inbound` is the stream of decoded `FromRadio` payloads (already
+    /// deframed by the transport). `settle_delay` is observed before the
+    /// initial `WantConfigId` is sent — pass `Duration::ZERO` if the
+    /// underlying transport is already fully ready.
+    ///
+    /// Once the inbound stream returns `None`, the service is moved to
+    /// [`ConnectionState::Disconnected`] and the transport slot cleared.
+    pub async fn connect_with_transport(
+        &self,
+        transport: Arc<dyn Transport>,
+        inbound: mpsc::Receiver<Vec<u8>>,
+        settle_delay: Duration,
+    ) -> Result<()> {
         {
             let mut slot = self.inner.transport.lock().await;
             *slot = Some(transport);
         }
         self.set_state(ConnectionState::Connected);
 
-        // `subscribe_inbound` already drains on every notify and on the safety
-        // poll, so we must NOT drain here too: btleplug serialises GATT reads
-        // per peripheral, but issuing concurrent drains would still race for
-        // the FROMRADIO queue ordering.
-        let mut inbound = conn.clone().subscribe_inbound().await?;
         let svc = self.clone();
+        let mut inbound = inbound;
         tokio::spawn(async move {
             while let Some(payload) = inbound.recv().await {
                 if let Err(e) = svc.handle_from_radio(&payload).await {
@@ -235,48 +253,46 @@ impl MeshService {
             *slot = None;
         });
 
-        tokio::time::sleep(CONFIG_REQUEST_DELAY).await;
+        if !settle_delay.is_zero() {
+            tokio::time::sleep(settle_delay).await;
+        }
         self.set_state(ConnectionState::Configuring);
         self.send_want_config().await?;
         self.spawn_config_watchdog();
         Ok(())
     }
 
+    /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).
+    #[cfg(feature = "ble-btleplug")]
+    pub async fn connect_by_address(&self, address: &str) -> Result<()> {
+        self.set_state(ConnectionState::Connecting);
+        let peripheral = self.ble().await?.peripheral_by_address(address).await?;
+        let conn = Arc::new(Connection::open(peripheral).await?);
+        // `subscribe_inbound` already drains on every notify and on the safety
+        // poll, so we must NOT drain here too: btleplug serialises GATT reads
+        // per peripheral, but issuing concurrent drains would still race for
+        // the FROMRADIO queue ordering.
+        let inbound = conn.clone().subscribe_inbound().await?;
+        self.connect_with_transport(conn as Arc<dyn Transport>, inbound, CONFIG_REQUEST_DELAY)
+            .await
+    }
+
     /// Connect to a device by serial port path (e.g. `/dev/ttyUSB0`).
+    #[cfg(feature = "serial-tokio")]
     pub async fn connect_by_serial(&self, path: &str) -> Result<()> {
         self.connect_by_serial_baud(path, crate::serial::DEFAULT_BAUD)
             .await
     }
 
     /// Connect to a device by serial port path with a custom baud rate.
+    #[cfg(feature = "serial-tokio")]
     pub async fn connect_by_serial_baud(&self, path: &str, baud: u32) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
         let serial = Arc::new(SerialConnection::open(path, baud).await?);
-        let transport = Transport::Serial(serial.clone());
-        {
-            let mut slot = self.inner.transport.lock().await;
-            *slot = Some(transport);
-        }
-        self.set_state(ConnectionState::Connected);
-
-        let mut inbound = serial.subscribe_inbound().await?;
-        let svc = self.clone();
-        tokio::spawn(async move {
-            while let Some(payload) = inbound.recv().await {
-                if let Err(e) = svc.handle_from_radio(&payload).await {
-                    warn!(?e, "from_radio handler failed");
-                }
-            }
-            svc.set_state(ConnectionState::Disconnected);
-            let mut slot = svc.inner.transport.lock().await;
-            *slot = None;
-        });
-
-        tokio::time::sleep(CONFIG_REQUEST_DELAY).await;
-        self.set_state(ConnectionState::Configuring);
-        self.send_want_config().await?;
-        self.spawn_config_watchdog();
-        Ok(())
+        let inbound = serial.subscribe_inbound().await?;
+        // Serial port is fully ready after `open` — no settle delay needed.
+        self.connect_with_transport(serial as Arc<dyn Transport>, inbound, Duration::ZERO)
+            .await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -286,7 +302,7 @@ impl MeshService {
         };
         if let Some(t) = transport {
             let _ = self
-                .send_to_radio_via(&t, to_radio::PayloadVariant::Disconnect(true))
+                .send_to_radio_via(t.as_ref(), to_radio::PayloadVariant::Disconnect(true))
                 .await;
             t.disconnect().await?;
         }
@@ -302,6 +318,7 @@ impl MeshService {
     /// succeed on machines without Bluetooth (serial-only setups, CI hosts,
     /// integration tests). Failures still surface to the caller of any
     /// BLE-touching method.
+    #[cfg(feature = "ble-btleplug")]
     async fn ble(&self) -> Result<&BleManager> {
         self.inner
             .ble

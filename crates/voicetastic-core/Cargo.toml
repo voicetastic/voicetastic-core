@@ -13,14 +13,27 @@ futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 prost = { workspace = true }
-btleplug = { workspace = true }
-uuid = { workspace = true }
-tokio-serial = { workspace = true }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 getrandom = { workspace = true }
+
+# Optional desktop transports. Off-by-default for Android / embedded
+# consumers that supply their own `Transport` implementation.
+btleplug = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+tokio-serial = { workspace = true, optional = true }
+
+[features]
+# Default features keep desktop (CLI/GUI) builds working without changes.
+default = ["ble-btleplug", "serial-tokio"]
+# BLE GATT transport via the `btleplug` crate (BlueZ on Linux, CoreBluetooth on
+# macOS, WinRT on Windows). Pulls in `uuid` for the GATT characteristic IDs.
+ble-btleplug = ["dep:btleplug", "dep:uuid"]
+# USB-serial transport via `tokio-serial` (Unix termios / Win32 COM ports).
+serial-tokio = ["dep:tokio-serial"]
 
 [build-dependencies]
 prost-build = { workspace = true }
