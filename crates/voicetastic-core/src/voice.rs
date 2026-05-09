@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::warn;
 
 /// Current protocol version. Receivers must reject any other value.
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -34,6 +35,17 @@ pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
 /// Recently-completed message blacklist parameters.
 const BLACKLIST_TTL: Duration = Duration::from_secs(60);
 const BLACKLIST_MAX: usize = 100;
+
+/// Maximum number of in-progress reassemblies kept at once. Prevents an
+/// unbounded `HashMap` if a remote node spams unique `message_id`s without
+/// ever finishing a message. When exceeded, the oldest entry (by
+/// `started_at`) is evicted on insert.
+pub const MAX_IN_PROGRESS: usize = 64;
+
+/// Hard cap on the audio bytes accumulated for a single in-progress
+/// message. `MAX_CHUNKS_PER_MESSAGE * MAX_PAYLOAD_SIZE` is the natural ceiling
+/// (≈ 57 KB), so this is mostly belt-and-braces against a wire-protocol bug.
+pub const MAX_MESSAGE_BYTES: usize = MAX_CHUNKS_PER_MESSAGE * MAX_PAYLOAD_SIZE;
 
 /// Generate a non-zero random `u16` suitable for use as a voice
 /// `message_id`. Zero is reserved as "unset" by the chunk header convention.
@@ -294,6 +306,7 @@ struct AssemblyState {
     bitrate: AmrNbBitrate,
     chunks: Vec<Option<Vec<u8>>>,
     received: u8,
+    bytes: usize,
     started_at: Instant,
     first_seen: chrono::DateTime<chrono::Utc>,
     to: String,
@@ -307,6 +320,7 @@ impl AssemblyState {
             bitrate,
             chunks: vec![None; total_chunks as usize],
             received: 0,
+            bytes: 0,
             started_at: Instant::now(),
             first_seen: chrono::Utc::now(),
             to,
@@ -373,9 +387,44 @@ impl VoiceAssembler {
             return AssemblyEvent::Rejected;
         }
 
+        // Cap concurrent in-progress reassemblies. If full and this is a new
+        // message, evict the oldest one (DoS guard against a peer that emits
+        // unique message_ids without ever finishing). Existing entries pass.
+        if !inner.in_progress.contains_key(&key)
+            && inner.in_progress.len() >= MAX_IN_PROGRESS
+            && let Some(victim) = inner
+                .in_progress
+                .iter()
+                .min_by_key(|(_, v)| v.started_at)
+                .map(|(k, _)| k.clone())
+        {
+            warn!(
+                from = %victim.0,
+                message_id = victim.1,
+                in_progress = inner.in_progress.len(),
+                "voice assembler full; evicting oldest in-progress message"
+            );
+            inner.in_progress.remove(&victim);
+            push_blacklist(&mut inner.blacklist, victim, now);
+        }
+
         let state = inner.in_progress.entry(key.clone()).or_insert_with(|| {
             AssemblyState::new(chunk.total_chunks, chunk.bitrate, to.to_string(), channel)
         });
+
+        // Same (from, message_id) but a different totalChunks declared.
+        // Per protocol the value is fixed for the lifetime of one message;
+        // log so a buggy sender doesn't fail silently.
+        if chunk.total_chunks != state.total_chunks {
+            warn!(
+                from = %key.0,
+                message_id = key.1,
+                expected_total = state.total_chunks,
+                got_total = chunk.total_chunks,
+                "voice chunk totalChunks mismatch; rejecting"
+            );
+            return AssemblyEvent::Rejected;
+        }
 
         let idx = chunk.chunk_index as usize;
         if idx >= state.chunks.len() {
@@ -385,6 +434,21 @@ impl VoiceAssembler {
         if state.chunks[idx].is_some() {
             return AssemblyEvent::Duplicate;
         }
+        // Hard byte cap: refuse to grow beyond MAX_MESSAGE_BYTES.
+        let new_bytes = state.bytes.saturating_add(chunk.payload.len());
+        if new_bytes > MAX_MESSAGE_BYTES {
+            warn!(
+                from = %key.0,
+                message_id = key.1,
+                bytes = new_bytes,
+                max = MAX_MESSAGE_BYTES,
+                "voice message exceeds byte cap; dropping reassembly"
+            );
+            inner.in_progress.remove(&key);
+            push_blacklist(&mut inner.blacklist, key, now);
+            return AssemblyEvent::Rejected;
+        }
+        state.bytes = new_bytes;
         state.chunks[idx] = Some(chunk.payload);
         state.received = state.received.saturating_add(1);
 

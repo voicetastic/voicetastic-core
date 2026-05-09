@@ -97,7 +97,10 @@ impl MeshService {
                 config_complete_tx,
                 incoming_text_tx,
                 incoming_data_tx,
-                next_packet_id: Mutex::new(1),
+                // Meshtastic firmware uses packet id for flood-routing
+                // deduplication; tiny sequential ids would clash with
+                // recently-seen packets, so seed from the OS RNG.
+                next_packet_id: Mutex::new(types::rand_u32().max(1)),
                 lora_tx,
                 device_tx,
                 position_tx,
@@ -180,7 +183,17 @@ impl MeshService {
 
     /// Re-request the entire configuration burst.
     pub async fn refresh_config(&self) -> Result<()> {
-        // Clear local snapshots so callers can detect a fresh burst.
+        let prev = *self.inner.state_tx.borrow();
+        self.set_state(ConnectionState::Configuring);
+        if let Err(e) = self.send_want_config().await {
+            // Don't strand the UI in `Configuring` if we can't actually ask.
+            // Snapshots are intentionally NOT cleared on failure so the UI
+            // continues to show the last-known good values.
+            self.set_state(prev);
+            return Err(e);
+        }
+        // Only clear local snapshots after the request was actually sent, so
+        // a transport failure doesn't blank out the settings UI.
         let _ = self.inner.lora_tx.send(None);
         let _ = self.inner.device_tx.send(None);
         let _ = self.inner.position_tx.send(None);
@@ -189,13 +202,6 @@ impl MeshService {
         let _ = self.inner.display_tx.send(None);
         let _ = self.inner.bluetooth_tx.send(None);
         let _ = self.inner.channels_tx.send(Vec::new());
-        let prev = *self.inner.state_tx.borrow();
-        self.set_state(ConnectionState::Configuring);
-        if let Err(e) = self.send_want_config().await {
-            // Don't strand the UI in `Configuring` if we can't actually ask.
-            self.set_state(prev);
-            return Err(e);
-        }
         self.spawn_config_watchdog();
         Ok(())
     }
@@ -523,10 +529,19 @@ mod tests {
         svc.handle_from_radio(&bytes).await.unwrap();
         assert!(svc.inner.lora_tx.borrow().is_some());
 
-        // No transport: send_want_config will fail and refresh_config returns
-        // Err — but the snapshots must already be cleared by then.
-        let _ = svc.refresh_config().await;
-        assert!(svc.inner.lora_tx.borrow().is_none());
-        assert!(svc.inner.channels_tx.borrow().is_empty());
+        // No transport: send_want_config fails and refresh_config returns
+        // Err. In that case we keep the previous snapshots so the UI is not
+        // blanked by a transient transport hiccup.
+        let prev_state = *svc.inner.state_tx.borrow();
+        assert!(svc.refresh_config().await.is_err());
+        assert!(
+            svc.inner.lora_tx.borrow().is_some(),
+            "snapshots must survive a failed refresh"
+        );
+        assert_eq!(
+            *svc.inner.state_tx.borrow(),
+            prev_state,
+            "state must revert when refresh fails"
+        );
     }
 }

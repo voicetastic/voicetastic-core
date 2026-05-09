@@ -121,15 +121,19 @@ pub fn spawn_watchers(
                 match rx.recv().await {
                     Ok(msg) => {
                         s.lock().chat_log.push(ChatEntry {
-                            from_id: msg.from_id.clone(),
                             text: msg.text.clone(),
                             rx_time: msg.rx_time,
                             outgoing: false,
+                            channel: msg.channel,
+                            from_num: msg.from,
+                            to_num: msg.to,
                         });
                         c.request_repaint();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(_) => {} // lagged
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "text broadcast lagged");
+                    }
                 }
             }
         });
@@ -190,7 +194,9 @@ pub fn spawn_watchers(
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(_) => {} // lagged
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(skipped = n, "voice broadcast lagged");
+                        }
                     },
                 }
             }
@@ -214,10 +220,12 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
         )
     };
     s.lock().chat_log.push(ChatEntry {
-        from_id: msg.from.clone(),
         text: label,
         rx_time: 0,
         outgoing: false,
+        channel: msg.channel,
+        from_num: 0,
+        to_num: 0,
     });
     c.request_repaint();
 }

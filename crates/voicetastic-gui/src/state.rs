@@ -19,11 +19,16 @@ pub enum Tab {
 
 #[derive(Clone)]
 pub struct ChatEntry {
-    pub from_id: String,
     pub text: String,
     #[allow(dead_code)]
     pub rx_time: u32,
     pub outgoing: bool,
+    /// Channel index this message belongs to.
+    pub channel: u32,
+    /// Sender node num (0 for our own outgoing messages where it isn't known yet).
+    pub from_num: u32,
+    /// Destination node num. `0xFFFF_FFFF` = broadcast.
+    pub to_num: u32,
 }
 
 /// Identifies one editable settings section. Used as a dirty-tracking key

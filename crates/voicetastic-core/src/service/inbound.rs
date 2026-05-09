@@ -167,19 +167,29 @@ impl MeshService {
                 );
                 return;
             }
-            if let Ok(text) = String::from_utf8(payload.clone()) {
-                let from_id = node_num_to_id(pkt.from);
-                let _ = self.inner.incoming_text_tx.send(IncomingText {
-                    from: pkt.from,
-                    from_id,
-                    to: pkt.to,
-                    channel: pkt.channel,
-                    text,
-                    rx_time: pkt.rx_time,
-                    rx_snr: pkt.rx_snr,
-                    rx_rssi: pkt.rx_rssi,
-                });
-                return;
+            match String::from_utf8(payload.clone()) {
+                Ok(text) => {
+                    let from_id = node_num_to_id(pkt.from);
+                    let _ = self.inner.incoming_text_tx.send(IncomingText {
+                        from: pkt.from,
+                        from_id,
+                        to: pkt.to,
+                        channel: pkt.channel,
+                        text,
+                        rx_time: pkt.rx_time,
+                        rx_snr: pkt.rx_snr,
+                        rx_rssi: pkt.rx_rssi,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    warn!(
+                        from = pkt.from,
+                        len = payload.len(),
+                        ?e,
+                        "malformed UTF-8 on TextMessageApp; falling through to data fan-out"
+                    );
+                }
             }
         }
         let _ = self.inner.incoming_data_tx.send(IncomingData {

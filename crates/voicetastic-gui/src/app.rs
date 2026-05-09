@@ -21,6 +21,8 @@ pub struct VoicetasticApp {
     // Chat tab
     pub chat_input: String,
     pub chat_channel: u32,
+    /// Destination node num for outgoing messages. `None` = broadcast.
+    pub chat_dest: Option<u32>,
 }
 
 impl VoicetasticApp {
@@ -38,6 +40,7 @@ impl VoicetasticApp {
             device_addr: prefs.last_device.unwrap_or_default(),
             chat_input: String::new(),
             chat_channel: 0,
+            chat_dest: None,
         }
     }
 }

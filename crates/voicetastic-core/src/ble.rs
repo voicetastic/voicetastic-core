@@ -8,7 +8,7 @@ use std::time::Duration;
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -125,6 +125,7 @@ pub struct Connection {
     write_lock: Arc<Mutex<()>>,
     write_sema: Arc<Semaphore>,
     read_lock: Arc<Mutex<()>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl Connection {
@@ -180,6 +181,7 @@ impl Connection {
             write_lock: Arc::new(Mutex::new(())),
             write_sema: Arc::new(Semaphore::new(1)),
             read_lock: Arc::new(Mutex::new(())),
+            shutdown: watch::channel(false).0,
         })
     }
 
@@ -225,43 +227,58 @@ impl Connection {
     /// Subscribe to inbound `FROMRADIO` payloads.
     ///
     /// Spawns a background task that drains on every `FROMNUM` notify and
-    /// re-polls every [`POLL_INTERVAL`] as a safety net.
+    /// re-polls every [`POLL_INTERVAL`] as a safety net. Both spawned tasks
+    /// observe the [`Connection::disconnect`] signal and exit promptly.
     pub async fn subscribe_inbound(self: Arc<Self>) -> Result<mpsc::Receiver<Vec<u8>>> {
         let (tx, rx) = mpsc::channel(64);
         let conn = self.clone();
         let mut notifs = conn.peripheral.notifications().await?;
         let tx_notify = tx.clone();
         let conn_notify = conn.clone();
+        let mut shutdown_notify = conn.shutdown.subscribe();
         tokio::spawn(async move {
-            while let Some(n) = notifs.next().await {
-                if n.uuid == FROMNUM_UUID
-                    && let Ok(payloads) = conn_notify.drain_from_radio().await
-                {
-                    for p in payloads {
-                        if tx_notify.send(p).await.is_err() {
-                            return;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_notify.changed() => return,
+                    n = notifs.next() => {
+                        let Some(n) = n else { return };
+                        if n.uuid == FROMNUM_UUID
+                            && let Ok(payloads) = conn_notify.drain_from_radio().await
+                        {
+                            for p in payloads {
+                                if tx_notify.send(p).await.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                 }
             }
         });
         let conn_poll = conn;
+        let mut shutdown_poll = conn_poll.shutdown.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
-                match conn_poll.drain_from_radio().await {
-                    Ok(payloads) => {
-                        for p in payloads {
-                            if tx.send(p).await.is_err() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_poll.changed() => return,
+                    _ = interval.tick() => {
+                        match conn_poll.drain_from_radio().await {
+                            Ok(payloads) => {
+                                for p in payloads {
+                                    if tx.send(p).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(?e, "FROMRADIO poll failed");
                                 return;
                             }
                         }
-                    }
-                    Err(e) => {
-                        warn!(?e, "FROMRADIO poll failed");
-                        return;
                     }
                 }
             }
@@ -270,6 +287,7 @@ impl Connection {
     }
 
     pub async fn disconnect(&self) -> Result<()> {
+        let _ = self.shutdown.send(true);
         self.peripheral.disconnect().await?;
         Ok(())
     }
