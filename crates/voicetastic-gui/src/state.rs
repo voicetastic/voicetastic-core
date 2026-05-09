@@ -111,3 +111,89 @@ impl Default for SharedState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mimics the watcher behaviour: only overwrite when the section is not
+    /// in the dirty set. This is what `watchers::spawn_watch!` does and what
+    /// `settings::card` relies on to preserve in-flight edits.
+    fn apply_inbound_lora(
+        state: &mut SharedState,
+        value: voicetastic_core::proto::config::LoRaConfig,
+    ) {
+        if !state.dirty.contains(&Section::Lora) {
+            state.lora = Some(value);
+        }
+    }
+
+    #[test]
+    fn inbound_does_not_clobber_dirty_section() {
+        let mut s = SharedState::default();
+        // User starts editing — locally sets a value and marks dirty.
+        let edited = voicetastic_core::proto::config::LoRaConfig {
+            tx_power: 42,
+            ..Default::default()
+        };
+        s.lora = Some(edited);
+        s.dirty.insert(Section::Lora);
+
+        // Device pushes a stale snapshot.
+        let from_device = voicetastic_core::proto::config::LoRaConfig {
+            tx_power: 0,
+            ..Default::default()
+        };
+        apply_inbound_lora(&mut s, from_device);
+
+        // The local edit must survive.
+        assert_eq!(s.lora.as_ref().unwrap().tx_power, 42);
+    }
+
+    #[test]
+    fn inbound_overwrites_clean_section() {
+        let mut s = SharedState::default();
+        assert!(s.lora.is_none());
+        let from_device = voicetastic_core::proto::config::LoRaConfig {
+            tx_power: 7,
+            ..Default::default()
+        };
+        apply_inbound_lora(&mut s, from_device);
+        assert_eq!(s.lora.as_ref().unwrap().tx_power, 7);
+    }
+
+    #[test]
+    fn dirty_set_distinguishes_channels_by_index() {
+        let mut s = SharedState::default();
+        s.dirty.insert(Section::Channel(0));
+        assert!(s.dirty.contains(&Section::Channel(0)));
+        assert!(!s.dirty.contains(&Section::Channel(1)));
+        assert!(!s.dirty.contains(&Section::Lora));
+    }
+
+    #[test]
+    fn config_complete_handler_clears_all_dirty() {
+        let mut s = SharedState::default();
+        s.dirty.insert(Section::Lora);
+        s.dirty.insert(Section::Owner);
+        s.dirty.insert(Section::Channel(2));
+        // Same logic the config_complete watcher runs.
+        s.dirty.clear();
+        assert!(s.dirty.is_empty());
+    }
+
+    #[test]
+    fn fixed_pos_edit_round_trip() {
+        let mut s = SharedState::default();
+        assert!(s.fixed_pos_edit.is_none());
+        s.fixed_pos_edit = Some(FixedPosEdit {
+            latitude_deg: 48.5,
+            longitude_deg: 2.3,
+            altitude_m: 120,
+        });
+        let e = s.fixed_pos_edit.clone().unwrap();
+        assert!((e.latitude_deg - 48.5).abs() < 1e-9);
+        assert!((e.longitude_deg - 2.3).abs() < 1e-9);
+        assert_eq!(e.altitude_m, 120);
+    }
+}

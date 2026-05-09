@@ -162,7 +162,10 @@ impl SerialConnection {
 ///
 /// Scans for the `START1 START2` magic, reads the 2-byte big-endian length,
 /// then reads exactly that many bytes.  Returns `Ok(None)` on EOF.
-async fn read_frame(reader: &mut SerialReader) -> std::io::Result<Option<Vec<u8>>> {
+async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     loop {
         let b = match read_byte(reader).await {
             Ok(b) => b,
@@ -194,8 +197,133 @@ async fn read_frame(reader: &mut SerialReader) -> std::io::Result<Option<Vec<u8>
     }
 }
 
-async fn read_byte(reader: &mut SerialReader) -> std::io::Result<u8> {
+async fn read_byte<R>(reader: &mut R) -> std::io::Result<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buf = [0u8; 1];
     reader.read_exact(&mut buf).await?;
     Ok(buf[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncRead;
+
+    /// Build a valid framed packet: `94 c3 <msb> <lsb> <payload...>`.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len() as u16;
+        let mut v = vec![START1, START2, (len >> 8) as u8, (len & 0xff) as u8];
+        v.extend_from_slice(payload);
+        v
+    }
+
+    async fn read_all<R: AsyncRead + Unpin>(r: &mut R) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(p) = read_frame(r).await.expect("read") {
+            out.push(p);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn parses_single_frame() {
+        let mut buf: &[u8] = &frame(b"hello");
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![b"hello".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn parses_back_to_back_frames() {
+        let mut data = frame(b"one");
+        data.extend(frame(b"twoo"));
+        data.extend(frame(b"three"));
+        let mut buf: &[u8] = &data;
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0], b"one");
+        assert_eq!(frames[1], b"twoo");
+        assert_eq!(frames[2], b"three");
+    }
+
+    #[tokio::test]
+    async fn skips_console_garbage_before_magic() {
+        let mut data = b"some debug log line\n".to_vec();
+        data.extend(frame(b"payload"));
+        let mut buf: &[u8] = &data;
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![b"payload".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn recovers_from_lone_start1() {
+        // 0x94 then a non-START2 byte — the parser must keep scanning, not
+        // consume the next START1 as data.
+        let mut data = vec![START1, 0x00, START1, 0x42];
+        data.extend(frame(b"ok"));
+        let mut buf: &[u8] = &data;
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![b"ok".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_length_and_resyncs() {
+        // 94 c3 00 00 (invalid) followed by a valid frame.
+        let mut data = vec![START1, START2, 0x00, 0x00];
+        data.extend(frame(b"after"));
+        let mut buf: &[u8] = &data;
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![b"after".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_length_and_resyncs() {
+        // Length = MAX_PAYLOAD + 1 → invalid; parser resyncs.
+        let bogus = (MAX_PAYLOAD + 1) as u16;
+        let mut data = vec![START1, START2, (bogus >> 8) as u8, (bogus & 0xff) as u8];
+        data.extend(frame(b"good"));
+        let mut buf: &[u8] = &data;
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![b"good".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn truncated_payload_is_unexpected_eof() {
+        // Header advertises 10 bytes but only 3 follow.
+        let mut data = vec![START1, START2, 0x00, 0x0a];
+        data.extend_from_slice(b"abc");
+        let mut buf: &[u8] = &data;
+        let err = read_frame(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn eof_at_start1_returns_none() {
+        let mut buf: &[u8] = &[START1];
+        assert!(read_frame(&mut buf).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_input_returns_none() {
+        let mut buf: &[u8] = &[];
+        assert!(read_frame(&mut buf).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn accepts_max_payload_size() {
+        let payload = vec![0xab; MAX_PAYLOAD];
+        let mut buf: &[u8] = &frame(&payload);
+        let frames = read_all(&mut buf).await;
+        assert_eq!(frames, vec![payload]);
+    }
+
+    #[test]
+    fn is_serial_path_recognises_common_forms() {
+        assert!(is_serial_path("/dev/ttyUSB0"));
+        assert!(is_serial_path("/dev/ttyACM1"));
+        assert!(is_serial_path("COM3"));
+        assert!(!is_serial_path("AA:BB:CC:DD:EE:FF"));
+        assert!(!is_serial_path("aa:bb:cc:dd:ee:ff"));
+    }
 }

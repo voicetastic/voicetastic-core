@@ -12,9 +12,15 @@ mod types;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tracing::warn;
+
+/// Maximum time we wait for the device to finish its config burst (i.e. for
+/// `ConnectionState` to leave `Configuring`). If the radio never sends
+/// `ConfigCompleteId`, we revert to `Connected` so the UI isn't stranded.
+const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::ble::{BleManager, CONFIG_REQUEST_DELAY, Connection, DiscoveredDevice};
 use crate::error::Result;
@@ -39,7 +45,7 @@ pub struct MeshService {
 }
 
 struct Inner {
-    ble: BleManager,
+    ble: tokio::sync::OnceCell<BleManager>,
     transport: Mutex<Option<Transport>>,
     state_tx: watch::Sender<ConnectionState>,
     my_info_tx: watch::Sender<Option<MyNodeInfo>>,
@@ -64,7 +70,7 @@ struct Inner {
 
 impl MeshService {
     pub async fn new() -> Result<Self> {
-        let ble = BleManager::new().await?;
+        let ble = tokio::sync::OnceCell::new();
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
         let (my_info_tx, _) = watch::channel(None);
         let (nodes_tx, _) = watch::channel(HashMap::new());
@@ -107,10 +113,10 @@ impl MeshService {
     }
 
     pub async fn scan(&self) -> Result<mpsc::Receiver<DiscoveredDevice>> {
-        self.inner.ble.scan().await
+        self.ble().await?.scan().await
     }
     pub async fn stop_scan(&self) -> Result<()> {
-        self.inner.ble.stop_scan().await
+        self.ble().await?.stop_scan().await
     }
 
     pub fn watch_state(&self) -> watch::Receiver<ConnectionState> {
@@ -190,13 +196,14 @@ impl MeshService {
             self.set_state(prev);
             return Err(e);
         }
+        self.spawn_config_watchdog();
         Ok(())
     }
 
     /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).
     pub async fn connect_by_address(&self, address: &str) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
-        let peripheral = self.inner.ble.peripheral_by_address(address).await?;
+        let peripheral = self.ble().await?.peripheral_by_address(address).await?;
         let conn = Arc::new(Connection::open(peripheral).await?);
         let transport = Transport::Ble(conn.clone());
         {
@@ -225,6 +232,7 @@ impl MeshService {
         tokio::time::sleep(CONFIG_REQUEST_DELAY).await;
         self.set_state(ConnectionState::Configuring);
         self.send_want_config().await?;
+        self.spawn_config_watchdog();
         Ok(())
     }
 
@@ -261,6 +269,7 @@ impl MeshService {
         tokio::time::sleep(CONFIG_REQUEST_DELAY).await;
         self.set_state(ConnectionState::Configuring);
         self.send_want_config().await?;
+        self.spawn_config_watchdog();
         Ok(())
     }
 
@@ -281,5 +290,243 @@ impl MeshService {
 
     pub(super) fn set_state(&self, state: ConnectionState) {
         let _ = self.inner.state_tx.send(state);
+    }
+
+    /// Lazy-init the BLE adapter on first use. Lets `MeshService::new()`
+    /// succeed on machines without Bluetooth (serial-only setups, CI hosts,
+    /// integration tests). Failures still surface to the caller of any
+    /// BLE-touching method.
+    async fn ble(&self) -> Result<&BleManager> {
+        self.inner
+            .ble
+            .get_or_try_init(|| async { BleManager::new().await })
+            .await
+    }
+
+    /// Spawn a one-shot task that reverts `Configuring` to `Connected` if the
+    /// device never sends `ConfigCompleteId` within [`CONFIG_BURST_TIMEOUT`].
+    /// Cheap to call repeatedly; tasks self-exit if state has already moved on.
+    fn spawn_config_watchdog(&self) {
+        let svc = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(CONFIG_BURST_TIMEOUT).await;
+            if *svc.inner.state_tx.borrow() == ConnectionState::Configuring {
+                warn!(
+                    timeout_s = CONFIG_BURST_TIMEOUT.as_secs(),
+                    "config burst did not complete; reverting to Connected"
+                );
+                svc.set_state(ConnectionState::Connected);
+            }
+        });
+    }
+}
+
+/// Compile-time assertion that `MeshService` can be cloned across `tokio::spawn`
+/// boundaries and shared between threads. Catches refactors that accidentally
+/// embed a `!Send` or `!Sync` field (e.g. `Rc`, `RefCell`, raw pointers).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync + Clone + 'static>() {}
+    assert_send_sync::<MeshService>();
+};
+
+#[cfg(test)]
+mod tests {
+    //! Service-level tests that don't need real BLE or serial hardware.
+    //!
+    //! `MeshService::new()` lazy-inits the BLE adapter, so these tests can
+    //! exercise inbound decoding and config-burst sequencing on any host.
+
+    use super::*;
+    use crate::proto::{
+        Config, FromRadio, MyNodeInfo, NodeInfo, Position, User, config, from_radio,
+    };
+    use prost::Message as _;
+
+    fn encode(variant: from_radio::PayloadVariant) -> Vec<u8> {
+        let msg = FromRadio {
+            id: 0,
+            payload_variant: Some(variant),
+        };
+        let mut buf = Vec::with_capacity(msg.encoded_len());
+        msg.encode(&mut buf).expect("encode");
+        buf
+    }
+
+    async fn make_service() -> MeshService {
+        MeshService::new().await.expect("MeshService::new")
+    }
+
+    /// Hold one receiver on every watch we inspect: tokio's `watch::Sender::send`
+    /// returns `Err` (without updating the cached value) when all receivers
+    /// have been dropped. In production the GUI/CLI is always subscribed; in
+    /// tests we have to keep the receivers alive ourselves.
+    fn keep_alive(svc: &MeshService) -> Vec<Box<dyn std::any::Any + Send>> {
+        vec![
+            Box::new(svc.watch_state()),
+            Box::new(svc.watch_my_info()),
+            Box::new(svc.watch_nodes()),
+            Box::new(svc.watch_owner()),
+            Box::new(svc.watch_lora_config()),
+            Box::new(svc.watch_device_config()),
+            Box::new(svc.watch_position_config()),
+            Box::new(svc.watch_power_config()),
+            Box::new(svc.watch_network_config()),
+            Box::new(svc.watch_display_config()),
+            Box::new(svc.watch_bluetooth_config()),
+            Box::new(svc.watch_channels()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn handles_my_info() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x1234_5678,
+            ..Default::default()
+        }));
+        // Sanity-check that the encode round-trips before exercising the service.
+        let decoded = FromRadio::decode(bytes.as_slice()).expect("decode");
+        assert!(matches!(
+            decoded.payload_variant,
+            Some(from_radio::PayloadVariant::MyInfo(ref i)) if i.my_node_num == 0x1234_5678
+        ));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        let info = svc.inner.my_info_tx.borrow().clone().unwrap();
+        assert_eq!(info.my_node_num, 0x1234_5678);
+        assert_eq!(svc.my_node_num(), Some(0x1234_5678));
+    }
+
+    #[tokio::test]
+    async fn config_burst_populates_each_section_then_completes() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let mut state_rx = svc.watch_state();
+        // No config received yet: every watch should hold None.
+        assert!(svc.inner.lora_tx.borrow().is_none());
+        assert!(svc.inner.device_tx.borrow().is_none());
+        assert!(svc.inner.position_tx.borrow().is_none());
+        assert!(svc.inner.power_tx.borrow().is_none());
+        assert!(svc.inner.network_tx.borrow().is_none());
+        assert!(svc.inner.display_tx.borrow().is_none());
+        assert!(svc.inner.bluetooth_tx.borrow().is_none());
+
+        // Walk the burst variants in arbitrary order.
+        for variant in [
+            config::PayloadVariant::Lora(Default::default()),
+            config::PayloadVariant::Device(Default::default()),
+            config::PayloadVariant::Position(Default::default()),
+            config::PayloadVariant::Power(Default::default()),
+            config::PayloadVariant::Network(Default::default()),
+            config::PayloadVariant::Display(Default::default()),
+            config::PayloadVariant::Bluetooth(Default::default()),
+        ] {
+            let bytes = encode(from_radio::PayloadVariant::Config(Config {
+                payload_variant: Some(variant),
+            }));
+            svc.handle_from_radio(&bytes).await.unwrap();
+        }
+        // All seven sections now have a value.
+        assert!(svc.inner.lora_tx.borrow().is_some());
+        assert!(svc.inner.device_tx.borrow().is_some());
+        assert!(svc.inner.position_tx.borrow().is_some());
+        assert!(svc.inner.power_tx.borrow().is_some());
+        assert!(svc.inner.network_tx.borrow().is_some());
+        assert!(svc.inner.display_tx.borrow().is_some());
+        assert!(svc.inner.bluetooth_tx.borrow().is_some());
+
+        // Subscribe before sending the terminator so we don't miss the
+        // broadcast notification.
+        let mut done = svc.subscribe_config_complete();
+        let bytes = encode(from_radio::PayloadVariant::ConfigCompleteId(42));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        assert_eq!(done.try_recv().ok(), Some(42));
+        // State machine must have advanced to Ready.
+        assert_eq!(*state_rx.borrow_and_update(), ConnectionState::Ready);
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_range_position_coordinates() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 7,
+            user: None,
+            position: Some(Position {
+                latitude_i: Some(900_000_001),     // > 90°
+                longitude_i: Some(-1_800_000_001), // < -180°
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        let nodes = svc.inner.nodes_tx.borrow().clone();
+        let pos = nodes.get(&7).unwrap().position.as_ref().unwrap();
+        assert_eq!(pos.latitude_i, None);
+        assert_eq!(pos.longitude_i, None);
+    }
+
+    #[tokio::test]
+    async fn keeps_in_range_position_coordinates() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 8,
+            position: Some(Position {
+                latitude_i: Some(485_000_000), // ~48.5°
+                longitude_i: Some(23_400_000), // ~2.34°
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        let nodes = svc.inner.nodes_tx.borrow().clone();
+        let pos = nodes.get(&8).unwrap().position.as_ref().unwrap();
+        assert_eq!(pos.latitude_i, Some(485_000_000));
+        assert_eq!(pos.longitude_i, Some(23_400_000));
+    }
+
+    #[tokio::test]
+    async fn nodeinfo_for_self_publishes_owner() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        // First, set our node number.
+        let my_bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0xdead_beef,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&my_bytes).await.unwrap();
+        // Then, a NodeInfo from ourselves: owner should propagate.
+        let ni_bytes = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 0xdead_beef,
+            user: Some(User {
+                id: "!deadbeef".into(),
+                long_name: "Me".into(),
+                short_name: "Me".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&ni_bytes).await.unwrap();
+        let owner = svc.inner.owner_tx.borrow().clone().unwrap();
+        assert_eq!(owner.long_name, "Me");
+    }
+
+    #[tokio::test]
+    async fn refresh_config_clears_section_snapshots() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        // Seed at least one section.
+        let bytes = encode(from_radio::PayloadVariant::Config(Config {
+            payload_variant: Some(config::PayloadVariant::Lora(Default::default())),
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        assert!(svc.inner.lora_tx.borrow().is_some());
+
+        // No transport: send_want_config will fail and refresh_config returns
+        // Err — but the snapshots must already be cleared by then.
+        let _ = svc.refresh_config().await;
+        assert!(svc.inner.lora_tx.borrow().is_none());
+        assert!(svc.inner.channels_tx.borrow().is_empty());
     }
 }
