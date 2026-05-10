@@ -44,8 +44,9 @@ pub use assembler::{AssemblerConfig, OutboundNack, TickOutput, VoiceAssembler};
 pub use builder::{BuildConfig, EncodedMessage, build_message, random_message_id};
 pub use consts::{
     BLACKLIST_MAX, BLACKLIST_TTL, GCM_NONCE_LEN, GCM_TAG_LEN, HEADER_SIZE, MAX_BODY_SIZE,
-    MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_PACKET_SIZE,
-    MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS, PROTOCOL_VERSION,
+    MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_MESSAGE_BYTES,
+    MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS,
+    PROTOCOL_VERSION,
 };
 pub use crypto::{EnvelopeKey, decrypt_body, derive_key, encrypt_body};
 pub use error::{Result, VoiceError};
@@ -206,5 +207,146 @@ mod tests {
         assert_eq!(detect_version(&[0x01, 0, 0]), Some(0x01));
         assert_eq!(detect_version(&[0x99, 0, 0]), Some(0x99));
         assert_eq!(detect_version(&[]), None);
+    }
+
+    /// Regression: if the first arriving frame is the (possibly trimmed)
+    /// final DATA chunk, chunk_size discovery must be deferred until a
+    /// non-final DATA or any PARITY frame arrives. Previously the receiver
+    /// would freeze chunk_size to the trimmed length and reject every
+    /// subsequent full-size frame as BodyLenMismatch.
+    #[test]
+    fn last_chunk_first_does_not_freeze_chunk_size() {
+        // Audio sized so the final chunk is shorter than chunk_size.
+        let audio = synthesize(64 * 3 + 17);
+        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        assert_eq!(enc.total_data, 4);
+        let asm = assembler(false);
+        // Deliver the trimmed final DATA chunk first, then the rest in order.
+        let mut order: Vec<usize> = (0..enc.frames.len()).collect();
+        let last = order.remove(enc.total_data as usize - 1);
+        order.insert(0, last);
+        let mut completed = None;
+        for idx in order {
+            match asm.accept(
+                "!cafebabe",
+                VoiceDestination::Broadcast,
+                0,
+                &enc.frames[idx],
+            ) {
+                AssemblyEvent::Pending => {}
+                AssemblyEvent::Complete(m) => completed = Some(m),
+                e => panic!("unexpected: {e:?}"),
+            }
+        }
+        let m = completed.expect("completion");
+        assert_eq!(m.audio, audio);
+    }
+
+    /// Spec §3.2: receivers MUST drop frames with an unknown codec.
+    #[test]
+    fn unknown_codec_is_rejected() {
+        // Build a valid frame, then poke the codec byte to an unknown value.
+        let audio = synthesize(64);
+        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let mut frame = enc.frames[0].clone();
+        frame[6] = 0xEE; // codec
+        let asm = assembler(false);
+        let ev = asm.accept("!cc", VoiceDestination::Broadcast, 0, &frame);
+        assert!(
+            matches!(ev, AssemblyEvent::Rejected(VoiceError::UnknownCodec(0xEE))),
+            "expected UnknownCodec, got {ev:?}",
+        );
+    }
+
+    /// Spec §7: encrypted frames whose `from` is not a valid !hex8 must be
+    /// rejected (otherwise the receiver would silently derive a wrong key).
+    #[test]
+    fn encrypted_frame_with_bad_from_is_rejected() {
+        let audio = synthesize(64);
+        let mut c = cfg(0, true);
+        c.encryption = Some(derive_key(b"psk", c.message_id, 0));
+        let enc = build_message(&audio, &c).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            channel_psk: Some(b"psk".to_vec()),
+            ..Default::default()
+        });
+        let ev = asm.accept(
+            "not-a-node-id",
+            VoiceDestination::Broadcast,
+            0,
+            &enc.frames[0],
+        );
+        assert!(
+            matches!(
+                ev,
+                AssemblyEvent::Rejected(VoiceError::BadFromForEncrypted(_))
+            ),
+            "expected BadFromForEncrypted, got {ev:?}",
+        );
+    }
+
+    /// Spec §9.2: encrypted frame with no PSK configured is rejected with
+    /// a dedicated error (not the generic AES-GCM `BadTag`).
+    #[test]
+    fn encrypted_frame_without_psk_is_rejected() {
+        let audio = synthesize(64);
+        let mut c = cfg(0, true);
+        c.encryption = Some(derive_key(b"psk", c.message_id, 0x12345678));
+        let enc = build_message(&audio, &c).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            channel_psk: None,
+            ..Default::default()
+        });
+        let ev = asm.accept("!12345678", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        assert!(
+            matches!(ev, AssemblyEvent::Rejected(VoiceError::EncryptedNoPsk)),
+            "expected EncryptedNoPsk, got {ev:?}",
+        );
+    }
+
+    /// A duplicate DATA frame whose body length differs from the first
+    /// arrival is reported as `Duplicate`, not `BodyLenMismatch` — the
+    /// slot is already filled, so we don't leak that the original body
+    /// length mattered to a probing attacker.
+    #[test]
+    fn tampered_duplicate_reports_duplicate_not_mismatch() {
+        let audio = synthesize(64 * 3);
+        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let asm = assembler(false);
+        // Ingest the first DATA frame normally.
+        assert!(matches!(
+            asm.accept("!aa", VoiceDestination::Broadcast, 0, &enc.frames[0]),
+            AssemblyEvent::Pending,
+        ));
+        // Build a tampered duplicate of chunk 0 with a shorter body.
+        let mut tampered = enc.frames[0].clone();
+        tampered.truncate(HEADER_SIZE + 32);
+        let ev = asm.accept("!aa", VoiceDestination::Broadcast, 0, &tampered);
+        assert!(
+            matches!(ev, AssemblyEvent::Duplicate),
+            "expected Duplicate, got {ev:?}",
+        );
+    }
+
+    /// Mismatched `stream_seq` on a follow-up frame is rejected as
+    /// `StreamSeqMismatch` — the template captures stream_seq from the
+    /// first frame and later frames must match.
+    #[test]
+    fn stream_seq_mismatch_is_rejected() {
+        let audio = synthesize(64 * 3);
+        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let asm = assembler(false);
+        let _ = asm.accept("!bb", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        // Tamper stream_seq (header byte 8) on the second frame.
+        let mut tampered = enc.frames[1].clone();
+        tampered[8] = tampered[8].wrapping_add(1);
+        let ev = asm.accept("!bb", VoiceDestination::Broadcast, 0, &tampered);
+        assert!(
+            matches!(
+                ev,
+                AssemblyEvent::Rejected(VoiceError::StreamSeqMismatch { .. })
+            ),
+            "expected StreamSeqMismatch, got {ev:?}",
+        );
     }
 }

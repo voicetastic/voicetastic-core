@@ -14,6 +14,10 @@ pub const MAX_BODY_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;
 pub const MIN_CHUNK_SIZE: usize = 16;
 /// Maximum data chunks per message (`total_data` field is `u8`).
 pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
+/// Hard receive-side cap on the un-FEC payload of a single message
+/// (`MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE`). Frames pushing the assembler
+/// past this are rejected.
+pub const MAX_MESSAGE_BYTES: usize = MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE;
 /// Maximum parity chunks per message (Reed-Solomon coder limit).
 pub const MAX_PARITY_PER_MESSAGE: usize = 128;
 /// Global cap on concurrent in-progress reassemblies.

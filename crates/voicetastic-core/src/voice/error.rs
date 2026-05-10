@@ -48,6 +48,18 @@ pub enum VoiceError {
     CodecMismatch { first: VoiceCodec, got: VoiceCodec },
     #[error("total_data mismatch within message: {first} vs {got}")]
     TotalMismatch { first: u8, got: u8 },
+    #[error("stream_seq mismatch within message: {first} vs {got}")]
+    StreamSeqMismatch { first: u8, got: u8 },
+    #[error("unknown codec byte: 0x{0:02x}")]
+    UnknownCodec(u8),
+    #[error("(from, message_id) is on the recently-completed blacklist")]
+    Blacklisted,
+    #[error("per-sender in-flight cap reached for {0}")]
+    PerSenderCap(String),
+    #[error("encrypted frame received but no channel PSK is configured")]
+    EncryptedNoPsk,
+    #[error("`from` field {0:?} is not a valid !hex8 node id (required for encrypted frames)")]
+    BadFromForEncrypted(String),
 }
 
 /// Convenience alias for voice protocol results.

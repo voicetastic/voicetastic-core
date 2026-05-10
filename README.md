@@ -12,6 +12,11 @@ messaging and AMR-NB voice message exchange — wire-compatible with the Android
 | `voicetastic-cli` | CLI (`clap`): `scan`, `text send/listen`, `voice send/listen`, `device reboot/factory-reset` |
 | `voicetastic-gui` | GUI (`eframe`/`egui`): three-tab app (Devices, Chat, Settings) |
 
+## Documentation
+
+- **Voice protocol spec** (normative wire format): [`VOICE_PROTOCOL.md`](VOICE_PROTOCOL.md)
+- **Voice protocol wiki** (implementer guide, examples, diagrams): [`docs/wiki/Home.md`](docs/wiki/Home.md)
+
 ## Prerequisites
 
 - **Rust 1.95+** (edition 2024 workspace)

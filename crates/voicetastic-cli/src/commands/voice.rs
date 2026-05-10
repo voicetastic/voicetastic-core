@@ -99,8 +99,31 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
                 for completed in out.finalized {
                     save_amr(&base_dir, &completed).await?;
                 }
-                // NACKs would be transmitted here once we wire the
-                // sender-side selective-retransmission state machine.
+                // Forward outbound NACKs to the originating sender so the
+                // receive→send selective-retransmission loop can close.
+                // (A future commit will add the sender-side state machine
+                // that consumes these NACKs and retransmits missing chunks.)
+                for nack in out.nacks {
+                    let to_node = match voicetastic_core::ids::node_id_to_num(&nack.from) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!(from = %nack.from, ?e, "skip NACK: bad node id");
+                            continue;
+                        }
+                    };
+                    if let Err(e) = svc
+                        .send_data(
+                            PRIVATE_APP as i32,
+                            nack.frame,
+                            nack.channel,
+                            Some(to_node),
+                            false,
+                        )
+                        .await
+                    {
+                        warn!(?e, "failed to transmit voice NACK");
+                    }
+                }
             }
             data = rx.recv() => match data {
                 Ok(d) => {

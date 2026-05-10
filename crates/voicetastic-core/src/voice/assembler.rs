@@ -11,6 +11,12 @@ use super::consts::{
     BLACKLIST_MAX, BLACKLIST_TTL, HEADER_SIZE, MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL,
     MAX_IN_PROGRESS_PER_SENDER, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS,
 };
+
+/// After this many post-template validation failures (codec / total_data /
+/// stream_seq mismatch) on the same in-progress entry, the entry is
+/// evicted and blacklisted. Keeps a chatty bad sender from holding a
+/// per-sender slot for the full message timeout.
+const MAX_VALIDATION_STRIKES: u8 = 3;
 use super::crypto::{decrypt_body, derive_key};
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
@@ -42,7 +48,9 @@ impl Default for AssemblerConfig {
 
 struct AssemblyState {
     header_template: ChunkHeader,
-    chunk_size: usize,
+    /// `None` until the first non-final DATA frame or any PARITY frame fixes
+    /// the chunk size. A lone trimmed final DATA chunk is not enough.
+    chunk_size: Option<usize>,
     last_data_len: Option<usize>,
     data_shards: Vec<Option<Vec<u8>>>,
     parity_shards: Vec<Option<Vec<u8>>>,
@@ -52,6 +60,11 @@ struct AssemblyState {
     last_chunk_at: Instant,
     first_seen: chrono::DateTime<chrono::Utc>,
     nack_rounds: u8,
+    /// Count of post-template validation failures (codec / total_data /
+    /// stream_seq mismatch). After [`MAX_VALIDATION_STRIKES`] the entry is
+    /// evicted and blacklisted to keep a chatty bad sender from holding a
+    /// per-sender slot until [`AssemblerConfig::message_timeout`].
+    validation_strikes: u8,
     to: VoiceDestination,
     channel: u32,
     encrypted_seen: bool,
@@ -59,7 +72,12 @@ struct AssemblyState {
 }
 
 impl AssemblyState {
-    fn new(header: ChunkHeader, chunk_size: usize, to: VoiceDestination, channel: u32) -> Self {
+    fn new(
+        header: ChunkHeader,
+        chunk_size: Option<usize>,
+        to: VoiceDestination,
+        channel: u32,
+    ) -> Self {
         Self {
             header_template: header,
             chunk_size,
@@ -72,6 +90,7 @@ impl AssemblyState {
             last_chunk_at: Instant::now(),
             first_seen: chrono::Utc::now(),
             nack_rounds: 0,
+            validation_strikes: 0,
             to,
             channel,
             encrypted_seen: false,
@@ -83,6 +102,10 @@ impl AssemblyState {
         if self.header_template.parity_count == 0 {
             return Ok(());
         }
+        // FEC requires a known chunk_size (set by a non-final DATA or any PARITY).
+        let Some(chunk_size) = self.chunk_size else {
+            return Ok(());
+        };
         let total_data = self.header_template.total_data as usize;
         let parity_count = self.header_template.parity_count as usize;
         // Need at least `total_data` shards present in total to attempt recovery.
@@ -95,8 +118,8 @@ impl AssemblyState {
         // Data shards: pad the last one to chunk_size so all shards are equal-sized.
         for (idx, slot) in self.data_shards.iter().enumerate() {
             shards.push(slot.as_ref().map(|p| {
-                if idx == total_data - 1 && p.len() < self.chunk_size {
-                    let mut padded = vec![0u8; self.chunk_size];
+                if idx == total_data - 1 && p.len() < chunk_size {
+                    let mut padded = vec![0u8; chunk_size];
                     padded[..p.len()].copy_from_slice(p);
                     padded
                 } else {
@@ -187,12 +210,14 @@ impl VoiceAssembler {
         }
     }
 
-    fn from_node_num(from: &str) -> u32 {
-        // "!aabbccdd" → u32. Best-effort; encryption derive_key uses this so a
-        // malformed id just yields a different (failing) key.
-        from.strip_prefix('!')
-            .and_then(|h| u32::from_str_radix(h, 16).ok())
-            .unwrap_or(0)
+    /// Strict parse of a Meshtastic `"!aabbccdd"` id.
+    /// Returns `None` if the format is malformed (encryption requires this).
+    fn parse_from_node_num(from: &str) -> Option<u32> {
+        let hex = from.strip_prefix('!')?;
+        if hex.len() != 8 {
+            return None;
+        }
+        u32::from_str_radix(hex, 16).ok()
     }
 
     /// Feed a frame.
@@ -231,10 +256,7 @@ impl VoiceAssembler {
             .blacklist
             .retain(|(_, t)| now.duration_since(*t) < BLACKLIST_TTL);
         if inner.blacklist.iter().any(|(k, _)| *k == key) {
-            return Ok(AssemblyEvent::Rejected(VoiceError::TooShort {
-                len: 0,
-                needed: 0,
-            }));
+            return Err(VoiceError::Blacklisted);
         }
 
         // Per-sender rate limit, applied only to *new* messages.
@@ -242,10 +264,7 @@ impl VoiceAssembler {
             let in_use = *inner.per_sender.get(from).unwrap_or(&0);
             if in_use >= MAX_IN_PROGRESS_PER_SENDER {
                 warn!(from, "voice per-sender cap reached; dropping new message");
-                return Ok(AssemblyEvent::Rejected(VoiceError::AudioTooLarge {
-                    bytes: 0,
-                    max: 0,
-                }));
+                return Err(VoiceError::PerSenderCap(from.to_string()));
             }
             // Global cap — evict the globally-oldest if needed.
             if inner.in_progress.len() >= MAX_IN_PROGRESS_GLOBAL
@@ -265,65 +284,97 @@ impl VoiceAssembler {
             }
         }
 
+        // Spec §9.1: `MAX_MESSAGE_BYTES = MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE`
+        // is enforced structurally — `total_data` is `u8` (≤ 255) and every
+        // accepted chunk body is ≤ `MAX_BODY_SIZE` (header parse + body-len
+        // checks). No additional runtime check is required.
+
+        // Reject unknown codecs (spec §3.2: receivers MUST drop unknown codecs).
+        if let super::types::VoiceCodec::Unknown(b) = header.codec {
+            return Err(VoiceError::UnknownCodec(b));
+        }
+
         // Decrypt body if needed (uses original header bytes as AAD).
         let plain_body: Vec<u8> = if header.encrypted {
             let psk = self
                 .cfg
                 .channel_psk
                 .as_ref()
-                .ok_or(VoiceError::BadTag)?
+                .ok_or(VoiceError::EncryptedNoPsk)?
                 .as_slice();
-            let derived = derive_key(psk, header.message_id, Self::from_node_num(from));
+            // Spec §7: encrypted frames MUST carry a valid !hex8 `from`.
+            let from_node = Self::parse_from_node_num(from)
+                .ok_or_else(|| VoiceError::BadFromForEncrypted(from.to_string()))?;
+            let derived = derive_key(psk, header.message_id, from_node);
             decrypt_body(&derived, &bytes[..HEADER_SIZE], body)?
         } else {
             body.to_vec()
         };
 
-        // Look up or create the in-progress state.
+        // Look up or create the in-progress state. chunk_size is established
+        // by the first non-final DATA frame or any PARITY frame; a lone
+        // trimmed final DATA chunk leaves it `None` until later evidence.
+        let initial_chunk_size: Option<usize> = match header.packet_type {
+            PacketType::Data => {
+                let is_last = header.chunk_index == header.total_data - 1;
+                if is_last {
+                    None
+                } else {
+                    Some(plain_body.len())
+                }
+            }
+            PacketType::Parity => Some(plain_body.len()),
+            PacketType::Nack => unreachable!("handled above"),
+        };
+        if let Some(cs) = initial_chunk_size
+            && !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&cs)
+        {
+            return Err(VoiceError::ChunkTooLarge {
+                got: cs,
+                max: MAX_BODY_SIZE,
+            });
+        }
         let state = match inner.in_progress.get_mut(&key) {
             Some(s) => s,
             None => {
-                let chunk_size = match header.packet_type {
-                    PacketType::Data => {
-                        // First DATA frame fixes chunk_size unless it's the
-                        // final (potentially-trimmed) chunk and shorter.
-                        if header.chunk_index == header.total_data - 1 {
-                            // Defer chunk_size discovery: assume max body for now.
-                            plain_body.len().max(MIN_CHUNK_SIZE)
-                        } else {
-                            plain_body.len()
-                        }
-                    }
-                    PacketType::Parity => plain_body.len(),
-                    PacketType::Nack => unreachable!("handled above"),
-                };
-                if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&chunk_size) {
-                    return Err(VoiceError::ChunkTooLarge {
-                        got: chunk_size,
-                        max: MAX_BODY_SIZE,
-                    });
-                }
                 let cnt = inner.per_sender.entry(from.to_string()).or_default();
                 *cnt = cnt.saturating_add(1);
                 inner
                     .in_progress
                     .entry(key.clone())
-                    .or_insert_with(|| AssemblyState::new(header, chunk_size, to, channel))
+                    .or_insert_with(|| AssemblyState::new(header, initial_chunk_size, to, channel))
             }
         };
 
-        // Validate consistency vs. the established header template.
+        // Validate consistency vs. the established header template. After
+        // MAX_VALIDATION_STRIKES the entry is evicted + blacklisted so a
+        // chatty mismatched sender can't hold a per-sender slot.
+        let mut mismatch: Option<VoiceError> = None;
         if header.total_data != state.header_template.total_data {
-            return Err(VoiceError::TotalMismatch {
+            mismatch = Some(VoiceError::TotalMismatch {
                 first: state.header_template.total_data,
                 got: header.total_data,
             });
-        }
-        if header.codec != state.header_template.codec {
-            return Err(VoiceError::CodecMismatch {
+        } else if header.codec != state.header_template.codec {
+            mismatch = Some(VoiceError::CodecMismatch {
                 first: state.header_template.codec,
                 got: header.codec,
             });
+        } else if header.stream_seq != state.header_template.stream_seq {
+            mismatch = Some(VoiceError::StreamSeqMismatch {
+                first: state.header_template.stream_seq,
+                got: header.stream_seq,
+            });
+        }
+        if let Some(err) = mismatch {
+            state.validation_strikes = state.validation_strikes.saturating_add(1);
+            if state.validation_strikes >= MAX_VALIDATION_STRIKES {
+                inner.in_progress.remove(&key);
+                let cnt = inner.per_sender.entry(from.to_string()).or_default();
+                *cnt = cnt.saturating_sub(1);
+                push_blacklist(&mut inner.blacklist, key, now);
+            }
+            return Err(err);
         }
         state.encrypted_seen = state.encrypted_seen || header.encrypted;
         state.last_chunk_at = now;
@@ -332,33 +383,70 @@ impl VoiceAssembler {
             PacketType::Data => {
                 let idx = header.chunk_index as usize;
                 let is_last = idx == state.header_template.total_data as usize - 1;
-                // Body length policy: full chunks must equal chunk_size; the
-                // final chunk may be shorter (sender stripped padding).
-                if !is_last && plain_body.len() != state.chunk_size {
-                    return Err(VoiceError::BodyLenMismatch {
-                        got: plain_body.len(),
-                        expected: state.chunk_size,
-                    });
-                }
-                if is_last {
-                    state.last_data_len = Some(plain_body.len());
-                }
+                // Duplicate check first: a retransmit (correct or tampered)
+                // never alters established state, and reporting Duplicate
+                // does not leak whether the body matched.
                 if state.data_shards[idx].is_some() {
                     return Ok(AssemblyEvent::Duplicate);
+                }
+                // Body length policy: full (non-final) chunks must equal
+                // chunk_size, and they also fix it if not yet known.
+                if !is_last {
+                    match state.chunk_size {
+                        Some(expected) if plain_body.len() != expected => {
+                            return Err(VoiceError::BodyLenMismatch {
+                                got: plain_body.len(),
+                                expected,
+                            });
+                        }
+                        None => {
+                            if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
+                                return Err(VoiceError::ChunkTooLarge {
+                                    got: plain_body.len(),
+                                    max: MAX_BODY_SIZE,
+                                });
+                            }
+                            state.chunk_size = Some(plain_body.len());
+                        }
+                        _ => {}
+                    }
+                } else {
+                    // Final DATA chunk may be shorter than chunk_size.
+                    if let Some(expected) = state.chunk_size
+                        && plain_body.len() > expected
+                    {
+                        return Err(VoiceError::BodyLenMismatch {
+                            got: plain_body.len(),
+                            expected,
+                        });
+                    }
+                    state.last_data_len = Some(plain_body.len());
                 }
                 state.data_shards[idx] = Some(plain_body);
                 state.received_data = state.received_data.saturating_add(1);
             }
             PacketType::Parity => {
                 let idx = header.chunk_index as usize;
-                if plain_body.len() != state.chunk_size {
-                    return Err(VoiceError::BodyLenMismatch {
-                        got: plain_body.len(),
-                        expected: state.chunk_size,
-                    });
-                }
                 if state.parity_shards[idx].is_some() {
                     return Ok(AssemblyEvent::Duplicate);
+                }
+                match state.chunk_size {
+                    Some(expected) if plain_body.len() != expected => {
+                        return Err(VoiceError::BodyLenMismatch {
+                            got: plain_body.len(),
+                            expected,
+                        });
+                    }
+                    None => {
+                        if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
+                            return Err(VoiceError::ChunkTooLarge {
+                                got: plain_body.len(),
+                                max: MAX_BODY_SIZE,
+                            });
+                        }
+                        state.chunk_size = Some(plain_body.len());
+                    }
+                    _ => {}
                 }
                 state.parity_shards[idx] = Some(plain_body);
                 state.received_parity = state.received_parity.saturating_add(1);
@@ -459,14 +547,24 @@ fn push_blacklist(bl: &mut Vec<((String, u32), Instant)>, key: (String, u32), no
 }
 
 fn finalize(from: &str, key: &(String, u32), state: AssemblyState, complete: bool) -> VoiceMessage {
-    let mut audio = Vec::with_capacity(state.chunk_size * state.data_shards.len());
+    // chunk_size may still be None if we only ever saw the (trimmed) final
+    // DATA chunk. Fall back to that body's length for capacity hints / fill.
+    let chunk_size = state.chunk_size.unwrap_or_else(|| {
+        state
+            .data_shards
+            .iter()
+            .filter_map(|s| s.as_ref().map(|b| b.len()))
+            .max()
+            .unwrap_or(0)
+    });
+    let mut audio = Vec::with_capacity(chunk_size * state.data_shards.len());
     for slot in &state.data_shards {
         match slot {
             Some(payload) => audio.extend_from_slice(payload),
             None => {
                 // Missing chunk → fill with zeros (codec-specific silence is
                 // the responsibility of the decoder/playback layer).
-                audio.resize(audio.len() + state.chunk_size, 0);
+                audio.resize(audio.len() + chunk_size, 0);
             }
         }
     }

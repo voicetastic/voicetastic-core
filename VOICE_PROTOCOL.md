@@ -4,7 +4,10 @@ Voice messaging over the Meshtastic mesh.
 
 This document is the **source of truth** for the wire format used by
 `voicetastic-desktop` and any compatible peer. The reference implementation
-lives in [`crates/voicetastic-core/src/voice.rs`](crates/voicetastic-core/src/voice.rs).
+lives in [`crates/voicetastic-core/src/voice/`](crates/voicetastic-core/src/voice/).
+
+For an implementer-friendly companion (byte walkthroughs, diagrams,
+sender/receiver recipes), see the [voice protocol wiki](docs/wiki/Home.md).
 
 **Protocol version: 1**
 
@@ -69,9 +72,12 @@ LoRa duty-cycle starvation. The recommended delay depends on the radio's
 | `LONG_MODERATE`, `LONG_SLOW`  | 500 ms  |
 | `VERY_LONG_SLOW`              | 800 ms  |
 
-When the preset is unknown, senders MUST default to **500 ms**. USB-serial
-transports MAY use 100 ms regardless of the preset, since duty-cycle limits
-do not apply locally.
+When the preset is unknown, senders MUST default to **500 ms**.
+
+Local transports (USB-serial, BLE-to-radio) are not subject to LoRa
+duty-cycle limits, but the radio's queue still benefits from pacing; the
+recommended values above SHOULD be used regardless of the link to the
+radio.
 
 ---
 
@@ -92,7 +98,7 @@ Every frame is at most 231 bytes and starts with a 12-byte header:
    7     1   codec_param      UInt8 (codec-specific, see §3.2)
    8     1   stream_seq       UInt8 (per-(from,channel) monotonic)
    9     1   chunk_index      UInt8
-  10     1   total_data       UInt8 (1..=255, original data chunks)
+  10     1   total_data       UInt8 (1..=255, original data chunks; 0 is reserved and rejected — see §9.2)
   11     1   parity_count     UInt8 (0..=128, FEC parity chunks)
  ───────────────────────────────────────────────────────────────────────
   12   ≤219  body             see §3.3
@@ -111,16 +117,22 @@ Every frame is at most 231 bytes and starts with a 12-byte header:
 
 ### 3.2 Codec field
 
-| `codec` | Name        | `codec_param` meaning                          |
-|---------|-------------|------------------------------------------------|
-|   0     | `AMR_NB`    | AMR-NB bitrate ordinal (0..=7), see §3.2.1     |
-|   1     | `OPUS`      | bitrate / 1000 (kbps, 6..=64)                  |
-|   2     | `PCM_S16LE` | sample rate index: 0=8 kHz, 1=16 kHz           |
-| 3..255  | reserved    | receivers MUST drop unknown codecs             |
+| `codec` | Name        | `codec_param` meaning                                       |
+|---------|-------------|--------------------------------------------------------------|
+|   0     | `AMR_NB`    | AMR-NB bitrate ordinal (0..=7), see §3.2.1                  |
+|   1     | `OPUS`      | bitrate / 1000 (kbps); typical range 6..=64, advisory only   |
+|   2     | `PCM_S16LE` | sample rate index: 0=8 kHz, 1=16 kHz                         |
+| 3..255  | reserved    | receivers MUST drop unknown codecs                           |
+
+`codec_param` is codec-specific metadata passed through unmodified by the
+protocol; receivers SHOULD interpret it per the codec column above but the
+protocol does not range-check it.
 
 The codec/codec_param fields are advisory: the protocol does not transcode.
 Receivers that do not support the advertised codec MUST drop the frame and
 SHOULD surface a "codec unsupported" event to the application layer.
+`codec` values in the `3..=255` range are reserved; receivers MUST drop
+frames carrying them.
 
 #### 3.2.1 AMR-NB bitrates
 
@@ -145,7 +157,7 @@ frames only.
 ```
               encrypted=0                       encrypted=1
  ───────────────────────────  ─────────────────────────────────────────
- plaintext payload bytes      12 B nonce ‖ AES-GCM-256(ciphertext ‖ 16 B tag)
+ plaintext payload bytes      12 B nonce ‖ ciphertext ‖ 16 B tag
 ```
 
 For `DATA` frames the plaintext is the codec frame bytes for this chunk.
@@ -154,6 +166,18 @@ index, sized to `chunk_size` (see §4). For `NACK` frames the body is never
 encrypted; the `encrypted` bit MUST be zero.
 
 ### 3.4 NACK body
+
+A NACK frame carries the standard 12-byte header, with these constraints:
+
+- `packet_type = NACK` (binary `10` in `type_flags` bits 6–7)
+- `encrypted = 0` (NACKs MUST NOT use the AES-GCM envelope; see §7)
+- `chunk_index = 0`
+- `message_id`, `codec`, `codec_param`, `stream_seq`, `total_data` MUST
+  echo the values of the message being NACK'd. `parity_count` MUST be
+  echoed for completeness; receivers of NACKs (i.e. the original sender)
+  MAY ignore it since the bitmap is sized solely from `total_data`.
+
+The body is:
 
 ```
  Byte   Size              Field         Encoding
@@ -165,10 +189,14 @@ encrypted; the `encrypted` bit MUST be zero.
 ```
 
 Bit 0 (most-significant bit of byte 2) corresponds to chunk index 0; bit 7
-to chunk index 7; byte 3 bit 0 to chunk index 8; and so on. A NACK with all
-bitmap bits cleared MUST be interpreted as "all chunks received, stop
-sending parity". When `give_up` is set, the receiver has timed out and the
-sender SHOULD discard any remaining queued chunks for this message.
+to chunk index 7; byte 3 bit 0 to chunk index 8; and so on. A NACK with
+all bitmap bits cleared is a **positive ACK** and the sender SHOULD stop
+transmitting any remaining queued parity chunks for this message;
+receivers in the reference implementation rely on natural completion (and
+the per-message blacklist for late frames) and do not currently emit this
+shape, but parsers MUST accept it. When `give_up` is set, the receiver
+has timed out and the sender SHOULD discard any remaining queued chunks
+for this message.
 
 NACKs are not encrypted, are not retransmitted (the loss-recovery loop is
 itself the retransmission), and SHOULD be sent with `want_ack=false`.
@@ -187,12 +215,14 @@ Variable chunk size per message: each message picks a `chunk_size` ∈
 | Long-range                            | 96           |
 | Very long-range (worst loss profile)  | 48           |
 
-`chunk_size` is **not** carried in the header — receivers infer it from the
-DATA frame body length, which is constant within a message except for the
-final data chunk (which MAY be smaller). Parity frames always use the full
-`chunk_size`. The first DATA frame received fixes the receiver's expected
-size; later frames whose body length differs (excluding the last data
-chunk) are rejected.
+`chunk_size` is **not** carried in the header — receivers infer it from
+the first frame whose body length is unambiguous: any **PARITY** frame, or
+any **non-final DATA** frame. A receiver MUST NOT freeze `chunk_size` from
+a lone trimmed final DATA chunk that arrives first; it defers discovery
+until one of the unambiguous frame types arrives. Once established,
+later DATA frames whose body length differs (excluding the last data
+chunk, which MAY be shorter) and PARITY frames whose body length differs
+MUST be rejected.
 
 The sender's recording duration limit derives from `chunk_size`:
 
@@ -204,7 +234,9 @@ At `chunk_size = 219` and OPUS @ 16 kbps that's ~28 s of audio per message;
 at `chunk_size = 48` and AMR-NB @ MR795 it's ~12 s.
 
 When the encryption envelope is enabled (see §7), `chunk_size` is bounded
-by `MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN = 219 - 12 - 16 = 191`.
+by `MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN = 219 - 12 - 16 = 191`,
+so the corresponding maximum reassembled audio drops to
+`255 × 191 = 48 705 B`.
 
 ---
 
@@ -217,8 +249,9 @@ FEC uses **Reed-Solomon over GF(2⁸)** (`reed-solomon-erasure` crate) with
   `chunk_size`) and produces `parity_count` parity chunks. Padding is
   removed only on the final data chunk during reassembly.
 - The receiver MUST be able to reconstruct the message if it has any
-  `total_data` shards out of the `total_data + parity_count` total (i.e.
-  loss up to `parity_count` shards is recoverable without a NACK).
+  `total_data` shards out of the `total_data + parity_count` total (any
+  combination of DATA and PARITY shards counts toward the threshold).
+  Loss up to `parity_count` shards is recoverable without a NACK.
 - `parity_count` is sender policy; recommended values:
 
 | Mesh profile      | `parity_count` (% of `total_data`) |
@@ -233,7 +266,11 @@ FEC uses **Reed-Solomon over GF(2⁸)** (`reed-solomon-erasure` crate) with
 When loss exceeds `parity_count`, the receiver issues a NACK; the sender
 retransmits the missing data chunks (only) and MAY add additional parity
 chunks beyond the original `parity_count`. Retransmitted frames carry the
-same `message_id`, `chunk_index`, and `total_data`.
+same `message_id`, `chunk_index`, and `total_data`. `parity_count` MAY
+grow on retransmit; receivers MUST accept frames whose `parity_count` is
+≥ the value first observed and SHOULD reject decreases. Retransmitted
+DATA / PARITY frames are paced under the same rules as the original send
+(see §2.1).
 
 ---
 
@@ -242,13 +279,19 @@ same `message_id`, `chunk_index`, and `total_data`.
 - **Message identity**: `(from_node_num, message_id)` where `message_id` is
   a non-zero `u32` chosen by the sender. The 32-bit space makes accidental
   collision with the receiver's recently-finalized blacklist negligible.
+  `from` MUST be the lowercase 8-hex-digit form `!hex8`; uppercase or
+  shortened ids are rejected for encrypted frames (§7) and SHOULD be
+  normalized for plaintext frames.
 - **Stream identity**: `(from_node_num, channel, stream_seq)` where
   `stream_seq` is a `u8` monotonic counter per (sender, channel) pair,
-  wrapping at 256. The receiver uses it to order overlapping voice messages
-  from the same sender on the same channel deterministically (e.g. when
-  recordings are interleaved). The `last_in_stream` flag (bit 4 of
-  `type_flags`) is set on the final frame of a recording session and
-  signals the receiver to expire stream-history state for that sender.
+  wrapping at 256. It is intended for receivers that order overlapping
+  voice messages from the same sender on the same channel deterministically
+  (e.g. interleaved recordings); the reference implementation currently
+  treats it as informational and echoes it on NACK frames. The
+  `last_in_stream` flag (bit 4 of `type_flags`) is set on the final frame
+  of a recording session; receivers MAY use it to expire stream-history
+  state for that sender. The reference implementation currently treats
+  this bit as informational.
 
 ---
 
@@ -266,7 +309,12 @@ The protocol OPTIONALLY adds an end-to-end AES-256-GCM envelope on top:
   each message to its channel and sender; replaying a captured frame on a
   different channel or with a spoofed sender id fails authentication. The
   HKDF `info` string is preserved across protocol revisions for
-  forward-compat with derivers that have already shipped.
+  forward-compat with derivers that have already shipped — the literal
+  `"voicetastic/v2"` is permanent and does not track the wire-protocol
+  version byte (currently `0x01`).
+- **Sender id requirement**: when `encrypted = 1`, the receiver MUST
+  reject any frame whose `from` is not a strict `!hex8` Meshtastic node
+  id, since key derivation otherwise diverges silently.
 - **Nonce**: 96-bit random per frame, prepended to the body. Nonces are
   never reused for the same `key`; a fresh `message_id` ⇒ fresh `key` ⇒
   fresh nonce space.
@@ -336,7 +384,10 @@ channel), encryption is a no-op.
 Senders MAY also drop **silence chunks**: a DATA chunk whose payload is
 entirely codec NO_DATA frames does not need to be sent, since the receiver
 synthesises silence for missing chunks anyway. Silence detection is
-codec-specific (e.g. AMR-NB: all bytes equal to `0x7C`).
+codec-specific (e.g. AMR-NB: all bytes equal to `0x7C`). Receivers MUST
+NOT distinguish silence-skipped chunks from lost chunks: both appear as
+"missing", are eligible for FEC reconstruction, and are zero-filled on
+timeout per §9.
 
 The full send is cancellable: a `CancellationToken` signal aborts
 remaining transmissions and emits `last_in_stream = 1` on the next sent
@@ -382,7 +433,10 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
 
 ### 9.1 Resource bounds
 
-- `MAX_IN_PROGRESS_GLOBAL = 64` total reassemblies.
+- `MAX_IN_PROGRESS_GLOBAL = 64` total reassemblies. When the global cap
+  is reached and a new `(from, message_id)` arrives, the receiver evicts
+  the in-progress entry with the oldest `started_at` and blacklists its
+  key for `BLACKLIST_TTL`.
 - `MAX_IN_PROGRESS_PER_SENDER = 4` per `from_node_num` (prevents one chatty
   peer from starving everyone else).
 - `MAX_MESSAGE_BYTES = 255 × 219 = 55_845` (worst-case sum of data shards
@@ -390,6 +444,8 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
 - `BLACKLIST_TTL = 60 s`, `BLACKLIST_MAX = 100`.
 - `NACK_MAX_ROUNDS = 3` per message before the receiver gives up.
 - `NACK_WINDOW_MS = 1500` after the last seen chunk before issuing a NACK.
+  Global NACK emission is bounded by `MAX_IN_PROGRESS_GLOBAL` per tick;
+  senders / transports SHOULD pace NACK transmission per §2.1.
 
 ### 9.2 Rejection rules
 
@@ -402,9 +458,17 @@ following hold:
 - `chunk_index >= total_data` for `DATA` frames
 - `chunk_index >= parity_count` for `PARITY` frames
 - `parity_count > 128`
+- the frame's `codec` is unknown to the receiver (spec §3.2)
+- the frame's `codec` differs from the codec established by the first
+  frame of this `(from, message_id)`
+- the frame's `total_data` differs from the value established by the first
+  frame of this `(from, message_id)`
 - DATA body length differs from the message's established `chunk_size` and
   this is not the last data chunk
+- PARITY body length differs from the message's established `chunk_size`
 - AES-GCM tag verification fails
+- `encrypted = 1` but the receiver has no channel PSK configured, or the
+  frame's `from` is not a strict `!hex8` Meshtastic node id
 - the `(from, message_id)` is on the recently-completed blacklist
 - the sender already has `MAX_IN_PROGRESS_PER_SENDER` in-flight messages
   and this is a new `message_id`
@@ -447,7 +511,7 @@ container themselves if needed (e.g. `#!AMR\n` for AMR-NB playback).
 |----------------------------------|-----------------|-----------------------------------------|
 | Max chunks per message           | 255 (`u8`)      | header byte                             |
 | Max parity per message           | 128             | RS coder limit                          |
-| Max audio per message            | ~56 KB          | 255 × 219                               |
+| Max audio per message            | 55 845 B (clear) / 48 705 B (encrypted) | 255 × 219 (or × 191 with GCM envelope) |
 | Min chunk size                   | 16 B            | per-frame overhead floor                |
 | Stream sequence wrap             | 256             | per-(from,channel)                      |
 | Encryption                       | AES-256-GCM     | end-to-end on top of channel AES-CTR    |
@@ -462,6 +526,12 @@ The protocol explicitly does **not** provide:
   per-recipient privacy a future revision could add X25519 key exchange)
 - congestion control (relies on adaptive pacing + per-sender rate limit)
 - ordering across messages (only within a stream via `stream_seq`)
+- authenticated NACKs: NACK frames travel in the clear (Meshtastic's
+  channel AES-CTR aside) and any peer with the channel PSK can forge a
+  `give_up` NACK and abort an in-flight transmission. Senders SHOULD
+  treat a forged-NACK cancellation as a benign failure mode; a future
+  revision MAY add an HMAC field over the NACK body keyed by the
+  envelope key.
 
 ---
 
@@ -472,6 +542,7 @@ pub const PROTOCOL_VERSION: u8 = 0x01;
 pub const HEADER_SIZE: usize = 12;
 pub const MAX_PACKET_SIZE: usize = 231;
 pub const MAX_BODY_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;  // 219
+pub const MAX_MESSAGE_BYTES: usize = MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE;  // 55_845
 pub const MIN_CHUNK_SIZE: usize = 16;
 pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
 pub const MAX_PARITY_PER_MESSAGE: usize = 128;
