@@ -28,13 +28,15 @@ pub const REASSEMBLY_TIMEOUT_UPPER_SECS: u32 = 3_600;
 /// the wire byte assigned in `voice::VoiceCodec::to_byte()`.
 pub const VOICE_CODEC_OPUS: &str = "opus";
 pub const VOICE_CODEC_CODEC2: &str = "codec2";
+pub const VOICE_CODEC_AMRNB: &str = "amrnb";
 
-/// Default voice codec for newly composed messages. Codec2 at its
-/// lowest-stable rate (MODE_1200, 1.2 kbps) is the best fit for slow
-/// LoRa presets — a 30 s clip fits in ~4.5 kB, well under one
-/// retransmittable message budget. Users can switch to Opus in
+/// Default voice codec for newly composed messages. AMR-NB at its
+/// highest rate (MR122, 12.2 kbps) is widely deployed, decodes on
+/// virtually every legacy receiver, and stays under the per-message
+/// budget for the 30 s default clip. Users can switch to Codec2 (for
+/// very slow LoRa presets) or Opus (higher quality) in
 /// Settings → Voice messages.
-pub const DEFAULT_VOICE_CODEC: &str = VOICE_CODEC_CODEC2;
+pub const DEFAULT_VOICE_CODEC: &str = VOICE_CODEC_AMRNB;
 
 /// Codec2 mode index (matches the `codec2` crate's `Codec2Mode` discriminant
 /// and is what we ship over the air as `codec_param`):
@@ -48,6 +50,21 @@ pub const CODEC2_MODE_1300: u8 = 4;
 pub const CODEC2_MODE_1200: u8 = 5;
 /// Lowest implemented (and thus most LoRa-friendly) Codec2 rate.
 pub const DEFAULT_CODEC2_MODE: u8 = CODEC2_MODE_1200;
+
+/// AMR-NB mode index (matches the OpenCORE `enum_Mode` ordinal we ship
+/// over the air as `codec_param`):
+///   0 = MR475 (4.75 kbps), 1 = MR515, 2 = MR59, 3 = MR67,
+///   4 = MR74, 5 = MR795, 6 = MR102, 7 = MR122 (12.2 kbps).
+pub const AMRNB_MODE_475: u8 = 0;
+pub const AMRNB_MODE_515: u8 = 1;
+pub const AMRNB_MODE_590: u8 = 2;
+pub const AMRNB_MODE_670: u8 = 3;
+pub const AMRNB_MODE_740: u8 = 4;
+pub const AMRNB_MODE_795: u8 = 5;
+pub const AMRNB_MODE_1020: u8 = 6;
+pub const AMRNB_MODE_1220: u8 = 7;
+/// Highest-quality AMR-NB rate; matches the most common `.amr` files.
+pub const DEFAULT_AMRNB_MODE: u8 = AMRNB_MODE_1220;
 
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -68,8 +85,9 @@ pub struct AppSettings {
     pub reassembly_timeout_secs: Option<u32>,
 
     /// Voice codec used when *sending* a new voice message. One of
-    /// [`VOICE_CODEC_OPUS`] or [`VOICE_CODEC_CODEC2`]. `None` falls back
-    /// to [`DEFAULT_VOICE_CODEC`]. Unknown values are treated as the
+    /// [`VOICE_CODEC_AMRNB`], [`VOICE_CODEC_OPUS`] or
+    /// [`VOICE_CODEC_CODEC2`]. `None` falls back to
+    /// [`DEFAULT_VOICE_CODEC`]. Unknown values are treated as the
     /// default. Received messages are decoded based on the codec byte
     /// carried in the frame header, independent of this setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +98,12 @@ pub struct AppSettings {
     /// outside `0..=5` are clamped to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_codec2_mode: Option<u8>,
+
+    /// AMR-NB mode index, used when [`Self::voice_codec`] resolves to
+    /// AMR-NB. `None` falls back to [`DEFAULT_AMRNB_MODE`]. Values
+    /// outside `0..=7` are clamped to the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_amrnb_mode: Option<u8>,
 }
 
 impl AppSettings {
@@ -103,6 +127,7 @@ impl AppSettings {
         match self.voice_codec.as_deref() {
             Some(VOICE_CODEC_OPUS) => VOICE_CODEC_OPUS,
             Some(VOICE_CODEC_CODEC2) => VOICE_CODEC_CODEC2,
+            Some(VOICE_CODEC_AMRNB) => VOICE_CODEC_AMRNB,
             _ => DEFAULT_VOICE_CODEC,
         }
     }
@@ -112,6 +137,14 @@ impl AppSettings {
         match self.voice_codec2_mode {
             Some(m) if m <= CODEC2_MODE_1200 => m,
             _ => DEFAULT_CODEC2_MODE,
+        }
+    }
+
+    /// Effective AMR-NB mode index, clamped to `0..=7`.
+    pub fn voice_amrnb_mode(&self) -> u8 {
+        match self.voice_amrnb_mode {
+            Some(m) if m <= AMRNB_MODE_1220 => m,
+            _ => DEFAULT_AMRNB_MODE,
         }
     }
 

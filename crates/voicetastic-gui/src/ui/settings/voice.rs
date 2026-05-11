@@ -10,10 +10,11 @@
 use eframe::egui;
 
 use voicetastic_core::settings::{
-    CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400, CODEC2_MODE_1600, CODEC2_MODE_2400,
-    CODEC2_MODE_3200, DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS,
-    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER,
-    VoiceCodecKind,
+    AMRNB_MODE_475, AMRNB_MODE_515, AMRNB_MODE_590, AMRNB_MODE_670, AMRNB_MODE_740, AMRNB_MODE_795,
+    AMRNB_MODE_1020, AMRNB_MODE_1220, CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400,
+    CODEC2_MODE_1600, CODEC2_MODE_2400, CODEC2_MODE_3200, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
+    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS, REASSEMBLY_TIMEOUT_LOWER_SECS,
+    REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER, VoiceCodecKind,
 };
 
 use crate::app::VoicetasticApp;
@@ -88,10 +89,12 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
             let label = |k: VoiceCodecKind| match k {
                 VoiceCodecKind::Opus => "Opus (12 kbps wideband)",
                 VoiceCodecKind::Codec2 => "Codec2 (1.2-3.2 kbps narrowband)",
+                VoiceCodecKind::AmrNb => "AMR-NB (4.75-12.2 kbps narrowband, default)",
             };
             egui::ComboBox::from_id_salt("voice_codec_select")
                 .selected_text(label(current))
                 .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut next, VoiceCodecKind::AmrNb, label(VoiceCodecKind::AmrNb));
                     ui.selectable_value(&mut next, VoiceCodecKind::Codec2, label(VoiceCodecKind::Codec2));
                     ui.selectable_value(&mut next, VoiceCodecKind::Opus, label(VoiceCodecKind::Opus));
                 });
@@ -133,6 +136,45 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                     && let Err(e) = app.settings.set_voice_codec2_mode(mode)
                 {
                     warn("set voice_codec2_mode", e);
+                }
+            }
+
+            if app.settings.voice_codec() == VoiceCodecKind::AmrNb {
+                ui.add_space(4.0);
+                ui.label("AMR-NB bitrate:");
+                let mut mode = app.settings.voice_amrnb_mode();
+                let mode_label = |m: u8| match m {
+                    AMRNB_MODE_475 => "4.75 kbps (lowest)",
+                    AMRNB_MODE_515 => "5.15 kbps",
+                    AMRNB_MODE_590 => "5.90 kbps",
+                    AMRNB_MODE_670 => "6.70 kbps",
+                    AMRNB_MODE_740 => "7.40 kbps",
+                    AMRNB_MODE_795 => "7.95 kbps",
+                    AMRNB_MODE_1020 => "10.20 kbps",
+                    AMRNB_MODE_1220 => "12.20 kbps (best, default)",
+                    _ => "unknown",
+                };
+                let prev = mode;
+                egui::ComboBox::from_id_salt("voice_amrnb_mode_select")
+                    .selected_text(mode_label(mode))
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            AMRNB_MODE_475,
+                            AMRNB_MODE_515,
+                            AMRNB_MODE_590,
+                            AMRNB_MODE_670,
+                            AMRNB_MODE_740,
+                            AMRNB_MODE_795,
+                            AMRNB_MODE_1020,
+                            AMRNB_MODE_1220,
+                        ] {
+                            ui.selectable_value(&mut mode, m, mode_label(m));
+                        }
+                    });
+                if mode != prev
+                    && let Err(e) = app.settings.set_voice_amrnb_mode(mode)
+                {
+                    warn("set voice_amrnb_mode", e);
                 }
             }
             ui.weak(format!(

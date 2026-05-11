@@ -1,8 +1,9 @@
-//! Microphone capture, Opus / Codec2 encode/decode and speaker playback for
+//! Microphone capture, Opus / Codec2 / AMR-NB encode/decode and speaker playback for
 //! voice messages composed in the Chat tab.
 //!
 //! Gated behind the `audio` Cargo feature so default builds remain free of
-//! `cpal` (ALSA on Linux), `audiopus` (libopus) and the `codec2` crate.
+//! `cpal` (ALSA on Linux), `audiopus` (libopus), the `codec2` crate and the
+//! `libopencore-amrnb` system library.
 //! With the feature off the module exposes the same surface but every
 //! entry point returns [`AudioError::FeatureDisabled`] and
 //! [`is_available`] is `false`.
@@ -24,6 +25,14 @@
 //! - **Codec2** (`VoiceCodec::Codec2`, `codec_param = mode in 0..=5`):
 //!   raw concatenated packed frames of the mode's fixed size
 //!   (`bits_per_frame / 8`, rounded up). 8 kHz mono internally.
+//!
+//! - **AMR-NB** (`VoiceCodec::AmrNb`, `codec_param = mode in 0..=7`):
+//!   concatenated IF1 storage-format frames. Each frame is a 1-byte
+//!   ToC header (encoding the mode in bits 3..6) followed by the
+//!   mode-specific number of speech bytes, for totals (incl. ToC) of
+//!   13/14/16/18/20/21/27/32 bytes per 20 ms frame. 8 kHz mono internally.
+//!   The actual encode/decode work goes through `libopencore-amrnb` over
+//!   raw FFI; no `-sys` crate.
 
 use std::time::Duration;
 
@@ -39,6 +48,12 @@ pub const FRAME_SAMPLES: usize = 960;
 /// Sample rate Codec2 operates on (all modes).
 #[allow(dead_code)]
 pub const CODEC2_SAMPLE_RATE_HZ: u32 = 8_000;
+/// Sample rate AMR-NB operates on (all modes).
+#[allow(dead_code)]
+pub const AMRNB_SAMPLE_RATE_HZ: u32 = 8_000;
+/// Samples per AMR-NB frame (20 ms @ 8 kHz mono).
+#[allow(dead_code)]
+pub const AMRNB_SAMPLES_PER_FRAME: usize = 160;
 /// Target Opus bitrate. 12 kbps voice keeps a 30 s clip under the
 /// protocol's per-message size budget.
 #[allow(dead_code)]
@@ -96,6 +111,23 @@ fn codec2_frame_sizes(mode: u8) -> Option<(usize, usize)> {
     }
 }
 
+/// Total bytes (ToC + speech) per AMR-NB frame for each mode index `0..=7`.
+const AMRNB_BYTES_PER_FRAME: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
+
+/// Extract the AMR-NB mode index from an IF1 storage-format ToC byte.
+/// The mode (FT field) lives in bits 3..6 of the ToC.
+fn amrnb_mode_from_toc(toc: u8) -> u8 {
+    (toc >> 3) & 0x0F
+}
+
+/// Total bytes (ToC + speech) of an AMR-NB frame, given a ToC byte.
+/// Returns `None` for non-speech frame types (DTX/SID/no_data) since we
+/// never emit them.
+fn amrnb_frame_size_from_toc(toc: u8) -> Option<usize> {
+    let mode = amrnb_mode_from_toc(toc) as usize;
+    AMRNB_BYTES_PER_FRAME.get(mode).copied()
+}
+
 /// Best-effort estimate of the wall-clock duration of an encoded payload,
 /// in milliseconds. Returns 0 for unknown codec parameters. Doesn't need
 /// the `audio` feature — used by the chat watcher to label inbound clips
@@ -123,6 +155,23 @@ pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -
             let frames = (payload.len() / bytes) as u32;
             frames * (samples as u32) / 8
         }
+        VoiceCodec::AmrNb => {
+            // Walk the IF1 ToC bytes — frames can in principle mix modes,
+            // but we always emit a fixed mode.
+            let mut i = 0;
+            let mut frames: u32 = 0;
+            while i < payload.len() {
+                let Some(size) = amrnb_frame_size_from_toc(payload[i]) else {
+                    break;
+                };
+                if i + size > payload.len() {
+                    break;
+                }
+                i += size;
+                frames += 1;
+            }
+            frames * 20
+        }
         _ => 0,
     }
 }
@@ -130,6 +179,7 @@ pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -
 #[cfg(feature = "audio")]
 mod imp {
     use super::*;
+    use std::ffi::c_void;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::sync::mpsc;
@@ -140,6 +190,79 @@ mod imp {
     use cpal::{SampleFormat, SupportedStreamConfig};
     use opus::{Application, Bitrate, Channels, Decoder, Encoder};
     use parking_lot::Mutex;
+
+    // Raw FFI bindings to libopencore-amrnb. No -sys crate exists on
+    // crates.io for this library, so we declare the surface inline.
+    // System package: `libopencore-amrnb-dev` (Debian/Ubuntu) or
+    // `opencore-amr` (Arch).
+    #[link(name = "opencore-amrnb")]
+    unsafe extern "C" {
+        fn Encoder_Interface_init(dtx: i32) -> *mut c_void;
+        fn Encoder_Interface_Encode(
+            st: *mut c_void,
+            mode: i32,
+            speech: *const i16,
+            serial: *mut u8,
+            force_speech: i32,
+        ) -> i32;
+        fn Encoder_Interface_exit(st: *mut c_void);
+
+        fn Decoder_Interface_init() -> *mut c_void;
+        fn Decoder_Interface_Decode(st: *mut c_void, input: *const u8, out: *mut i16, bfi: i32);
+        fn Decoder_Interface_exit(st: *mut c_void);
+    }
+
+    /// Owned AMR-NB encoder state. Calls `Encoder_Interface_exit` on drop.
+    struct AmrnbEncoder(*mut c_void);
+    impl AmrnbEncoder {
+        fn new() -> Result<Self, AudioError> {
+            // dtx=0 → always emit speech frames (no SID/no_data), which
+            // keeps the wire format trivially walkable.
+            // SAFETY: FFI call with no preconditions; checks for NULL.
+            let p = unsafe { Encoder_Interface_init(0) };
+            if p.is_null() {
+                return Err(AudioError::Codec(
+                    "amrnb: Encoder_Interface_init failed".into(),
+                ));
+            }
+            Ok(Self(p))
+        }
+    }
+    impl Drop for AmrnbEncoder {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: pointer came from Encoder_Interface_init and is
+                // only freed here exactly once.
+                unsafe { Encoder_Interface_exit(self.0) };
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Owned AMR-NB decoder state. Calls `Decoder_Interface_exit` on drop.
+    struct AmrnbDecoder(*mut c_void);
+    impl AmrnbDecoder {
+        fn new() -> Result<Self, AudioError> {
+            // SAFETY: FFI call with no preconditions; checks for NULL.
+            let p = unsafe { Decoder_Interface_init() };
+            if p.is_null() {
+                return Err(AudioError::Codec(
+                    "amrnb: Decoder_Interface_init failed".into(),
+                ));
+            }
+            Ok(Self(p))
+        }
+    }
+    impl Drop for AmrnbDecoder {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: pointer came from Decoder_Interface_init and is
+                // only freed here exactly once.
+                unsafe { Decoder_Interface_exit(self.0) };
+                self.0 = std::ptr::null_mut();
+            }
+        }
+    }
 
     fn backend<E: std::fmt::Display>(e: E) -> AudioError {
         AudioError::Backend(e.to_string())
@@ -160,6 +283,14 @@ mod imp {
                 return Err(AudioError::Codec(format!("unknown codec2 mode index {b}")));
             }
         })
+    }
+
+    fn amrnb_validate_mode(b: u8) -> Result<i32, AudioError> {
+        if (b as usize) < AMRNB_BYTES_PER_FRAME.len() {
+            Ok(b as i32)
+        } else {
+            Err(AudioError::Codec(format!("unknown amrnb mode index {b}")))
+        }
     }
 
     fn pick_config(
@@ -255,6 +386,14 @@ mod imp {
             scratch: Vec<f32>,
             payload: Vec<u8>,
         },
+        AmrNb {
+            enc: AmrnbEncoder,
+            mode: i32,
+            bytes_per_frame: usize,
+            resampler: Resampler,
+            scratch: Vec<f32>,
+            payload: Vec<u8>,
+        },
     }
 
     impl EncState {
@@ -282,6 +421,19 @@ mod imp {
                         bytes_per_frame,
                         resampler: Resampler::new(SAMPLE_RATE_HZ, CODEC2_SAMPLE_RATE_HZ),
                         scratch: Vec::with_capacity(samples_per_frame * 2),
+                        payload: Vec::new(),
+                    })
+                }
+                VoiceCodec::AmrNb => {
+                    let mode = amrnb_validate_mode(codec_param)?;
+                    let enc = AmrnbEncoder::new()?;
+                    let bytes_per_frame = AMRNB_BYTES_PER_FRAME[mode as usize];
+                    Ok(Self::AmrNb {
+                        enc,
+                        mode,
+                        bytes_per_frame,
+                        resampler: Resampler::new(SAMPLE_RATE_HZ, AMRNB_SAMPLE_RATE_HZ),
+                        scratch: Vec::with_capacity(AMRNB_SAMPLES_PER_FRAME * 2),
                         payload: Vec::new(),
                     })
                 }
@@ -329,6 +481,49 @@ mod imp {
                     }
                     Ok(())
                 }
+                Self::AmrNb {
+                    enc,
+                    mode,
+                    bytes_per_frame,
+                    resampler,
+                    scratch,
+                    payload,
+                } => {
+                    resampler.push(src, scratch);
+                    let mut serial = [0u8; 64];
+                    while scratch.len() >= AMRNB_SAMPLES_PER_FRAME {
+                        let mut frame_i16 = [0i16; AMRNB_SAMPLES_PER_FRAME];
+                        for (i, s) in scratch.drain(..AMRNB_SAMPLES_PER_FRAME).enumerate() {
+                            frame_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        // SAFETY: `enc.0` is a valid encoder state; speech
+                        // pointer covers 160 i16 samples; serial covers >=32 bytes.
+                        let n = unsafe {
+                            Encoder_Interface_Encode(
+                                enc.0,
+                                *mode,
+                                frame_i16.as_ptr(),
+                                serial.as_mut_ptr(),
+                                0,
+                            )
+                        };
+                        if n <= 0 {
+                            return Err(AudioError::Codec(format!(
+                                "amrnb: Encoder_Interface_Encode returned {n}"
+                            )));
+                        }
+                        let n = n as usize;
+                        // With dtx=0 and a fixed mode the encoder always
+                        // produces a full speech frame of the expected size.
+                        if n != *bytes_per_frame {
+                            return Err(AudioError::Codec(format!(
+                                "amrnb: unexpected frame size {n}, want {bytes_per_frame}"
+                            )));
+                        }
+                        payload.extend_from_slice(&serial[..n]);
+                    }
+                    Ok(())
+                }
             }
         }
 
@@ -370,9 +565,44 @@ mod imp {
                         payload.extend_from_slice(&packed);
                     }
                 }
+                Self::AmrNb {
+                    enc,
+                    mode,
+                    bytes_per_frame,
+                    scratch,
+                    payload,
+                    ..
+                } => {
+                    if !scratch.is_empty() {
+                        scratch.resize(AMRNB_SAMPLES_PER_FRAME, 0.0);
+                        let mut frame_i16 = [0i16; AMRNB_SAMPLES_PER_FRAME];
+                        for (i, s) in scratch.drain(..AMRNB_SAMPLES_PER_FRAME).enumerate() {
+                            frame_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        let mut serial = [0u8; 64];
+                        // SAFETY: see `push`; valid pointers and sizes.
+                        let n = unsafe {
+                            Encoder_Interface_Encode(
+                                enc.0,
+                                *mode,
+                                frame_i16.as_ptr(),
+                                serial.as_mut_ptr(),
+                                0,
+                            )
+                        };
+                        if n > 0 {
+                            let n = n as usize;
+                            if n == *bytes_per_frame {
+                                payload.extend_from_slice(&serial[..n]);
+                            }
+                        }
+                    }
+                }
             }
             Ok(match self {
-                Self::Opus { payload, .. } | Self::Codec2 { payload, .. } => payload,
+                Self::Opus { payload, .. }
+                | Self::Codec2 { payload, .. }
+                | Self::AmrNb { payload, .. } => payload,
             })
         }
     }
@@ -583,6 +813,7 @@ mod imp {
         match codec_id {
             VoiceCodec::Opus => decode_opus(payload),
             VoiceCodec::Codec2 => decode_codec2(payload, codec_param),
+            VoiceCodec::AmrNb => decode_amrnb(payload),
             other => Err(AudioError::UnsupportedCodec(other)),
         }
     }
@@ -629,6 +860,42 @@ mod imp {
             .map(|s| s as f32 / i16::MAX as f32)
             .collect();
         let mut rs = Resampler::new(CODEC2_SAMPLE_RATE_HZ, SAMPLE_RATE_HZ);
+        let mut pcm48k_f32: Vec<f32> = Vec::with_capacity(pcm8k_f32.len() * 6);
+        rs.push(&pcm8k_f32, &mut pcm48k_f32);
+        Ok(pcm48k_f32
+            .into_iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect())
+    }
+
+    fn decode_amrnb(payload: &[u8]) -> Result<Vec<i16>, AudioError> {
+        let dec = AmrnbDecoder::new()?;
+        let mut pcm8k_i16: Vec<i16> = Vec::new();
+        let mut i = 0;
+        let mut frame = [0i16; AMRNB_SAMPLES_PER_FRAME];
+        while i < payload.len() {
+            let Some(size) = amrnb_frame_size_from_toc(payload[i]) else {
+                return Err(AudioError::Codec(format!(
+                    "amrnb: unsupported ToC byte {:#x}",
+                    payload[i]
+                )));
+            };
+            if i + size > payload.len() {
+                return Err(AudioError::Codec("amrnb: truncated frame".into()));
+            }
+            // SAFETY: `dec.0` is a valid decoder state; input covers `size`
+            // bytes; output covers 160 i16 samples.
+            unsafe {
+                Decoder_Interface_Decode(dec.0, payload[i..].as_ptr(), frame.as_mut_ptr(), 0);
+            }
+            pcm8k_i16.extend_from_slice(&frame);
+            i += size;
+        }
+        let pcm8k_f32: Vec<f32> = pcm8k_i16
+            .into_iter()
+            .map(|s| s as f32 / i16::MAX as f32)
+            .collect();
+        let mut rs = Resampler::new(AMRNB_SAMPLE_RATE_HZ, SAMPLE_RATE_HZ);
         let mut pcm48k_f32: Vec<f32> = Vec::with_capacity(pcm8k_f32.len() * 6);
         rs.push(&pcm8k_f32, &mut pcm48k_f32);
         Ok(pcm48k_f32

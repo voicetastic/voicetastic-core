@@ -8,7 +8,7 @@ default:
   tags:
     - rust
   before_script:
-    - apt-get update -qq && apt-get install -y -qq libdbus-1-dev libasound2-dev libopus-dev pkg-config protobuf-compiler
+    - apt-get update -qq && apt-get install -y -qq libdbus-1-dev libasound2-dev libopus-dev libopencore-amrnb-dev pkg-config protobuf-compiler
 
 build:
   stage: check

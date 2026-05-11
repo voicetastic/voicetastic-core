@@ -25,6 +25,7 @@ byte-by-byte, and provides recipes for senders and receivers.
 | [Receiver Guide](Receiver-Guide.md)                           | How to build a compatible reassembler.                   |
 | [Constants and Limits](Constants-and-Limits.md)               | All numeric ceilings in one place, with rationale.       |
 | [Error Catalogue](Error-Catalogue.md)                         | Every `VoiceError` variant and when it fires.            |
+| [Settings](Settings.md)                                       | Client-side persisted settings (codec, bitrate, …).      |
 | [Glossary](Glossary.md)                                       | Term definitions; read first if jargon trips you up.     |
 
 ---

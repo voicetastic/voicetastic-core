@@ -487,6 +487,7 @@ pub enum SettingKey {
     VoiceReassemblyTimeoutSecs,
     VoiceCodec,
     VoiceCodec2Mode,
+    VoiceAmrnbMode,
 }
 
 impl From<SettingKey> for s::SettingKey {
@@ -497,6 +498,7 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceReassemblyTimeoutSecs => Self::VoiceReassemblyTimeoutSecs,
             SettingKey::VoiceCodec => Self::VoiceCodec,
             SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
+            SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
         }
     }
 }
@@ -509,6 +511,7 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceReassemblyTimeoutSecs => Self::VoiceReassemblyTimeoutSecs,
             s::SettingKey::VoiceCodec => Self::VoiceCodec,
             s::SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
+            s::SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
         }
     }
 }
@@ -517,6 +520,7 @@ impl From<s::SettingKey> for SettingKey {
 pub enum VoiceCodecKind {
     Opus,
     Codec2,
+    AmrNb,
 }
 
 impl From<VoiceCodecKind> for s::VoiceCodecKind {
@@ -524,6 +528,7 @@ impl From<VoiceCodecKind> for s::VoiceCodecKind {
         match k {
             VoiceCodecKind::Opus => Self::Opus,
             VoiceCodecKind::Codec2 => Self::Codec2,
+            VoiceCodecKind::AmrNb => Self::AmrNb,
         }
     }
 }
@@ -533,6 +538,7 @@ impl From<s::VoiceCodecKind> for VoiceCodecKind {
         match k {
             s::VoiceCodecKind::Opus => Self::Opus,
             s::VoiceCodecKind::Codec2 => Self::Codec2,
+            s::VoiceCodecKind::AmrNb => Self::AmrNb,
         }
     }
 }
@@ -654,6 +660,14 @@ impl SettingsApi {
 
     pub fn set_voice_codec2_mode(&self, mode: u8) -> Result<(), SettingsError> {
         self.0.set_voice_codec2_mode(mode).map_err(Into::into)
+    }
+
+    pub fn voice_amrnb_mode(&self) -> u8 {
+        self.0.voice_amrnb_mode()
+    }
+
+    pub fn set_voice_amrnb_mode(&self, mode: u8) -> Result<(), SettingsError> {
+        self.0.set_voice_amrnb_mode(mode).map_err(Into::into)
     }
 }
 

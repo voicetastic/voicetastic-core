@@ -18,10 +18,10 @@ use parking_lot::{Mutex, RwLock};
 use crate::voice::VoiceCodec;
 
 use super::data::{
-    AppSettings, CODEC2_MODE_1200, DEFAULT_CODEC2_MODE, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
-    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS, REASSEMBLY_TIMEOUT_LOWER_SECS,
-    REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER,
-    config_path,
+    AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
+    DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS,
+    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB,
+    VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER, config_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,6 +42,8 @@ pub enum SettingKey {
     VoiceCodec,
     /// Codec2 mode index (0..=5).
     VoiceCodec2Mode,
+    /// AMR-NB mode index (0..=7).
+    VoiceAmrnbMode,
 }
 
 impl SettingKey {
@@ -53,6 +55,7 @@ impl SettingKey {
             Self::VoiceReassemblyTimeoutSecs => "voice.reassembly_timeout_secs",
             Self::VoiceCodec => "voice.codec",
             Self::VoiceCodec2Mode => "voice.codec2_mode",
+            Self::VoiceAmrnbMode => "voice.amrnb_mode",
         }
     }
 
@@ -63,6 +66,7 @@ impl SettingKey {
             "voice.reassembly_timeout_secs" => Self::VoiceReassemblyTimeoutSecs,
             "voice.codec" => Self::VoiceCodec,
             "voice.codec2_mode" => Self::VoiceCodec2Mode,
+            "voice.amrnb_mode" => Self::VoiceAmrnbMode,
             _ => return None,
         })
     }
@@ -74,6 +78,7 @@ impl SettingKey {
             SettingKey::VoiceReassemblyTimeoutSecs,
             SettingKey::VoiceCodec,
             SettingKey::VoiceCodec2Mode,
+            SettingKey::VoiceAmrnbMode,
         ]
     }
 }
@@ -148,6 +153,7 @@ pub trait SettingsListener: Send + Sync {
 pub enum VoiceCodecKind {
     Opus,
     Codec2,
+    AmrNb,
 }
 
 impl VoiceCodecKind {
@@ -155,6 +161,7 @@ impl VoiceCodecKind {
         match self {
             Self::Opus => VOICE_CODEC_OPUS,
             Self::Codec2 => VOICE_CODEC_CODEC2,
+            Self::AmrNb => VOICE_CODEC_AMRNB,
         }
     }
 
@@ -162,6 +169,7 @@ impl VoiceCodecKind {
         Some(match s {
             VOICE_CODEC_OPUS => Self::Opus,
             VOICE_CODEC_CODEC2 => Self::Codec2,
+            VOICE_CODEC_AMRNB => Self::AmrNb,
             _ => return None,
         })
     }
@@ -269,19 +277,24 @@ impl SettingsApi {
     }
 
     pub fn voice_codec(&self) -> VoiceCodecKind {
-        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or(VoiceCodecKind::Codec2)
+        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or(VoiceCodecKind::AmrNb)
     }
 
     pub fn voice_codec2_mode(&self) -> u8 {
         self.inner.read().voice_codec2_mode()
     }
 
-    /// Convenience: resolve `voice.codec` + `voice.codec2_mode` to the
+    pub fn voice_amrnb_mode(&self) -> u8 {
+        self.inner.read().voice_amrnb_mode()
+    }
+
+    /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `(VoiceCodec, codec_param)` pair the voice protocol layer wants.
     pub fn voice_codec_for_protocol(&self) -> (VoiceCodec, u8) {
         match self.voice_codec() {
             VoiceCodecKind::Opus => (VoiceCodec::Opus, 0),
             VoiceCodecKind::Codec2 => (VoiceCodec::Codec2, self.voice_codec2_mode()),
+            VoiceCodecKind::AmrNb => (VoiceCodec::AmrNb, self.voice_amrnb_mode()),
         }
     }
 
@@ -340,6 +353,18 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceCodec2Mode)
     }
 
+    pub fn set_voice_amrnb_mode(&self, mode: u8) -> SettingsResult<()> {
+        if mode > AMRNB_MODE_1220 {
+            return Err(SettingsError::Invalid {
+                key: SettingKey::VoiceAmrnbMode.id(),
+                value: mode.to_string(),
+                reason: format!("must be in 0..={AMRNB_MODE_1220}"),
+            });
+        }
+        self.inner.write().voice_amrnb_mode = Some(mode);
+        self.persist_and_notify(SettingKey::VoiceAmrnbMode)
+    }
+
     /// Clear a single field's override (revert to its default).
     pub fn reset(&self, key: SettingKey) -> SettingsResult<()> {
         {
@@ -350,6 +375,7 @@ impl SettingsApi {
                 SettingKey::VoiceReassemblyTimeoutSecs => g.reassembly_timeout_secs = None,
                 SettingKey::VoiceCodec => g.voice_codec = None,
                 SettingKey::VoiceCodec2Mode => g.voice_codec2_mode = None,
+                SettingKey::VoiceAmrnbMode => g.voice_amrnb_mode = None,
             }
         }
         self.persist_and_notify(key)
@@ -378,6 +404,7 @@ impl SettingsApi {
             SettingKey::VoiceReassemblyTimeoutSecs => self.reassembly_timeout_secs().to_string(),
             SettingKey::VoiceCodec => self.voice_codec().id().to_string(),
             SettingKey::VoiceCodec2Mode => self.voice_codec2_mode().to_string(),
+            SettingKey::VoiceAmrnbMode => self.voice_amrnb_mode().to_string(),
         }
     }
 
@@ -403,7 +430,9 @@ impl SettingsApi {
                     VoiceCodecKind::from_id(value).ok_or_else(|| SettingsError::Invalid {
                         key: key.id(),
                         value: value.to_string(),
-                        reason: format!("expected one of {VOICE_CODEC_OPUS}, {VOICE_CODEC_CODEC2}"),
+                        reason: format!(
+                            "expected one of {VOICE_CODEC_AMRNB}, {VOICE_CODEC_CODEC2}, {VOICE_CODEC_OPUS}"
+                        ),
                     })?;
                 self.set_voice_codec(kind)
             }
@@ -417,6 +446,17 @@ impl SettingsApi {
                     });
                 }
                 self.set_voice_codec2_mode(n as u8)
+            }
+            SettingKey::VoiceAmrnbMode => {
+                let n = parse_u32(key, value)?;
+                if n > u32::from(u8::MAX) {
+                    return Err(SettingsError::Invalid {
+                        key: key.id(),
+                        value: value.to_string(),
+                        reason: "value out of u8 range".to_string(),
+                    });
+                }
+                self.set_voice_amrnb_mode(n as u8)
             }
         }
     }
@@ -460,7 +500,7 @@ impl SettingsApi {
                 "Outgoing voice codec",
                 "Codec used when sending new voice messages. Received messages always decode with the codec advertised in their header.",
                 SettingKind::Enum {
-                    variants: vec![VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS],
+                    variants: vec![VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS],
                 },
                 DEFAULT_VOICE_CODEC.to_string(),
             ),
@@ -472,6 +512,15 @@ impl SettingsApi {
                     max: u32::from(CODEC2_MODE_1200),
                 },
                 DEFAULT_CODEC2_MODE.to_string(),
+            ),
+            SettingKey::VoiceAmrnbMode => (
+                "AMR-NB bitrate mode",
+                "AMR-NB mode index (0=MR475 4.75 kbps .. 7=MR122 12.2 kbps). Lower is more LoRa-friendly.",
+                SettingKind::IntRange {
+                    min: 0,
+                    max: u32::from(AMRNB_MODE_1220),
+                },
+                DEFAULT_AMRNB_MODE.to_string(),
             ),
         };
         SettingDescriptor {

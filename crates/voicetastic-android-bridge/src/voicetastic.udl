@@ -245,12 +245,14 @@ enum SettingKey {
     "VoiceReassemblyTimeoutSecs",
     "VoiceCodec",
     "VoiceCodec2Mode",
+    "VoiceAmrnbMode",
 };
 
 /// Typed mirror of the `voice.codec` value.
 enum VoiceCodecKind {
     "Opus",
     "Codec2",
+    "AmrNb",
 };
 
 /// Kind of value a setting accepts. Used by `list` to render a generic UI.
@@ -308,5 +310,9 @@ interface SettingsApi {
     u8 voice_codec2_mode();
     [Throws=SettingsError]
     void set_voice_codec2_mode(u8 mode);
+
+    u8 voice_amrnb_mode();
+    [Throws=SettingsError]
+    void set_voice_amrnb_mode(u8 mode);
 };
 

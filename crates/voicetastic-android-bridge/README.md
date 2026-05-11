@@ -12,7 +12,7 @@ Two surfaces:
    envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
 2. **Settings** — `SettingsApi`, the centralised client-side preference
    facade (last device, voice max duration, reassembly timeout,
-   outgoing codec, Codec2 mode). Same TOML schema as the desktop GUI /
+   outgoing codec, Codec2 mode, AMR-NB mode). Same TOML schema as the desktop GUI /
    CLI. Persistence path is **host-injected**: pass the app's private
    data directory (typically `Context.filesDir.path`) as the
    constructor argument, or `null` for an in-memory store. Use the

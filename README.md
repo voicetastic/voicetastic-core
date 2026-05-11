@@ -2,7 +2,8 @@
 
 Linux desktop companion for [Voicetastic](https://github.com/nicogig/Voicetastic) (Android).
 Communicates with Meshtastic radios over BLE or USB serial, providing text
-messaging and AMR-NB voice message exchange — wire-compatible with the Android app.
+messaging and live voice message exchange (AMR-NB / Codec2 / Opus) — wire-compatible
+with the Android app for AMR-NB.
 
 ## Workspace Layout
 
@@ -102,11 +103,44 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Voice Protocol
 
-Voice messages use AMR-NB (Adaptive Multi-Rate Narrowband) codec at 8 kHz.
-Audio is chunked into ≤ 200-byte Meshtastic data packets sent over
-`PortNum::PRIVATE_APP` with a 4-byte header (`msgId · chunkIndex · totalChunks · bitrateIndex`).
-The desktop app reads/writes standard `.amr` files — no live microphone support
-in this version.
+Voice messages are captured live from the microphone, encoded, and chunked into
+≤ 200-byte Meshtastic data packets sent over `PortNum::PRIVATE_APP` with a 4-byte
+header (`msgId · chunkIndex · totalChunks · codecParam`). Three codecs are supported:
+
+| Codec  | Wire id | Rate    | Bitrates                          | Notes                                  |
+|--------|---------|---------|-----------------------------------|----------------------------------------|
+| AMR-NB | `1`     | 8 kHz   | 4.75 – 12.2 kbps (8 modes)        | Default. Wire-compatible with Android. |
+| Codec2 | `3`     | 8 kHz   | 1.2 – 3.2 kbps (6 modes)          | Most LoRa-friendly bitrates.           |
+| Opus   | `2`     | 48 kHz  | 12 kbps VoIP                      | Wideband; larger payloads.             |
+
+The codec used to encode a message is advertised in its header, so peers always
+decode using the correct codec regardless of their own outgoing-codec setting.
+
+See [`docs/wiki/Settings.md`](docs/wiki/Settings.md) for the client-side settings
+(codec choice, bitrate, recording duration, reassembly timeout) and
+[`VOICE_PROTOCOL.md`](VOICE_PROTOCOL.md) for the wire format.
+
+## Settings
+
+Persisted client settings live under `$XDG_CONFIG_HOME/voicetastic/config.toml`
+(`~/.config/voicetastic/config.toml`). The same file backs the GUI's *Settings*
+tab, the CLI's `settings` subcommand, and the Android bridge.
+
+```bash
+# List every known setting, current value, default, and accepted range
+cargo run -p voicetastic-cli -- settings list
+
+# Read or write a single key
+cargo run -p voicetastic-cli -- settings get voice.codec
+cargo run -p voicetastic-cli -- settings set voice.codec amrnb
+cargo run -p voicetastic-cli -- settings set voice.amrnb_mode 7
+
+# Restore one key (or every key) to its default
+cargo run -p voicetastic-cli -- settings reset voice.amrnb_mode
+cargo run -p voicetastic-cli -- settings reset
+```
+
+Full key reference: [`docs/wiki/Settings.md`](docs/wiki/Settings.md).
 
 ## License
 
