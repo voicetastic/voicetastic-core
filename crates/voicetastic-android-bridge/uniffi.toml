@@ -1,0 +1,11 @@
+# UniFFI per-bindings config.
+#
+# The Kotlin loader template generates `findLibraryName()` returning
+# `"uniffi_" + namespace` by default. That would expect
+# `libuniffi_voicetastic.so`, but our cdylib is `libvoicetastic.so` (so
+# the cdylib name matches the UDL namespace, which is what keeps the
+# Rust-side scaffolding symbol prefixes consistent across `fn_` and
+# `checksum_`). Override the lookup name here.
+[bindings.kotlin]
+cdylib_name = "voicetastic"
+
