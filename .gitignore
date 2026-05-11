@@ -6,3 +6,5 @@ Cargo.lock.bak
 *.swp
 .DS_Store
 .github/
+.cargo/
+target-android/

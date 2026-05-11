@@ -1,0 +1,221 @@
+// SPDX-License-Identifier: MIT
+//
+// UniFFI scenario for the Voicetastic Android bridge.
+//
+// Scope (MVP): the voice protocol layer only -- `build_message` (sender)
+// and `VoiceAssembler` (receiver). Android keeps its existing BLE / USB
+// transport and Meshtastic state machine; this bridge replaces the
+// Kotlin `VoiceChunker` / `VoiceAssembler` (protocol v1) with calls into
+// `voicetastic-core::voice::*` (protocol v2: 12-byte header, AES-GCM
+// envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
+//
+// Out of scope here: `MeshService` facade, `Transport` foreign trait.
+// Add those in a follow-up when we're ready to also retire
+// `MessagingViewModel`'s Kotlin Meshtastic state machine.
+
+namespace voicetastic {
+    /// Generate a non-zero `u32` suitable for use as a `message_id`.
+    /// Equivalent to `voicetastic_core::voice::random_message_id`.
+    u32 random_message_id();
+
+    /// Returns the protocol version byte of a PRIVATE_APP payload, or
+    /// `null` if the buffer is empty.
+    u8? detect_version(bytes payload);
+
+    /// Chunk `audio` (codec frame bytes) into wire frames according to
+    /// `cfg`. Mirrors `voicetastic_core::voice::build_message`.
+    [Throws=VoiceError]
+    EncodedMessage build_message(bytes audio, BuildConfig cfg);
+
+    /// Build a NACK frame for `(message_id)` reporting `missing` data
+    /// chunk indices. Mirrors `voicetastic_core::voice::build_nack`.
+    bytes build_nack(NackConfig cfg);
+};
+
+/// Configuration for `build_nack`.
+dictionary NackConfig {
+    u32 message_id;
+    u8 stream_seq;
+    VoiceCodec codec;
+    u8 codec_param;
+    u8 total_data;
+    u8 parity_count;
+    sequence<u8> missing;
+    boolean give_up;
+};
+
+// -----------------------------------------------------------------------------
+// Errors
+// -----------------------------------------------------------------------------
+
+/// Errors raised by the voice protocol layer.
+///
+/// Variants mirror `voicetastic_core::voice::VoiceError` but flattened
+/// into UniFFI-friendly shapes (no nested enums, no borrowed slices).
+[Error]
+enum VoiceError {
+    "TooShort",
+    "TooLarge",
+    "BadVersion",
+    "ReservedFlagSet",
+    "ReservedPacketType",
+    "ZeroMessageId",
+    "BadTotal",
+    "TooMuchParity",
+    "BadIndex",
+    "AudioTooLarge",
+    "ChunkTooSmall",
+    "ChunkTooLarge",
+    "BodyLenMismatch",
+    "BadTag",
+    "BodyTooShortForEnv",
+    "EncryptedNack",
+    "NackTooShort",
+    "Fec",
+    "CodecMismatch",
+    "TotalMismatch",
+    "StreamSeqMismatch",
+    "UnknownCodec",
+    "Blacklisted",
+    "PerSenderCap",
+    "EncryptedNoPsk",
+    "BadFromForEncrypted",
+};
+
+// -----------------------------------------------------------------------------
+// Wire-shape types
+// -----------------------------------------------------------------------------
+
+/// Codec advertised in the chunk header. The protocol does not transcode.
+[Enum]
+interface VoiceCodec {
+    AmrNb();
+    Opus();
+    PcmS16Le();
+    Codec2();
+    Unknown(u8 raw);
+};
+
+/// Configuration for `build_message`.
+dictionary BuildConfig {
+    u32 message_id;
+    u8 stream_seq;
+    VoiceCodec codec;
+    u8 codec_param;
+    u32 chunk_size;
+    u8 parity_count;
+    boolean last_in_stream;
+    /// If `Some`, every DATA/PARITY body is wrapped with the AES-GCM
+    /// envelope keyed by HKDF(channel_psk, message_id || from_node_num).
+    /// `None` keeps bodies plaintext.
+    bytes? channel_psk;
+    /// Only consulted when `channel_psk` is `Some`. Mirrors the `!hex8`
+    /// `from` field on the wire.
+    u32 from_node_num;
+};
+
+/// Output of `build_message`: the wire frames to transmit, in send order.
+dictionary EncodedMessage {
+    /// Ready-to-send packet bodies (header + body), each ≤ MAX_PACKET_SIZE.
+    sequence<bytes> frames;
+    u8 total_data;
+    u8 parity_count;
+};
+
+/// Reassembled voice message emitted by the assembler.
+dictionary VoiceMessageOut {
+    u32 message_id;
+    string from;
+    /// `true` when destination was the channel broadcast; otherwise see
+    /// [`to_node`].
+    boolean broadcast;
+    u32 to_node;
+    u8 stream_seq;
+    VoiceCodec codec;
+    u8 codec_param;
+    bytes audio;
+    i64 timestamp_ms;
+    boolean is_complete;
+    u8 total_data;
+    u8 received_data;
+    u8 recovered_via_fec;
+    u32 channel;
+    boolean encrypted;
+};
+
+/// Parsed NACK contents.
+dictionary NackInfo {
+    u32 message_id;
+    u8 stream_seq;
+    u8 total_data;
+    u8 parity_count;
+    boolean give_up;
+    sequence<u8> missing;
+};
+
+/// Outcome of feeding a frame to the assembler's `accept`.
+[Enum]
+interface AssemblyEvent {
+    /// Frame accepted, message still in progress.
+    Pending(u32 message_id, string from, u8 received_data, u8 total_data, u32 channel);
+    /// Frame was a duplicate of a chunk we already had. Dropped.
+    Duplicate();
+    /// Frame rejected (structural error, decrypt-fail, blacklist, ...).
+    Rejected(string message);
+    /// Message complete.
+    Complete(VoiceMessageOut message);
+    /// NACK frame parsed; route to the sender's send-side state.
+    Nack(NackInfo info);
+};
+
+/// A NACK ready for transmission.
+dictionary OutboundNack {
+    string from;
+    u32 channel;
+    bytes frame;
+    boolean give_up;
+};
+
+/// Outcome of `VoiceAssembler.tick`.
+dictionary TickOutput {
+    sequence<VoiceMessageOut> finalized;
+    sequence<OutboundNack> nacks;
+};
+
+/// User-tunable assembler config.
+dictionary AssemblerConfig {
+    u64 message_timeout_ms;
+    boolean partial_play_on_timeout;
+    bytes? channel_psk;
+    u8 max_nack_rounds;
+    u64 nack_window_ms;
+    u64 completion_memory_ms;
+};
+
+// -----------------------------------------------------------------------------
+// Voice assembler (receive-side state machine)
+// -----------------------------------------------------------------------------
+
+interface VoiceAssembler {
+    /// Construct with the given config.
+    constructor(AssemblerConfig cfg);
+
+    /// Hot-replace the config.
+    void set_config(AssemblerConfig cfg);
+
+    /// Feed a raw `PRIVATE_APP` payload to the assembler.
+    ///
+    /// `to_node` is ignored when `broadcast` is `true`.
+    AssemblyEvent accept(
+        string from,
+        boolean broadcast,
+        u32 to_node,
+        u32 channel,
+        bytes frame
+    );
+
+    /// Drive timeouts and emit pending NACK frames. Should be polled at
+    /// roughly `nack_window_ms / 2` cadence.
+    TickOutput tick();
+};
+

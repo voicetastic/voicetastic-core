@@ -1,0 +1,25 @@
+[package]
+name = "voicetastic-android-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "UniFFI bridge that exposes voicetastic-core's voice protocol to Android (Kotlin)."
+[lib]
+# `cdylib` is the binary the NDK toolchain packages into `libvoicetastic.so`
+# under `app/src/main/jniLibs/<abi>/`.
+#
+# `staticlib` keeps the door open for static-link-against-test-binary use.
+crate-type = ["cdylib", "staticlib"]
+name = "voicetastic"
+[dependencies]
+# Pull only the voice protocol; drop btleplug + tokio-serial which won't
+# cross-compile to android targets out of the box.
+voicetastic-core = { path = "../voicetastic-core", default-features = false }
+uniffi = { workspace = true, features = ["cli"] }
+thiserror = { workspace = true }
+[build-dependencies]
+uniffi = { workspace = true, features = ["build"] }
+[features]
+default = []
