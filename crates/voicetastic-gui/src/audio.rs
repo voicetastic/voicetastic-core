@@ -342,7 +342,11 @@ mod imp {
                 dst.push(s0 + (s1 - s0) * frac);
                 self.cursor += self.ratio;
             }
-            self.last = *input.last().unwrap();
+            // `input` is non-empty (guarded above), but use `if let` to avoid
+            // a panic on hot streaming paths if that invariant ever changes.
+            if let Some(&last) = input.last() {
+                self.last = last;
+            }
             self.cursor -= n;
         }
     }

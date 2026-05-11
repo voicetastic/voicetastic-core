@@ -331,7 +331,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                 app.rt.spawn(async move {
                     match svc.send_text(&text, ch, dest).await {
                         Ok(_id) => {
-                            shared.lock().chat_log.push(ChatEntry {
+                            shared.lock().push_chat(ChatEntry {
                                 text,
                                 rx_time: 0,
                                 outgoing: true,
@@ -648,7 +648,7 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     // actually transmitted every frame — that's what gates the ▶ Play
     // button so users can't try to play back something that hasn't been
     // sent yet.
-    shared.lock().chat_log.push(ChatEntry {
+    shared.lock().push_chat(ChatEntry {
         text: sending_label,
         rx_time: 0,
         outgoing: true,

@@ -120,6 +120,27 @@ pub struct SharedState {
     pub fixed_pos_edit: Option<FixedPosEdit>,
 }
 
+/// Maximum number of entries kept in [`SharedState::chat_log`]. Long-running
+/// sessions on a busy mesh would otherwise grow this `Vec` without bound and
+/// eventually OOM the GUI process. Older entries are dropped FIFO once the
+/// log reaches this size.
+pub const MAX_CHAT_LOG_ENTRIES: usize = 2000;
+
+impl SharedState {
+    /// Append a chat entry and evict the oldest entries if the log exceeds
+    /// [`MAX_CHAT_LOG_ENTRIES`]. Callers that mutate existing entries
+    /// in-place (e.g. upgrading a "receiving …" placeholder) don't need to
+    /// go through this helper.
+    pub fn push_chat(&mut self, entry: ChatEntry) {
+        self.chat_log.push(entry);
+        let len = self.chat_log.len();
+        if len > MAX_CHAT_LOG_ENTRIES {
+            let excess = len - MAX_CHAT_LOG_ENTRIES;
+            self.chat_log.drain(..excess);
+        }
+    }
+}
+
 impl Default for SharedState {
     fn default() -> Self {
         Self {

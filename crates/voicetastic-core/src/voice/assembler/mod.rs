@@ -212,7 +212,19 @@ impl VoiceAssembler {
         let _ = state.try_fec_recover();
 
         if state.received_data == state.header_template.total_data {
-            let state = inner.in_progress.remove(&key).expect("just inserted");
+            // Invariant: we just held a `&mut state` borrowed from `in_progress`
+            // via `get_mut(&key)` above (now dropped), so the entry must still
+            // exist. Guard defensively against future refactors instead of
+            // panicking on an unreachable race.
+            let Some(state) = inner.in_progress.remove(&key) else {
+                return Ok(AssemblyEvent::Pending {
+                    message_id: header.message_id,
+                    from: from.to_string(),
+                    received_data: header.total_data,
+                    total_data: header.total_data,
+                    channel,
+                });
+            };
             let cnt = inner.per_sender.entry(from.to_string()).or_default();
             *cnt = cnt.saturating_sub(1);
             push_blacklist(&mut inner.blacklist, key.clone(), now);
@@ -278,7 +290,12 @@ impl VoiceAssembler {
 
             // Hard timeout — give up.
             if elapsed_total >= timeout || state.nack_rounds >= max_nack_rounds {
-                let state = inner.in_progress.remove(&key).expect("just listed");
+                // The key came from the snapshot above; the only way it would
+                // be missing here is a concurrent mutation, which can't happen
+                // under `&mut inner`. Skip defensively rather than panic.
+                let Some(state) = inner.in_progress.remove(&key) else {
+                    continue;
+                };
                 let cnt = inner.per_sender.entry(key.0.clone()).or_default();
                 *cnt = cnt.saturating_sub(1);
                 push_blacklist(&mut inner.blacklist, key.clone(), now);

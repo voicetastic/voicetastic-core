@@ -149,7 +149,7 @@ pub fn spawn_watchers(
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        s.lock().chat_log.push(ChatEntry {
+                        s.lock().push_chat(ChatEntry {
                             text: msg.text.clone(),
                             rx_time: msg.rx_time,
                             outgoing: false,
@@ -513,7 +513,7 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
             entry.to_num = to_num;
         }
     } else {
-        st.chat_log.push(ChatEntry {
+        st.push_chat(ChatEntry {
             text: label,
             rx_time: 0,
             outgoing: false,
@@ -550,7 +550,7 @@ fn upsert_inbound_voice_progress(
     {
         entry.text = label;
     } else {
-        st.chat_log.push(ChatEntry {
+        st.push_chat(ChatEntry {
             text: label,
             rx_time: 0,
             outgoing: false,
