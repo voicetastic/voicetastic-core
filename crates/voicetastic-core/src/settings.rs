@@ -24,6 +24,31 @@ pub const REASSEMBLY_TIMEOUT_LOWER_SECS: u32 = 10;
 /// Upper bound for the configurable reassembly timeout (1 hour).
 pub const REASSEMBLY_TIMEOUT_UPPER_SECS: u32 = 3_600;
 
+/// Voice codec identifiers used in [`AppSettings::voice_codec`]. Mirror
+/// the wire byte assigned in `voice::VoiceCodec::to_byte()`.
+pub const VOICE_CODEC_OPUS: &str = "opus";
+pub const VOICE_CODEC_CODEC2: &str = "codec2";
+
+/// Default voice codec for newly composed messages. Codec2 at its
+/// lowest-stable rate (MODE_1200, 1.2 kbps) is the best fit for slow
+/// LoRa presets — a 30 s clip fits in ~4.5 kB, well under one
+/// retransmittable message budget. Users can switch to Opus in
+/// Settings → Voice messages.
+pub const DEFAULT_VOICE_CODEC: &str = VOICE_CODEC_CODEC2;
+
+/// Codec2 mode index (matches the `codec2` crate's `Codec2Mode` discriminant
+/// and is what we ship over the air as `codec_param`):
+///   0 = 3200 bps, 1 = 2400 bps, 2 = 1600 bps,
+///   3 = 1400 bps, 4 = 1300 bps, 5 = 1200 bps.
+pub const CODEC2_MODE_3200: u8 = 0;
+pub const CODEC2_MODE_2400: u8 = 1;
+pub const CODEC2_MODE_1600: u8 = 2;
+pub const CODEC2_MODE_1400: u8 = 3;
+pub const CODEC2_MODE_1300: u8 = 4;
+pub const CODEC2_MODE_1200: u8 = 5;
+/// Lowest implemented (and thus most LoRa-friendly) Codec2 rate.
+pub const DEFAULT_CODEC2_MODE: u8 = CODEC2_MODE_1200;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -41,6 +66,20 @@ pub struct AppSettings {
     /// `[REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reassembly_timeout_secs: Option<u32>,
+
+    /// Voice codec used when *sending* a new voice message. One of
+    /// [`VOICE_CODEC_OPUS`] or [`VOICE_CODEC_CODEC2`]. `None` falls back
+    /// to [`DEFAULT_VOICE_CODEC`]. Unknown values are treated as the
+    /// default. Received messages are decoded based on the codec byte
+    /// carried in the frame header, independent of this setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_codec: Option<String>,
+
+    /// Codec2 mode index, used when [`Self::voice_codec`] resolves to
+    /// Codec2. `None` falls back to [`DEFAULT_CODEC2_MODE`]. Values
+    /// outside `0..=5` are clamped to the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_codec2_mode: Option<u8>,
 }
 
 impl AppSettings {
@@ -56,6 +95,24 @@ impl AppSettings {
         self.reassembly_timeout_secs
             .unwrap_or(DEFAULT_REASSEMBLY_TIMEOUT_SECS)
             .clamp(REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS)
+    }
+
+    /// Effective outgoing voice codec id (lowercased, validated). Unknown
+    /// values fall back to [`DEFAULT_VOICE_CODEC`].
+    pub fn voice_codec(&self) -> &'static str {
+        match self.voice_codec.as_deref() {
+            Some(VOICE_CODEC_OPUS) => VOICE_CODEC_OPUS,
+            Some(VOICE_CODEC_CODEC2) => VOICE_CODEC_CODEC2,
+            _ => DEFAULT_VOICE_CODEC,
+        }
+    }
+
+    /// Effective Codec2 mode index, clamped to `0..=5`.
+    pub fn voice_codec2_mode(&self) -> u8 {
+        match self.voice_codec2_mode {
+            Some(m) if m <= CODEC2_MODE_1200 => m,
+            _ => DEFAULT_CODEC2_MODE,
+        }
     }
 
     /// Load from the config path, or return defaults if the file is missing

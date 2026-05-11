@@ -12,12 +12,12 @@ name = "voicetastic-gui"
 path = "src/main.rs"
 
 [features]
-# Live mic capture + Opus encode/decode + speaker playback. On by default
-# so the voice-message UI in the Chat tab works out of the box. Disable
-# with `--no-default-features` for builds where libopus / ALSA aren't
+# Live mic capture + Opus / Codec2 encode/decode + speaker playback. On by
+# default so the voice-message UI in the Chat tab works out of the box.
+# Disable with `--no-default-features` for builds where libopus / ALSA aren't
 # available (e.g. headless CI).
 default = ["audio"]
-audio = ["dep:cpal", "dep:opus"]
+audio = ["dep:cpal", "dep:opus", "dep:codec2"]
 
 [dependencies]
 voicetastic-core = { workspace = true }
@@ -30,3 +30,4 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 cpal = { version = "0.16", optional = true }
 opus = { version = "0.3", optional = true }
+codec2 = { version = "0.3", optional = true }

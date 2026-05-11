@@ -248,7 +248,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         .max_height(ui.available_height() - 80.0)
         .show(ui, |ui| {
             let mut any = false;
-            let mut play_request: Option<(usize, Vec<u8>)> = None;
+            let mut play_request: Option<(usize, Vec<u8>, VoiceCodec, u8)> = None;
             let mut stop_request = false;
             for (idx, entry) in log.iter().enumerate() {
                 if entry_thread(entry, my_num) != Some(active) {
@@ -267,14 +267,14 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                     ui.label(format!("{prefix}: {}", entry.text));
                     if let Some(v) = entry.voice.as_ref()
                         && audio::is_available()
-                        && v.codec == VoiceCodec::Opus
+                        && matches!(v.codec, VoiceCodec::Opus | VoiceCodec::Codec2)
                     {
                         if is_playing {
                             if inline_player(ui, app.voice_playback.as_ref()) {
                                 stop_request = true;
                             }
                         } else if ui.small_button("▶ Play").clicked() {
-                            play_request = Some((idx, v.bytes.clone()));
+                            play_request = Some((idx, v.bytes.clone(), v.codec, v.codec_param));
                         }
                     }
                 });
@@ -288,8 +288,14 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                 }
                 app.playback_source = None;
             }
-            if let Some((idx, bytes)) = play_request {
-                start_playback(app, &bytes, PlaybackSource::LogEntry(idx));
+            if let Some((idx, bytes, codec, codec_param)) = play_request {
+                start_playback(
+                    app,
+                    &bytes,
+                    codec,
+                    codec_param,
+                    PlaybackSource::LogEntry(idx),
+                );
             }
         });
 
@@ -362,12 +368,18 @@ fn resolve_destination(
     }
 }
 
-fn start_playback(app: &mut VoicetasticApp, bytes: &[u8], source: PlaybackSource) {
+fn start_playback(
+    app: &mut VoicetasticApp,
+    bytes: &[u8],
+    codec: VoiceCodec,
+    codec_param: u8,
+    source: PlaybackSource,
+) {
     // Drop any in-flight playback first so the new clip starts cleanly.
     if let Some(h) = app.voice_playback.take() {
         h.stop();
     }
-    match audio::play_clip(bytes) {
+    match audio::play_clip(bytes, codec, codec_param) {
         Ok(handle) => {
             app.voice_playback = Some(handle);
             app.playback_source = Some(source);
@@ -427,7 +439,8 @@ fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> Vo
         if !enabled {
             resp.on_hover_text("Rebuild with `--features audio` to enable voice messages.");
         } else if resp.clicked() {
-            match Recorder::start(max_secs) {
+            let (codec, codec_param) = app.app_settings_voice_codec();
+            match Recorder::start(max_secs, codec, codec_param) {
                 Ok(rec) => {
                     return VoiceCompose::Recording(rec);
                 }
@@ -502,7 +515,7 @@ fn render_preview(
         ui.label(format!(
             "🎙 Preview ({:.1}s, {} bytes)",
             clip.duration.as_secs_f32(),
-            clip.opus_stream.len()
+            clip.payload.len()
         ));
         if is_playing {
             if inline_player(ui, app.voice_playback.as_ref()) {
@@ -527,7 +540,15 @@ fn render_preview(
     }
 
     if play_clicked {
-        start_playback(app, &clip.opus_stream, PlaybackSource::Preview);
+        let codec = clip.codec;
+        let codec_param = clip.codec_param;
+        start_playback(
+            app,
+            &clip.payload,
+            codec,
+            codec_param,
+            PlaybackSource::Preview,
+        );
     }
 
     if delete_now {
@@ -576,7 +597,7 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     // can only ever heal short messages. For longer clips we add ~50 %
     // parity (clamped to the protocol max of 128) so FEC alone closes
     // most gaps and the NACK + retransmit loop only has to mop up.
-    let total_data = clip.opus_stream.len().div_ceil(chunk_size).max(1);
+    let total_data = clip.payload.len().div_ceil(chunk_size).max(1);
     let parity_count = {
         let target = total_data.div_ceil(2).max(8);
         let cap = MAX_PARITY_PER_MESSAGE.min(255usize.saturating_sub(total_data));
@@ -586,14 +607,14 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     let cfg = BuildConfig {
         message_id: random_message_id(),
         stream_seq: 0,
-        codec: VoiceCodec::Opus,
-        codec_param: 0,
+        codec: clip.codec,
+        codec_param: clip.codec_param,
         chunk_size,
         parity_count,
         last_in_stream: true,
         encryption: None,
     };
-    let encoded = match build_message(&clip.opus_stream, &cfg) {
+    let encoded = match build_message(&clip.payload, &cfg) {
         Ok(e) => e,
         Err(e) => {
             app.shared.lock().status_msg = Some(format!("Voice build failed: {e}"));
@@ -611,11 +632,13 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
 
     let svc = app.service.clone();
     let shared = Arc::clone(&app.shared);
-    let bytes = clip.opus_stream.clone();
+    let bytes = clip.payload.clone();
+    let clip_codec = clip.codec;
+    let clip_codec_param = clip.codec_param;
     let duration_ms = clip.duration.as_millis() as u32;
     let to_num = dest.unwrap_or(BROADCAST_ADDR);
     let total_chunks = encoded.total_data;
-    let total_bytes = clip.opus_stream.len();
+    let total_bytes = clip.payload.len();
     let message_id = cfg.message_id;
     let sending_label = format!("🎙 sending voice ({total_bytes} bytes, {total_chunks} chunks)…");
     let sent_label = format!("🎙 voice message ({total_bytes} bytes, {total_chunks} chunks)");
@@ -759,7 +782,8 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         {
             entry.text = sent_label;
             entry.voice = Some(VoicePayload {
-                codec: VoiceCodec::Opus,
+                codec: clip_codec,
+                codec_param: clip_codec_param,
                 bytes,
                 duration_ms,
             });

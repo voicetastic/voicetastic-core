@@ -5,8 +5,8 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use voicetastic_core::service::{ConnectionState, MeshService};
-use voicetastic_core::settings::AppSettings;
-use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler};
+use voicetastic_core::settings::{AppSettings, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS};
+use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceCodec};
 
 use crate::outgoing::OutgoingVoiceRegistry;
 
@@ -126,6 +126,19 @@ impl VoicetasticApp {
     pub fn save_settings(&self) {
         if let Err(e) = self.app_settings.save() {
             tracing::warn!(error = %e, "failed to save app settings");
+        }
+    }
+
+    /// Resolve `app_settings.voice_codec` + `voice_codec2_mode` to a
+    /// `(VoiceCodec, codec_param)` pair suitable for [`Recorder::start`]
+    /// and the voice protocol header.
+    pub fn app_settings_voice_codec(&self) -> (VoiceCodec, u8) {
+        match self.app_settings.voice_codec() {
+            VOICE_CODEC_OPUS => (VoiceCodec::Opus, 0),
+            VOICE_CODEC_CODEC2 => (VoiceCodec::Codec2, self.app_settings.voice_codec2_mode()),
+            // `voice_codec()` already normalises unknowns to the default;
+            // this branch is unreachable but kept exhaustive.
+            _ => (VoiceCodec::Codec2, self.app_settings.voice_codec2_mode()),
         }
     }
 }

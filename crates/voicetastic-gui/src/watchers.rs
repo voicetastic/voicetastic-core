@@ -9,8 +9,8 @@ use voicetastic_core::ids::{node_id_to_num, node_num_to_id};
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
-    AssemblyEvent, ModemPreset as VoiceModemPreset, VoiceAssembler, VoiceCodec, VoiceDestination,
-    VoiceMessage, detect_version,
+    AssemblyEvent, ModemPreset as VoiceModemPreset, VoiceAssembler, VoiceDestination, VoiceMessage,
+    detect_version,
 };
 
 use crate::state::{ChatEntry, Section, SharedState, VoicePayload};
@@ -477,13 +477,11 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
             msg.audio.len()
         )
     };
-    let duration_ms = match msg.codec {
-        VoiceCodec::Opus => estimate_opus_duration_ms(&msg.audio),
-        _ => 0,
-    };
+    let duration_ms = crate::audio::payload_duration_ms(&msg.audio, msg.codec, msg.codec_param);
     let voice = if msg.is_complete && msg.codec.is_known() && !msg.audio.is_empty() {
         Some(VoicePayload {
             codec: msg.codec,
+            codec_param: msg.codec_param,
             bytes: msg.audio.clone(),
             duration_ms,
         })
@@ -570,6 +568,7 @@ fn upsert_inbound_voice_progress(
 
 /// Best-effort 20 ms-frame estimate for an Opus stream produced by
 /// `audio::Recorder` (length-prefixed packets, one packet per 20 ms).
+#[allow(dead_code)]
 fn estimate_opus_duration_ms(stream: &[u8]) -> u32 {
     let mut i = 0;
     let mut packets: u32 = 0;

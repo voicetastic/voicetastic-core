@@ -1,33 +1,44 @@
-//! Microphone capture, Opus encode/decode and speaker playback for voice
-//! messages composed in the Chat tab.
+//! Microphone capture, Opus / Codec2 encode/decode and speaker playback for
+//! voice messages composed in the Chat tab.
 //!
 //! Gated behind the `audio` Cargo feature so default builds remain free of
-//! `cpal` (ALSA on Linux) and `audiopus` (libopus). With the feature off
-//! the module exposes the same surface but every entry point returns an
-//! [`AudioError::FeatureDisabled`] error and [`is_available`] is `false`.
+//! `cpal` (ALSA on Linux), `audiopus` (libopus) and the `codec2` crate.
+//! With the feature off the module exposes the same surface but every
+//! entry point returns [`AudioError::FeatureDisabled`] and
+//! [`is_available`] is `false`.
 //!
-//! # Wire format
+//! # Wire formats
 //!
-//! [`RecordedClip::opus_stream`] is a sequence of length-prefixed Opus
-//! packets:
+//! Per-codec serialisation of [`RecordedClip::payload`]:
 //!
-//! ```text
-//! [u16 BE length][opus packet bytes] [u16 BE length][opus packet bytes] ...
-//! ```
+//! - **Opus** (`VoiceCodec::Opus`, `codec_param = 0`): a sequence of
+//!   length-prefixed packets:
 //!
-//! Each packet covers 20 ms of mono audio at 48 kHz, encoded with
-//! `Application::Voip` at 12 kbps. Receivers parse the same framing for
-//! playback. The blob is what we hand to the codec-agnostic voice protocol
-//! as the audio payload (codec=`Opus`, codec_param=0).
+//!   ```text
+//!   [u16 BE length][opus packet bytes] [u16 BE length][opus packet bytes] ...
+//!   ```
+//!
+//!   Each packet covers 20 ms of mono audio at 48 kHz, encoded with
+//!   `Application::Voip` at 12 kbps.
+//!
+//! - **Codec2** (`VoiceCodec::Codec2`, `codec_param = mode in 0..=5`):
+//!   raw concatenated packed frames of the mode's fixed size
+//!   (`bits_per_frame / 8`, rounded up). 8 kHz mono internally.
 
 use std::time::Duration;
 
-/// Sample rate used for both capture and playback.
+use voicetastic_core::voice::VoiceCodec;
+
+/// Sample rate used for both capture and playback for the Opus path, and
+/// the rate the playback pipeline expects after [`decode_clip`].
 #[allow(dead_code)] // unused when `audio` feature is off
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 /// Mono frame size (samples) corresponding to a 20 ms Opus packet at 48 kHz.
 #[allow(dead_code)]
 pub const FRAME_SAMPLES: usize = 960;
+/// Sample rate Codec2 operates on (all modes).
+#[allow(dead_code)]
+pub const CODEC2_SAMPLE_RATE_HZ: u32 = 8_000;
 /// Target Opus bitrate. 12 kbps voice keeps a 30 s clip under the
 /// protocol's per-message size budget.
 #[allow(dead_code)]
@@ -42,27 +53,78 @@ pub enum AudioError {
     FeatureDisabled,
     #[error("no default audio {0} device")]
     NoDevice(&'static str),
-    #[error("audio device does not support a usable Opus configuration")]
+    #[error("audio device does not support a usable configuration")]
     UnsupportedConfig,
     #[error("audio backend error: {0}")]
     Backend(String),
-    #[error("opus codec error: {0}")]
+    #[error("codec error: {0}")]
     Codec(String),
     #[error("recording produced no audio")]
     Empty,
+    #[error("unsupported codec for playback/encoding: {0:?}")]
+    UnsupportedCodec(VoiceCodec),
 }
 
 /// A finished recording, ready to feed to the voice protocol.
 #[derive(Debug, Clone)]
 pub struct RecordedClip {
-    /// Length-prefixed Opus packets — see module docs.
-    pub opus_stream: Vec<u8>,
+    /// Encoded codec payload — see module docs for per-codec layout.
+    pub payload: Vec<u8>,
+    /// Codec identifier matching `voice::VoiceCodec`.
+    pub codec: VoiceCodec,
+    /// Codec-specific parameter byte (e.g. Codec2 mode index).
+    pub codec_param: u8,
     pub duration: Duration,
 }
 
 /// `true` when the binary was built with `--features audio`.
 pub const fn is_available() -> bool {
     cfg!(feature = "audio")
+}
+
+/// Number of Codec2 samples per encoded frame for each mode index `0..=5`.
+const CODEC2_SAMPLES_PER_FRAME: [usize; 6] = [160, 160, 320, 320, 320, 320];
+/// Packed bytes per Codec2 frame for each mode index `0..=5`.
+const CODEC2_BYTES_PER_FRAME: [usize; 6] = [8, 6, 8, 7, 7, 6];
+
+fn codec2_frame_sizes(mode: u8) -> Option<(usize, usize)> {
+    let i = mode as usize;
+    if i < CODEC2_SAMPLES_PER_FRAME.len() {
+        Some((CODEC2_SAMPLES_PER_FRAME[i], CODEC2_BYTES_PER_FRAME[i]))
+    } else {
+        None
+    }
+}
+
+/// Best-effort estimate of the wall-clock duration of an encoded payload,
+/// in milliseconds. Returns 0 for unknown codec parameters. Doesn't need
+/// the `audio` feature — used by the chat watcher to label inbound clips
+/// even on headless builds.
+pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -> u32 {
+    match codec {
+        VoiceCodec::Opus => {
+            let mut i = 0;
+            let mut packets: u32 = 0;
+            while i + 2 <= payload.len() {
+                let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
+                i += 2;
+                if i + len > payload.len() {
+                    break;
+                }
+                i += len;
+                packets += 1;
+            }
+            packets * 20
+        }
+        VoiceCodec::Codec2 => {
+            let Some((samples, bytes)) = codec2_frame_sizes(codec_param) else {
+                return 0;
+            };
+            let frames = (payload.len() / bytes) as u32;
+            frames * (samples as u32) / 8
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(feature = "audio")]
@@ -73,6 +135,7 @@ mod imp {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    use codec2::{Codec2, Codec2Mode};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, SupportedStreamConfig};
     use opus::{Application, Bitrate, Channels, Decoder, Encoder};
@@ -85,9 +148,20 @@ mod imp {
         AudioError::Codec(e.to_string())
     }
 
-    /// Pick the device's preferred config. We adapt to whatever sample
-    /// rate, format and channel count it returns — Opus runs at 48 kHz
-    /// mono internally and we resample / mix in software.
+    fn codec2_mode_from_byte(b: u8) -> Result<Codec2Mode, AudioError> {
+        Ok(match b {
+            0 => Codec2Mode::MODE_3200,
+            1 => Codec2Mode::MODE_2400,
+            2 => Codec2Mode::MODE_1600,
+            3 => Codec2Mode::MODE_1400,
+            4 => Codec2Mode::MODE_1300,
+            5 => Codec2Mode::MODE_1200,
+            _ => {
+                return Err(AudioError::Codec(format!("unknown codec2 mode index {b}")));
+            }
+        })
+    }
+
     fn pick_config(
         device: &cpal::Device,
         for_input: bool,
@@ -99,12 +173,9 @@ mod imp {
         }
     }
 
-    /// Streaming linear resampler: f32 mono in → f32 mono out at a
-    /// possibly-different rate. Voice (<4 kHz content) sounds fine with
-    /// linear interp, and avoiding a proper polyphase filter keeps the
-    /// dependency surface tiny.
+    /// Streaming linear resampler.
     struct Resampler {
-        ratio: f64, // src_hz / dst_hz — how many src samples per dst sample
+        ratio: f64,
         cursor: f64,
         last: f32,
     }
@@ -118,13 +189,10 @@ mod imp {
             }
         }
 
-        /// Push `input` source samples and append resampled output to `dst`.
         fn push(&mut self, input: &[f32], dst: &mut Vec<f32>) {
             if input.is_empty() {
                 return;
             }
-            // Concatenate `last` + input into a virtual buffer indexed by
-            // [-1, input.len()).
             let n = input.len() as f64;
             while self.cursor < n {
                 let idx_floor = self.cursor.floor();
@@ -148,8 +216,6 @@ mod imp {
         }
     }
 
-    /// Convert an interleaved input buffer of arbitrary sample format and
-    /// channel count to mono f32 in `[-1, 1]`.
     fn to_mono_f32<T>(data: &[T], channels: usize, dst: &mut Vec<f32>)
     where
         T: cpal::SizedSample,
@@ -171,29 +237,144 @@ mod imp {
         }
     }
 
-    fn drain_frames(samples: &mut Vec<f32>) -> Vec<[i16; FRAME_SAMPLES]> {
-        let mut out = Vec::new();
-        while samples.len() >= FRAME_SAMPLES {
-            let mut frame = [0i16; FRAME_SAMPLES];
-            for (i, s) in samples.drain(..FRAME_SAMPLES).enumerate() {
-                let clamped = s.clamp(-1.0, 1.0);
-                frame[i] = (clamped * i16::MAX as f32) as i16;
-            }
-            out.push(frame);
-        }
-        out
+    /// Streaming encoder state.
+    enum EncState {
+        Opus {
+            encoder: Encoder,
+            scratch: Vec<f32>,
+            payload: Vec<u8>,
+        },
+        Codec2 {
+            // Boxed because `Codec2` carries ~7.8 kB of mode tables; storing
+            // it inline blew up the enum size and tripped clippy's
+            // `large_enum_variant`.
+            c2: Box<Codec2>,
+            samples_per_frame: usize,
+            bytes_per_frame: usize,
+            resampler: Resampler,
+            scratch: Vec<f32>,
+            payload: Vec<u8>,
+        },
     }
 
-    fn encode_frame(
-        encoder: &mut Encoder,
-        frame: &[i16; FRAME_SAMPLES],
-        dst: &mut Vec<u8>,
-    ) -> Result<(), AudioError> {
-        let mut buf = [0u8; 1275];
-        let n = encoder.encode(frame, &mut buf).map_err(codec)?;
-        dst.extend_from_slice(&(n as u16).to_be_bytes());
-        dst.extend_from_slice(&buf[..n]);
-        Ok(())
+    impl EncState {
+        fn new(codec_id: VoiceCodec, codec_param: u8) -> Result<Self, AudioError> {
+            match codec_id {
+                VoiceCodec::Opus => {
+                    let mut enc = Encoder::new(SAMPLE_RATE_HZ, Channels::Mono, Application::Voip)
+                        .map_err(codec)?;
+                    enc.set_bitrate(Bitrate::Bits(OPUS_BITRATE))
+                        .map_err(codec)?;
+                    Ok(Self::Opus {
+                        encoder: enc,
+                        scratch: Vec::with_capacity(FRAME_SAMPLES),
+                        payload: Vec::new(),
+                    })
+                }
+                VoiceCodec::Codec2 => {
+                    let mode = codec2_mode_from_byte(codec_param)?;
+                    let c2 = Codec2::new(mode);
+                    let samples_per_frame = c2.samples_per_frame();
+                    let bytes_per_frame = c2.bits_per_frame().div_ceil(8);
+                    Ok(Self::Codec2 {
+                        c2: Box::new(c2),
+                        samples_per_frame,
+                        bytes_per_frame,
+                        resampler: Resampler::new(SAMPLE_RATE_HZ, CODEC2_SAMPLE_RATE_HZ),
+                        scratch: Vec::with_capacity(samples_per_frame * 2),
+                        payload: Vec::new(),
+                    })
+                }
+                other => Err(AudioError::UnsupportedCodec(other)),
+            }
+        }
+
+        fn push(&mut self, src: &[f32]) -> Result<(), AudioError> {
+            match self {
+                Self::Opus {
+                    encoder,
+                    scratch,
+                    payload,
+                } => {
+                    scratch.extend_from_slice(src);
+                    let mut buf = [0u8; 1275];
+                    while scratch.len() >= FRAME_SAMPLES {
+                        let mut frame = [0i16; FRAME_SAMPLES];
+                        for (i, s) in scratch.drain(..FRAME_SAMPLES).enumerate() {
+                            frame[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        let n = encoder.encode(&frame, &mut buf).map_err(codec)?;
+                        payload.extend_from_slice(&(n as u16).to_be_bytes());
+                        payload.extend_from_slice(&buf[..n]);
+                    }
+                    Ok(())
+                }
+                Self::Codec2 {
+                    c2,
+                    samples_per_frame,
+                    bytes_per_frame,
+                    resampler,
+                    scratch,
+                    payload,
+                } => {
+                    resampler.push(src, scratch);
+                    while scratch.len() >= *samples_per_frame {
+                        let mut frame_i16 = vec![0i16; *samples_per_frame];
+                        for (i, s) in scratch.drain(..*samples_per_frame).enumerate() {
+                            frame_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        let mut packed = vec![0u8; *bytes_per_frame];
+                        c2.encode(&mut packed, &frame_i16);
+                        payload.extend_from_slice(&packed);
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        fn finish(mut self) -> Result<Vec<u8>, AudioError> {
+            match &mut self {
+                Self::Opus {
+                    encoder,
+                    scratch,
+                    payload,
+                } => {
+                    if !scratch.is_empty() {
+                        scratch.resize(FRAME_SAMPLES, 0.0);
+                        let mut frame = [0i16; FRAME_SAMPLES];
+                        for (i, s) in scratch.drain(..FRAME_SAMPLES).enumerate() {
+                            frame[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        let mut buf = [0u8; 1275];
+                        let n = encoder.encode(&frame, &mut buf).map_err(codec)?;
+                        payload.extend_from_slice(&(n as u16).to_be_bytes());
+                        payload.extend_from_slice(&buf[..n]);
+                    }
+                }
+                Self::Codec2 {
+                    c2,
+                    samples_per_frame,
+                    bytes_per_frame,
+                    scratch,
+                    payload,
+                    ..
+                } => {
+                    if !scratch.is_empty() {
+                        scratch.resize(*samples_per_frame, 0.0);
+                        let mut frame_i16 = vec![0i16; *samples_per_frame];
+                        for (i, s) in scratch.drain(..*samples_per_frame).enumerate() {
+                            frame_i16[i] = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        }
+                        let mut packed = vec![0u8; *bytes_per_frame];
+                        c2.encode(&mut packed, &frame_i16);
+                        payload.extend_from_slice(&packed);
+                    }
+                }
+            }
+            Ok(match self {
+                Self::Opus { payload, .. } | Self::Codec2 { payload, .. } => payload,
+            })
+        }
     }
 
     #[allow(dead_code)]
@@ -205,7 +386,14 @@ mod imp {
     }
 
     impl Recorder {
-        pub fn start(max_secs: u32) -> Result<Self, AudioError> {
+        pub fn start(
+            max_secs: u32,
+            codec_id: VoiceCodec,
+            codec_param: u8,
+        ) -> Result<Self, AudioError> {
+            // Fail fast on unsupported codecs.
+            let _ = EncState::new(codec_id, codec_param)?;
+
             let max = Duration::from_secs(max_secs.max(1) as u64);
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = Arc::clone(&stop);
@@ -213,7 +401,7 @@ mod imp {
 
             let thread = std::thread::Builder::new()
                 .name("voicetastic-rec".into())
-                .spawn(move || run_capture(stop_thread, max, ready_tx))
+                .spawn(move || run_capture(stop_thread, max, codec_id, codec_param, ready_tx))
                 .map_err(backend)?;
 
             match ready_rx.recv() {
@@ -255,8 +443,6 @@ mod imp {
         }
     }
 
-    /// Buffer of resampled 48 kHz mono f32 samples produced by the capture
-    /// callback, drained by the encoder loop.
     type CaptureBuf = Arc<Mutex<Vec<f32>>>;
 
     fn build_input_stream(
@@ -302,6 +488,8 @@ mod imp {
     fn run_capture(
         stop: Arc<AtomicBool>,
         max: Duration,
+        codec_id: VoiceCodec,
+        codec_param: u8,
         ready: mpsc::SyncSender<Result<(), AudioError>>,
     ) -> Result<RecordedClip, AudioError> {
         let host = cpal::default_host();
@@ -323,6 +511,8 @@ mod imp {
             rate = cfg.sample_rate().0,
             channels = cfg.channels(),
             format = ?cfg.sample_format(),
+            codec = ?codec_id,
+            codec_param,
             "opening capture device"
         );
 
@@ -343,65 +533,72 @@ mod imp {
         }
         let _ = ready.send(Ok(()));
 
-        let mut encoder =
-            Encoder::new(SAMPLE_RATE_HZ, Channels::Mono, Application::Voip).map_err(codec)?;
-        encoder
-            .set_bitrate(Bitrate::Bits(OPUS_BITRATE))
-            .map_err(codec)?;
-
-        let mut opus_stream: Vec<u8> = Vec::new();
-        let mut total_samples: usize = 0;
+        let mut enc = EncState::new(codec_id, codec_param)?;
+        let mut total_48k_samples: usize = 0;
         let started = Instant::now();
 
         while !stop.load(Ordering::SeqCst) && started.elapsed() < max {
             std::thread::sleep(Duration::from_millis(20));
-            let frames = {
+            let drained: Vec<f32> = {
                 let mut b = buffer.lock();
-                drain_frames(&mut b)
+                std::mem::take(&mut *b)
             };
-            for frame in &frames {
-                encode_frame(&mut encoder, frame, &mut opus_stream)?;
-                total_samples += FRAME_SAMPLES;
+            if !drained.is_empty() {
+                total_48k_samples += drained.len();
+                enc.push(&drained)?;
             }
         }
 
         drop(stream);
-        let mut tail = buffer.lock();
+        let tail: Vec<f32> = {
+            let mut b = buffer.lock();
+            std::mem::take(&mut *b)
+        };
         if !tail.is_empty() {
-            let cur_len = tail.len();
-            tail.resize(cur_len.div_ceil(FRAME_SAMPLES) * FRAME_SAMPLES, 0.0);
-            let frames = drain_frames(&mut tail);
-            for frame in &frames {
-                encode_frame(&mut encoder, frame, &mut opus_stream)?;
-                total_samples += FRAME_SAMPLES;
-            }
+            total_48k_samples += tail.len();
+            enc.push(&tail)?;
         }
-        drop(tail);
 
-        if total_samples == 0 || opus_stream.is_empty() {
+        let payload = enc.finish()?;
+        if total_48k_samples == 0 || payload.is_empty() {
             return Err(AudioError::Empty);
         }
 
         let duration =
-            Duration::from_micros((total_samples as u64 * 1_000_000) / SAMPLE_RATE_HZ as u64);
+            Duration::from_micros((total_48k_samples as u64 * 1_000_000) / SAMPLE_RATE_HZ as u64);
         Ok(RecordedClip {
-            opus_stream,
+            payload,
+            codec: codec_id,
+            codec_param,
             duration,
         })
     }
 
-    pub fn decode_clip(opus_stream: &[u8]) -> Result<Vec<i16>, AudioError> {
+    /// Decode an encoded payload to 48 kHz mono i16 PCM.
+    pub fn decode_clip(
+        payload: &[u8],
+        codec_id: VoiceCodec,
+        codec_param: u8,
+    ) -> Result<Vec<i16>, AudioError> {
+        match codec_id {
+            VoiceCodec::Opus => decode_opus(payload),
+            VoiceCodec::Codec2 => decode_codec2(payload, codec_param),
+            other => Err(AudioError::UnsupportedCodec(other)),
+        }
+    }
+
+    fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, AudioError> {
         let mut dec = Decoder::new(SAMPLE_RATE_HZ, Channels::Mono).map_err(codec)?;
         let mut pcm: Vec<i16> = Vec::new();
         let mut i = 0;
         let mut frame = [0i16; FRAME_SAMPLES];
-        while i + 2 <= opus_stream.len() {
-            let len = u16::from_be_bytes([opus_stream[i], opus_stream[i + 1]]) as usize;
+        while i + 2 <= payload.len() {
+            let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
             i += 2;
-            if i + len > opus_stream.len() {
+            if i + len > payload.len() {
                 return Err(AudioError::Codec("truncated opus stream".into()));
             }
-            let pkt = &opus_stream[i..i + len];
+            let pkt = &payload[i..i + len];
             i += len;
             let n = dec.decode(pkt, &mut frame[..], false).map_err(codec)?;
             pcm.extend_from_slice(&frame[..n]);
@@ -409,9 +606,38 @@ mod imp {
         Ok(pcm)
     }
 
-    /// Shared progress counters readable from any thread. The cpal output
-    /// callback bumps `pos` for every output sample; the UI polls
-    /// `progress()` once per frame to drive the inline player.
+    fn decode_codec2(payload: &[u8], codec_param: u8) -> Result<Vec<i16>, AudioError> {
+        let mode = codec2_mode_from_byte(codec_param)?;
+        let mut c2 = Codec2::new(mode);
+        let samples_per_frame = c2.samples_per_frame();
+        let bytes_per_frame = c2.bits_per_frame().div_ceil(8);
+        if bytes_per_frame == 0 {
+            return Err(AudioError::Codec("codec2: zero-size frame".into()));
+        }
+        let mut pcm8k_i16: Vec<i16> =
+            Vec::with_capacity((payload.len() / bytes_per_frame) * samples_per_frame);
+        let mut frame = vec![0i16; samples_per_frame];
+        let mut i = 0;
+        while i + bytes_per_frame <= payload.len() {
+            c2.decode(&mut frame, &payload[i..i + bytes_per_frame]);
+            pcm8k_i16.extend_from_slice(&frame);
+            i += bytes_per_frame;
+        }
+        // Upsample 8 kHz → 48 kHz for the playback pipeline.
+        let pcm8k_f32: Vec<f32> = pcm8k_i16
+            .into_iter()
+            .map(|s| s as f32 / i16::MAX as f32)
+            .collect();
+        let mut rs = Resampler::new(CODEC2_SAMPLE_RATE_HZ, SAMPLE_RATE_HZ);
+        let mut pcm48k_f32: Vec<f32> = Vec::with_capacity(pcm8k_f32.len() * 6);
+        rs.push(&pcm8k_f32, &mut pcm48k_f32);
+        Ok(pcm48k_f32
+            .into_iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect())
+    }
+
+    /// Shared progress counters readable from any thread.
     pub struct PlaybackProgress {
         pos: AtomicUsize,
         total: AtomicUsize,
@@ -426,8 +652,6 @@ mod imp {
                 rate: AtomicU32::new(SAMPLE_RATE_HZ),
             }
         }
-        /// `(elapsed, total)` durations, derived from sample counts at the
-        /// device sample rate. Saturates `elapsed` at `total`.
         pub fn snapshot(&self) -> (Duration, Duration) {
             let pos = self.pos.load(Ordering::Relaxed);
             let total = self.total.load(Ordering::Relaxed);
@@ -451,12 +675,10 @@ mod imp {
             }
         }
 
-        /// `(elapsed, total)` since playback started.
         pub fn progress(&self) -> (Duration, Duration) {
             self.progress.snapshot()
         }
 
-        /// `true` once the entire clip has been pushed to the device.
         pub fn is_finished(&self) -> bool {
             let (e, t) = self.progress.snapshot();
             !t.is_zero() && e >= t
@@ -472,8 +694,12 @@ mod imp {
         }
     }
 
-    pub fn play_clip(opus_stream: &[u8]) -> Result<PlaybackHandle, AudioError> {
-        let pcm_i16 = decode_clip(opus_stream)?;
+    pub fn play_clip(
+        payload: &[u8],
+        codec_id: VoiceCodec,
+        codec_param: u8,
+    ) -> Result<PlaybackHandle, AudioError> {
+        let pcm_i16 = decode_clip(payload, codec_id, codec_param)?;
         if pcm_i16.is_empty() {
             return Err(AudioError::Empty);
         }
@@ -514,8 +740,6 @@ mod imp {
         }
     }
 
-    /// Resample `pcm` (48 kHz mono f32) to `dst_hz` mono f32. Returns the
-    /// full output buffer; voice clips are short, no need to stream this.
     fn resample_to(pcm: &[f32], dst_hz: u32) -> Vec<f32> {
         if dst_hz == SAMPLE_RATE_HZ {
             return pcm.to_vec();
@@ -622,7 +846,11 @@ mod imp {
 
     pub struct Recorder;
     impl Recorder {
-        pub fn start(_max_secs: u32) -> Result<Self, AudioError> {
+        pub fn start(
+            _max_secs: u32,
+            _codec: VoiceCodec,
+            _codec_param: u8,
+        ) -> Result<Self, AudioError> {
             Err(AudioError::FeatureDisabled)
         }
         pub fn elapsed(&self) -> Duration {
@@ -644,7 +872,11 @@ mod imp {
         }
     }
 
-    pub fn play_clip(_opus_stream: &[u8]) -> Result<PlaybackHandle, AudioError> {
+    pub fn play_clip(
+        _payload: &[u8],
+        _codec: VoiceCodec,
+        _codec_param: u8,
+    ) -> Result<PlaybackHandle, AudioError> {
         Err(AudioError::FeatureDisabled)
     }
 }

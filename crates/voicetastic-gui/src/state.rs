@@ -53,6 +53,9 @@ pub struct ChatEntry {
 #[derive(Clone)]
 pub struct VoicePayload {
     pub codec: voicetastic_core::voice::VoiceCodec,
+    /// Codec-specific parameter byte from the wire header (e.g. Codec2
+    /// mode index). Required to drive the right decoder on playback.
+    pub codec_param: u8,
     pub bytes: Vec<u8>,
     #[allow(dead_code)] // displayed only in tooltips today; surface for future
     pub duration_ms: u32,

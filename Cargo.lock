@@ -582,6 +582,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "codec2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cefd04ca4a2f096acf5f44da5e5931436d030a620901f1fe8fa773e6b9de65b"
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3791,6 +3797,7 @@ dependencies = [
 name = "voicetastic-gui"
 version = "0.1.0"
 dependencies = [
+ "codec2",
  "cpal",
  "eframe",
  "egui",

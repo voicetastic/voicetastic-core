@@ -41,6 +41,9 @@ pub enum VoiceCodec {
     AmrNb,
     Opus,
     PcmS16Le,
+    /// Codec2 low-bitrate speech codec. `codec_param` carries the mode
+    /// (see [`Codec2Mode`] / `VoiceCodec2Mode` in the GUI).
+    Codec2,
     Unknown(u8),
 }
 
@@ -50,6 +53,7 @@ impl VoiceCodec {
             0 => Self::AmrNb,
             1 => Self::Opus,
             2 => Self::PcmS16Le,
+            3 => Self::Codec2,
             _ => Self::Unknown(b),
         }
     }
@@ -59,6 +63,7 @@ impl VoiceCodec {
             Self::AmrNb => 0,
             Self::Opus => 1,
             Self::PcmS16Le => 2,
+            Self::Codec2 => 3,
             Self::Unknown(b) => b,
         }
     }
