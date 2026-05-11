@@ -19,6 +19,15 @@ name = "voicetastic"
 voicetastic-core = { path = "../voicetastic-core", default-features = false }
 uniffi = { workspace = true, features = ["cli"] }
 thiserror = { workspace = true }
+# PR 0: async runtime + tracing for the upcoming MeshService bridge.
+# `rt-multi-thread` is required so that `MeshService::connect_with_transport`
+# (which internally `tokio::spawn`s inbound/outbound/voice-tx tasks) can run
+# independently of the JVM thread that called into UniFFI.
+tokio = { workspace = true }
+once_cell = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+prost = { workspace = true }
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
 [features]

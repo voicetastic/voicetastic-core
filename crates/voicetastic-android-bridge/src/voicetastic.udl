@@ -36,6 +36,13 @@ namespace voicetastic {
 
     /// Parse a wire-stable id back to a [`SettingKey`], or `null`.
     SettingKey? setting_key_from_id(string id);
+
+    /// `aabbccdd` → `!aabbccdd` text id for the given node number.
+    string node_num_to_id(u32 num);
+
+    /// Parse a `!aabbccdd` text id back into a node number; returns
+    /// `null` for any malformed id (or the broadcast address).
+    u32? node_id_to_num(string id);
 };
 
 /// Configuration for `build_nack`.
@@ -228,6 +235,7 @@ interface VoiceAssembler {
 };
 
 // -----------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Settings (client-side, persisted as TOML on the host)
 // -----------------------------------------------------------------------------
 
@@ -316,5 +324,166 @@ interface SettingsApi {
     u8 voice_amrnb_mode();
     [Throws=SettingsError]
     void set_voice_amrnb_mode(u8 mode);
+};
+
+// -----------------------------------------------------------------------------
+// PR 1: MeshService — Meshtastic state machine bridge
+// -----------------------------------------------------------------------------
+
+/// Errors raised by `MeshService` operations.
+[Error]
+interface MeshServiceError {
+    NotConnected();
+    NoLocalNode();
+    Transport(string message);
+    Protocol(string message);
+    Voice(string message);
+    InvalidArgument(string message);
+    Other(string message);
+};
+
+/// Coarse connection state. Mirrors `core::ConnectionState`.
+enum MeshConnectionState {
+    "Disconnected",
+    "Connecting",
+    "Connected",
+    "Configuring",
+    "Ready",
+};
+
+/// One inbound text message routed off the mesh.
+dictionary IncomingTextMsg {
+    u32 from;
+    string from_id;
+    u32 to;
+    u32 channel;
+    string text;
+    u32 rx_time;
+    f32 rx_snr;
+    i32 rx_rssi;
+};
+
+/// One inbound application data packet (used for voice + private-app).
+dictionary IncomingDataMsg {
+    u32 from;
+    u32 to;
+    u32 channel;
+    i32 portnum;
+    bytes payload;
+    u32 rx_time;
+};
+
+/// Mirror of the firmware's `QueueStatus` event.
+dictionary QueueStatusEvent {
+    i32 res;
+    u32 free;
+    u32 maxlen;
+    u32 mesh_packet_id;
+};
+
+/// Outbound half of the radio transport. Kotlin implements this for BLE
+/// (GATT write) and USB-serial. Methods are called from Rust threads;
+/// implementations must be thread-safe.
+[Trait, WithForeign]
+interface MeshTransport {
+    /// Send one already-encoded `ToRadio` protobuf message.
+    void write_to_radio(bytes data);
+    /// Close the underlying transport. Idempotent.
+    void close();
+};
+
+/// Listener for connection-state changes. Fired once with the current
+/// value on registration, then on every transition.
+[Trait, WithForeign]
+interface MeshStateListener {
+    void on_state(MeshConnectionState state);
+};
+
+[Trait, WithForeign]
+interface MeshTextListener {
+    void on_text(IncomingTextMsg message);
+};
+
+[Trait, WithForeign]
+interface MeshDataListener {
+    void on_data(IncomingDataMsg message);
+};
+
+[Trait, WithForeign]
+interface MeshQueueListener {
+    void on_queue_status(QueueStatusEvent event);
+};
+
+/// Per-section config listener. All payload arguments are
+/// protobuf-encoded; Kotlin decodes with its geeksville-mesh codegen.
+[Trait, WithForeign]
+interface MeshConfigListener {
+    void on_my_info(bytes encoded);
+    void on_node_info(bytes encoded);
+    void on_config(bytes encoded);
+    void on_channel(bytes encoded);
+    void on_owner(bytes encoded);
+    void on_metadata(bytes encoded);
+    void on_config_complete(u32 nonce);
+};
+
+/// Handle returned by [`MeshService.connect`]. Kotlin's BLE / serial
+/// callback path calls `push_inbound` for every decoded `FromRadio`
+/// frame; `close` signals EOF.
+interface MeshTransportSink {
+    void push_inbound(bytes frame);
+    void close();
+};
+
+/// UniFFI-exposed Meshtastic service. Construct once, reuse across the
+/// app's lifetime. Cheap to clone-by-Arc internally; the FFI handle is
+/// also cheap to share between Kotlin coroutines.
+interface MeshService {
+    [Throws=MeshServiceError]
+    constructor();
+
+    /// Register the foreign transport and start the inbound pump.
+    /// Returns the sink Kotlin pushes inbound frames into. After this
+    /// returns, the service will start its config-burst handshake.
+    [Throws=MeshServiceError]
+    MeshTransportSink connect(MeshTransport transport, u64 settle_delay_ms);
+
+    [Throws=MeshServiceError]
+    void disconnect();
+
+    [Throws=MeshServiceError]
+    void refresh_config();
+
+    /// Local node number, if known.
+    u32? my_node_num();
+
+    [Throws=MeshServiceError]
+    u32 send_text(string text, u32 channel, u32? dest);
+
+    [Throws=MeshServiceError]
+    u32 send_data(i32 portnum, bytes payload, u32 channel, u32? dest, boolean want_ack);
+
+    /// Encode `audio` per `cfg` and push the resulting frames onto the
+    /// paced voice TX queue. Returns the per-frame packet ids in send
+    /// order.
+    [Throws=MeshServiceError]
+    sequence<u32> send_voice(
+        bytes audio,
+        BuildConfig cfg,
+        u32 channel,
+        u32? dest,
+        u64 pacing_ms
+    );
+
+    /// Submit an already-encoded `AdminMessage` proto. The service
+    /// addresses the packet to the local node automatically.
+    [Throws=MeshServiceError]
+    u32 write_admin(bytes admin_proto);
+
+    void set_state_listener(MeshStateListener listener);
+    void set_text_listener(MeshTextListener listener);
+    void set_data_listener(MeshDataListener listener);
+    void set_queue_listener(MeshQueueListener listener);
+    void set_config_listener(MeshConfigListener listener);
 };
 
