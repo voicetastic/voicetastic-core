@@ -120,6 +120,32 @@ impl MeshService {
             from_radio::PayloadVariant::Packet(pkt) => {
                 self.handle_packet(pkt);
             }
+            from_radio::PayloadVariant::QueueStatus(qs) => {
+                // Firmware-driven backpressure. The radio publishes its
+                // outbound queue depth on every accept/drain; surface it
+                // to the voice TX worker so we never blast frames into a
+                // full firmware queue (which is what causes the sender
+                // device to OOM / watchdog-reboot under long voice
+                // bursts on slow modem presets).
+                debug!(
+                    free = qs.free,
+                    maxlen = qs.maxlen,
+                    res = qs.res,
+                    pkt = qs.mesh_packet_id,
+                    "queue_status"
+                );
+                *self.inner.radio_queue_free.lock() = qs.free;
+                self.inner.radio_queue_notify.notify_waiters();
+                let _ = self
+                    .inner
+                    .queue_status_tx
+                    .send(crate::service::QueueStatusEvent {
+                        res: qs.res,
+                        free: qs.free,
+                        maxlen: qs.maxlen,
+                        mesh_packet_id: qs.mesh_packet_id,
+                    });
+            }
             _ => {}
         }
         Ok(())

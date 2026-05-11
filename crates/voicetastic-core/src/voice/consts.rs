@@ -24,12 +24,22 @@ pub const MAX_PARITY_PER_MESSAGE: usize = 128;
 pub const MAX_IN_PROGRESS_GLOBAL: usize = 64;
 /// Per-sender cap on concurrent in-progress reassemblies.
 pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
-/// Recently-completed message blacklist TTL.
-pub const BLACKLIST_TTL: Duration = Duration::from_secs(60);
+/// Default for [`crate::voice::AssemblerConfig::completion_memory`]:
+/// how long the receiver remembers that a given `(from, message_id)`
+/// already completed, so late chunks still rattling out of the sender's
+/// firmware queue (or arriving over a long retransmit tail) don't
+/// resurrect a phantom partial reassembly. Set comfortably above the
+/// realistic worst-case sender airtime — Long Slow on a near-MTU clip
+/// can take 2–3 minutes — so the blacklist outlives the actual TX.
+pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 /// Recently-completed blacklist max entries.
 pub const BLACKLIST_MAX: usize = 100;
-/// Maximum NACK rounds per message before the receiver gives up.
-pub const NACK_MAX_ROUNDS: u8 = 3;
+/// Maximum NACK rounds per message before the receiver gives up. Each
+/// round fires after [`NACK_WINDOW_MS`] of silence, so this also bounds
+/// how long a stalled message survives. The previous value of `3` gave up
+/// after only ~4–5 s of quiet, which is far too aggressive on slow LoRa
+/// presets where inter-chunk gaps can routinely exceed a second.
+pub const NACK_MAX_ROUNDS: u8 = 32;
 /// Quiet-period after the last seen chunk before issuing a NACK.
 pub const NACK_WINDOW_MS: u64 = 1500;
 /// AES-GCM nonce length (96 bits per RFC 5288).

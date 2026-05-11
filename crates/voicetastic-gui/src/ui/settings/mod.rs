@@ -20,6 +20,7 @@ mod network;
 mod owner;
 mod position;
 mod power;
+mod voice;
 mod widgets;
 
 // Re-exported so the `impl_enum_strings!` macro can refer to the trait via a
@@ -53,13 +54,18 @@ pub(super) struct Ctx<'a> {
 }
 
 pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
-    let ctx = Ctx {
-        rt: &app.rt,
-        svc: &app.service,
-        shared: &app.shared,
-    };
-
     egui::ScrollArea::vertical().show(ui, |ui| {
+        // Client-side preferences first — these don't need a device
+        // connection and have no dirty-tracking complications.
+        voice::section(ui, app);
+        ui.add_space(4.0);
+
+        let ctx = Ctx {
+            rt: &app.rt,
+            svc: &app.service,
+            shared: &app.shared,
+        };
+
         connection::connection_card(ui, &ctx);
         connection::status_card(ui, &ctx);
         ui.add_space(4.0);

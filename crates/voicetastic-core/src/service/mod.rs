@@ -13,12 +13,13 @@
 mod inbound;
 mod outbound;
 mod types;
+mod voice_tx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
 use tracing::warn;
 
 /// Maximum time we wait for the device to finish its config burst (i.e. for
@@ -41,7 +42,7 @@ use crate::proto::{
 use crate::serial::SerialConnection;
 use crate::transport::Transport;
 
-pub use types::{ConnectionState, IncomingData, IncomingText, node_long_name};
+pub use types::{ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_long_name};
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]
@@ -60,6 +61,22 @@ struct Inner {
     incoming_text_tx: broadcast::Sender<IncomingText>,
     incoming_data_tx: broadcast::Sender<IncomingData>,
     next_packet_id: Mutex<u32>,
+    /// Producer end of the serialized voice TX queue. The worker is
+    /// spawned in [`MeshService::new`] and holds a `Weak<Inner>` so it
+    /// shuts down when the last external [`MeshService`] clone drops.
+    voice_tx: mpsc::Sender<voice_tx::VoiceTxItem>,
+    /// Latest firmware-reported outbound queue snapshot. Updated from
+    /// `FromRadio::QueueStatus` events. `free` defaults to `u32::MAX`
+    /// (i.e. "unknown / assume room") until the first report arrives so
+    /// we don't gate the very first send on a value we've never seen.
+    /// `radio_queue_notify` is pulsed on every update so the voice TX
+    /// worker can wake up as soon as the firmware drains its queue.
+    pub(super) radio_queue_free: parking_lot::Mutex<u32>,
+    pub(super) radio_queue_notify: Arc<Notify>,
+    /// Broadcast of each raw `QueueStatus` event the firmware emits.
+    /// Consumers (e.g. the chat UI) subscribe to track when individual
+    /// outbound packets have actually been transmitted on air.
+    pub(super) queue_status_tx: broadcast::Sender<types::QueueStatusEvent>,
     // Configuration sections, each updated when the device emits its
     // matching `Config` chunk during the want-config burst.
     pub(super) lora_tx: watch::Sender<Option<LoRaConfig>>,
@@ -81,7 +98,13 @@ impl MeshService {
         let (nodes_tx, _) = watch::channel(HashMap::new());
         let (config_complete_tx, _) = broadcast::channel(8);
         let (incoming_text_tx, _) = broadcast::channel(64);
-        let (incoming_data_tx, _) = broadcast::channel(128);
+        let (incoming_data_tx, _) = broadcast::channel(1024);
+        // Sized generously so a long voice send (≈ data + FEC parity
+        // frames, with the firmware sometimes emitting two QS events
+        // per packet) can't outrun a momentarily-suspended subscriber
+        // and force a `Lagged` error. Each event is small (~16 B), so
+        // the ~64 KB worst-case footprint is cheap.
+        let (queue_status_tx, _) = broadcast::channel(4096);
         let (lora_tx, _) = watch::channel(None);
         let (device_tx, _) = watch::channel(None);
         let (position_tx, _) = watch::channel(None);
@@ -92,33 +115,41 @@ impl MeshService {
         let (channels_tx, _) = watch::channel(Vec::new());
         let (owner_tx, _) = watch::channel(None);
         let (metadata_tx, _) = watch::channel(None);
-        Ok(Self {
-            inner: Arc::new(Inner {
-                #[cfg(feature = "ble-btleplug")]
-                ble: tokio::sync::OnceCell::new(),
-                transport: Mutex::new(None),
-                state_tx,
-                my_info_tx,
-                nodes_tx,
-                config_complete_tx,
-                incoming_text_tx,
-                incoming_data_tx,
-                // Meshtastic firmware uses packet id for flood-routing
-                // deduplication; tiny sequential ids would clash with
-                // recently-seen packets, so seed from the OS RNG.
-                next_packet_id: Mutex::new(types::rand_u32().max(1)),
-                lora_tx,
-                device_tx,
-                position_tx,
-                power_tx,
-                network_tx,
-                display_tx,
-                bluetooth_tx,
-                channels_tx,
-                owner_tx,
-                metadata_tx,
-            }),
-        })
+        // The voice TX queue is bootstrapped here: build the channel,
+        // wrap Inner in an Arc, then hand the worker a Weak<Inner> so
+        // it can shut down cleanly when the last MeshService clone drops.
+        let (voice_tx_send, voice_tx_recv) = tokio::sync::mpsc::channel(voice_tx::QUEUE_CAPACITY);
+        let inner = Arc::new(Inner {
+            #[cfg(feature = "ble-btleplug")]
+            ble: tokio::sync::OnceCell::new(),
+            transport: Mutex::new(None),
+            state_tx,
+            my_info_tx,
+            nodes_tx,
+            radio_queue_free: parking_lot::Mutex::new(u32::MAX),
+            radio_queue_notify: Arc::new(Notify::new()),
+            config_complete_tx,
+            incoming_text_tx,
+            incoming_data_tx,
+            // Meshtastic firmware uses packet id for flood-routing
+            // deduplication; tiny sequential ids would clash with
+            // recently-seen packets, so seed from the OS RNG.
+            next_packet_id: Mutex::new(types::rand_u32().max(1)),
+            voice_tx: voice_tx_send,
+            queue_status_tx,
+            lora_tx,
+            device_tx,
+            position_tx,
+            power_tx,
+            network_tx,
+            display_tx,
+            bluetooth_tx,
+            channels_tx,
+            owner_tx,
+            metadata_tx,
+        });
+        voice_tx::spawn_worker(Arc::downgrade(&inner), voice_tx_recv);
+        Ok(Self { inner })
     }
 
     #[cfg(feature = "ble-btleplug")]
@@ -144,6 +175,13 @@ impl MeshService {
     }
     pub fn subscribe_data(&self) -> broadcast::Receiver<IncomingData> {
         self.inner.incoming_data_tx.subscribe()
+    }
+    /// Subscribe to firmware queue-status events. Each event carries
+    /// `(res, free, maxlen, mesh_packet_id)` and is emitted as the radio
+    /// queue accepts or drains a packet. Useful for confirming that a
+    /// specific outbound packet has been transmitted.
+    pub fn subscribe_queue_status(&self) -> broadcast::Receiver<QueueStatusEvent> {
+        self.inner.queue_status_tx.subscribe()
     }
     pub fn subscribe_config_complete(&self) -> broadcast::Receiver<u32> {
         self.inner.config_complete_tx.subscribe()

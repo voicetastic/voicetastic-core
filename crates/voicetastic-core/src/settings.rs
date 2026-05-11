@@ -8,15 +8,56 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Default cap for voice-message recording duration.
+pub const DEFAULT_VOICE_MAX_SECS: u32 = 30;
+/// Hard upper bound the UI exposes for the voice-message duration cap.
+/// Anything larger would reliably exceed the protocol's per-message size
+/// budget at typical voice bitrates.
+pub const VOICE_MAX_SECS_UPPER: u32 = 120;
+
+/// Default per-message reassembly timeout, in seconds. Matches the core
+/// `AssemblerConfig` default and is exposed in the GUI so users can extend
+/// it on slow modem presets where a single voice message may take minutes.
+pub const DEFAULT_REASSEMBLY_TIMEOUT_SECS: u32 = 600;
+/// Lower bound for the configurable reassembly timeout (10 s).
+pub const REASSEMBLY_TIMEOUT_LOWER_SECS: u32 = 10;
+/// Upper bound for the configurable reassembly timeout (1 hour).
+pub const REASSEMBLY_TIMEOUT_UPPER_SECS: u32 = 3_600;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
     /// Last successfully connected BLE address or serial port path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_device: Option<String>,
+
+    /// Maximum recording duration (seconds) for voice messages composed in
+    /// the GUI. `None` falls back to [`DEFAULT_VOICE_MAX_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_voice_duration_secs: Option<u32>,
+
+    /// Per-message voice reassembly timeout (seconds). `None` falls back to
+    /// [`DEFAULT_REASSEMBLY_TIMEOUT_SECS`]. Clamped to
+    /// `[REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassembly_timeout_secs: Option<u32>,
 }
 
 impl AppSettings {
+    /// Effective voice-message duration cap, clamped to a sane range.
+    pub fn voice_max_secs(&self) -> u32 {
+        self.max_voice_duration_secs
+            .unwrap_or(DEFAULT_VOICE_MAX_SECS)
+            .clamp(1, VOICE_MAX_SECS_UPPER)
+    }
+
+    /// Effective per-message reassembly timeout, clamped to a sane range.
+    pub fn reassembly_timeout_secs(&self) -> u32 {
+        self.reassembly_timeout_secs
+            .unwrap_or(DEFAULT_REASSEMBLY_TIMEOUT_SECS)
+            .clamp(REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS)
+    }
+
     /// Load from the config path, or return defaults if the file is missing
     /// or unparseable. Errors are intentionally swallowed — corrupt config
     /// must never block app startup.

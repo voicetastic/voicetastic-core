@@ -137,7 +137,7 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
                     };
                     match assembler.accept(&from_id, to, d.channel, &d.payload) {
                         AssemblyEvent::Complete(msg) => save_amr(&base_dir, &msg).await?,
-                        AssemblyEvent::Pending | AssemblyEvent::Duplicate => {}
+                        AssemblyEvent::Pending { .. } | AssemblyEvent::Duplicate => {}
                         AssemblyEvent::Nack(_) => {}
                         AssemblyEvent::Rejected(e) => warn!(?e, "rejected voice frame"),
                     }

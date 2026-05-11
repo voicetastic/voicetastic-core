@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use eframe::egui;
-use voicetastic_core::settings::AppSettings;
 
 use crate::app::VoicetasticApp;
 
@@ -14,12 +13,11 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         ui.text_edit_singleline(&mut app.device_addr);
         if ui.button("Connect").clicked() {
             let addr = app.device_addr.clone();
-            // Persist the address best-effort. Failure to write the config
-            // file must never block the connection attempt.
-            let _ = AppSettings {
-                last_device: Some(addr.clone()),
-            }
-            .save();
+            // Persist the address best-effort — keep any other settings
+            // fields intact. Failure to write the config file must never
+            // block the connection attempt.
+            app.app_settings.last_device = Some(addr.clone());
+            app.save_settings();
             let svc = app.service.clone();
             let shared = Arc::clone(&app.shared);
             app.rt.spawn(async move {

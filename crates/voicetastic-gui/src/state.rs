@@ -29,6 +29,33 @@ pub struct ChatEntry {
     pub from_num: u32,
     /// Destination node num. `0xFFFF_FFFF` = broadcast.
     pub to_num: u32,
+    /// Voice payload (length-prefixed Opus packets) when this entry is a
+    /// voice message. `None` for plain text, or for an outgoing voice
+    /// entry that hasn't finished sending yet — the payload is attached
+    /// once the last chunk leaves the TX queue so the play button
+    /// only appears when playback would actually work.
+    pub voice: Option<VoicePayload>,
+    /// For outgoing voice entries: the protocol `message_id` so we can
+    /// upgrade the entry once the send completes (attaching `voice` and
+    /// clearing the "sending" label). `None` for text or inbound voice.
+    pub outgoing_voice_id: Option<u32>,
+    /// For inbound voice entries: the protocol `message_id`. Paired
+    /// with `from_num` it lets the assembler watcher locate this entry
+    /// to update its "received X/Y chunks" label as data arrives, and
+    /// finally promote it to a playable entry on completion. `None`
+    /// for text or outgoing voice.
+    pub inbound_voice_id: Option<u32>,
+}
+
+/// Audio attached to a [`ChatEntry`]. We keep a `codec` byte so future
+/// extensions (AMR, raw PCM, etc.) can land without breaking existing
+/// entries.
+#[derive(Clone)]
+pub struct VoicePayload {
+    pub codec: voicetastic_core::voice::VoiceCodec,
+    pub bytes: Vec<u8>,
+    #[allow(dead_code)] // displayed only in tooltips today; surface for future
+    pub duration_ms: u32,
 }
 
 /// Identifies one editable settings section. Used as a dirty-tracking key

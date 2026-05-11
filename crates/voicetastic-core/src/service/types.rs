@@ -36,6 +36,23 @@ pub struct IncomingData {
     pub rx_time: u32,
 }
 
+/// Mirror of the firmware's `QueueStatus` event. Fired every time the
+/// device's outbound packet queue accepts or drains an entry; lets
+/// callers track when a specific outgoing packet has actually left the
+/// firmware (≈ "the radio has transmitted it on air").
+#[derive(Debug, Clone, Copy)]
+pub struct QueueStatusEvent {
+    /// `ErrorCode` of the last queue operation; 0 == success.
+    pub res: i32,
+    /// Free slots remaining in the firmware queue.
+    pub free: u32,
+    /// Maximum number of slots.
+    pub maxlen: u32,
+    /// Mesh packet id this status applies to, or 0 if not associated
+    /// with a specific packet.
+    pub mesh_packet_id: u32,
+}
+
 /// Long name accessor for callers that don't want to import `proto::User`.
 pub fn node_long_name(node: &NodeInfo) -> Option<&str> {
     node.user.as_ref().map(|u: &User| u.long_name.as_str())

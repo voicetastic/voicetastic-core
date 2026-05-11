@@ -27,8 +27,15 @@ pub struct VoiceMessage {
 /// Outcome of feeding a frame to the assembler's `accept`.
 #[derive(Debug)]
 pub enum AssemblyEvent {
-    /// Frame accepted, message still in progress.
-    Pending,
+    /// Frame accepted, message still in progress. Carries enough info
+    /// for the caller to update a live "received X/Y chunks" UI.
+    Pending {
+        message_id: u32,
+        from: String,
+        received_data: u8,
+        total_data: u8,
+        channel: u32,
+    },
     /// Frame was a duplicate (same chunk_index already stored). Dropped.
     Duplicate,
     /// Frame rejected (blacklist, decrypt-fail, structural error, …).

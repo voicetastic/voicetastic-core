@@ -6,7 +6,7 @@ use prost::Message as _;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, PRIVATE_APP, TEXT_MESSAGE_APP};
+use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, TEXT_MESSAGE_APP};
 use crate::proto::{
     AdminMessage, Channel, Config, Data, MeshPacket, Position, ToRadio, User, admin_message,
     config, mesh_packet, to_radio,
@@ -97,9 +97,13 @@ impl MeshService {
     /// derived from the current LoRa modem preset (see
     /// [`crate::voice::ModemPreset::pacing`]).
     ///
-    /// Each DATA / PARITY frame is sent via [`PRIVATE_APP`] with `want_ack`
-    /// set for direct messages and cleared for broadcasts (the firmware
-    /// drops broadcast ACK requests anyway).
+    /// Frames are pushed onto the shared voice TX queue (see
+    /// [`super::voice_tx`]) so concurrent voice messages — including
+    /// NACK-driven retransmits — are serialized and paced consistently.
+    /// We wait for each frame to actually leave the worker before
+    /// enqueuing the next: this preserves the original semantics of
+    /// "returns after the burst is on its way" and yields the assigned
+    /// packet ids in order.
     pub async fn send_voice(
         &self,
         message: &crate::voice::EncodedMessage,
@@ -109,14 +113,11 @@ impl MeshService {
     ) -> Result<Vec<u32>> {
         let want_ack = to.is_some();
         let mut ids = Vec::with_capacity(message.frames.len());
-        for (i, frame) in message.frames.iter().enumerate() {
-            if i > 0 && !pacing.is_zero() {
-                tokio::time::sleep(pacing).await;
-            }
-            ids.push(
-                self.send_data(PRIVATE_APP as i32, frame.clone(), channel, to, want_ack)
-                    .await?,
-            );
+        for frame in &message.frames {
+            let id = self
+                .enqueue_voice_frame_with_id(frame.clone(), channel, to, want_ack, pacing)
+                .await?;
+            ids.push(id);
         }
         Ok(ids)
     }

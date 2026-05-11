@@ -2,14 +2,36 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use eframe::egui;
+use parking_lot::Mutex;
 
 use voicetastic_core::ports::BROADCAST_ADDR;
 use voicetastic_core::proto::{
     Channel, NodeInfo, channel::Role, config::LoRaConfig, config::lo_ra_config::ModemPreset,
 };
+use voicetastic_core::voice::{
+    BuildConfig, MAX_BODY_SIZE, MAX_PARITY_PER_MESSAGE, ModemPreset as VoiceModemPreset,
+    VoiceCodec, build_message, random_message_id,
+};
 
-use crate::app::VoicetasticApp;
-use crate::state::ChatEntry;
+use crate::app::{PlaybackSource, VoicetasticApp};
+use crate::audio::{self, PlaybackHandle, RecordedClip, Recorder};
+use crate::state::{ChatEntry, SharedState, VoicePayload};
+
+/// Voice-message compose state machine driven by the Chat tab UI.
+///
+/// Variants:
+/// - `Idle`: no recording in progress, mic icon shown.
+/// - `Recording`: cpal stream running, timer ticking, Stop button shown.
+/// - `Preview`: clip captured, user can listen / delete / send.
+#[derive(Default)]
+pub enum VoiceCompose {
+    #[default]
+    Idle,
+    Recording(Recorder),
+    Preview {
+        clip: RecordedClip,
+    },
+}
 
 /// Default name the Meshtastic firmware uses for the primary channel when
 /// the user hasn't overridden it. Derived from the active LoRa modem preset
@@ -211,13 +233,24 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         Some(num) => Thread::Direct(num),
     };
 
+    // Auto-clear playback handle when finished so the inline player
+    // disappears and the next ▶ Play click starts fresh.
+    if let Some(h) = app.voice_playback.as_ref()
+        && h.is_finished()
+    {
+        app.voice_playback = None;
+        app.playback_source = None;
+    }
+
     // Messages for the active thread.
     egui::ScrollArea::vertical()
         .stick_to_bottom(true)
-        .max_height(ui.available_height() - 40.0)
+        .max_height(ui.available_height() - 80.0)
         .show(ui, |ui| {
             let mut any = false;
-            for entry in log.iter() {
+            let mut play_request: Option<(usize, Vec<u8>)> = None;
+            let mut stop_request = false;
+            for (idx, entry) in log.iter().enumerate() {
                 if entry_thread(entry, my_num) != Some(active) {
                     continue;
                 }
@@ -228,15 +261,49 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                     let node = nodes.get(&entry.from_num);
                     node_display_name(node, entry.from_num)
                 };
-                ui.label(format!("{prefix}: {}", entry.text));
+                let is_playing = app.playback_source == Some(PlaybackSource::LogEntry(idx))
+                    && app.voice_playback.is_some();
+                ui.horizontal(|ui| {
+                    ui.label(format!("{prefix}: {}", entry.text));
+                    if let Some(v) = entry.voice.as_ref()
+                        && audio::is_available()
+                        && v.codec == VoiceCodec::Opus
+                    {
+                        if is_playing {
+                            if inline_player(ui, app.voice_playback.as_ref()) {
+                                stop_request = true;
+                            }
+                        } else if ui.small_button("▶ Play").clicked() {
+                            play_request = Some((idx, v.bytes.clone()));
+                        }
+                    }
+                });
             }
             if !any {
                 ui.weak("(no messages in this conversation yet)");
             }
+            if stop_request {
+                if let Some(h) = app.voice_playback.take() {
+                    h.stop();
+                }
+                app.playback_source = None;
+            }
+            if let Some((idx, bytes)) = play_request {
+                start_playback(app, &bytes, PlaybackSource::LogEntry(idx));
+            }
         });
 
-    // Input row.
+    // Voice composer + text input row.
     ui.separator();
+    voice_composer(app, ui, &nodes);
+    if let Some(msg) = app.chat_status.clone() {
+        ui.horizontal(|ui| {
+            ui.colored_label(egui::Color32::from_rgb(220, 100, 100), &msg);
+            if ui.small_button("✕").clicked() {
+                app.chat_status = None;
+            }
+        });
+    }
     ui.horizontal(|ui| {
         let resp = ui.text_edit_singleline(&mut app.chat_input);
         let send = (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -265,6 +332,9 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                                 channel: ch,
                                 from_num: 0,
                                 to_num,
+                                voice: None,
+                                outgoing_voice_id: None,
+                                inbound_voice_id: None,
                             });
                         }
                         Err(e) => {
@@ -275,4 +345,442 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+/// Route the destination channel/node for the active thread to a
+/// `(channel, dest)` pair compatible with `MeshService::send_voice`.
+fn resolve_destination(
+    app: &VoicetasticApp,
+    nodes: &std::collections::HashMap<u32, voicetastic_core::proto::NodeInfo>,
+) -> (u32, Option<u32>) {
+    match app.chat_dest {
+        None => (app.chat_channel, None),
+        Some(num) => {
+            let ch = nodes.get(&num).map(|n| n.channel).unwrap_or(0);
+            (ch, Some(num))
+        }
+    }
+}
+
+fn start_playback(app: &mut VoicetasticApp, bytes: &[u8], source: PlaybackSource) {
+    // Drop any in-flight playback first so the new clip starts cleanly.
+    if let Some(h) = app.voice_playback.take() {
+        h.stop();
+    }
+    match audio::play_clip(bytes) {
+        Ok(handle) => {
+            app.voice_playback = Some(handle);
+            app.playback_source = Some(source);
+        }
+        Err(e) => {
+            app.chat_status = Some(format!("Playback failed: {e}"));
+            app.playback_source = None;
+        }
+    }
+}
+
+/// Tiny inline transport widget rendered next to a message that's
+/// currently playing. Returns `true` if the user clicked Stop.
+fn inline_player(ui: &mut egui::Ui, handle: Option<&PlaybackHandle>) -> bool {
+    let (elapsed, total) = handle
+        .map(|h| h.progress())
+        .unwrap_or((std::time::Duration::ZERO, std::time::Duration::ZERO));
+    let total_s = total.as_secs_f32().max(0.001);
+    let frac = (elapsed.as_secs_f32() / total_s).clamp(0.0, 1.0);
+    ui.add(
+        egui::ProgressBar::new(frac)
+            .desired_width(140.0)
+            .text(format!(
+                "{:.1} / {:.1} s",
+                elapsed.as_secs_f32(),
+                total.as_secs_f32(),
+            )),
+    );
+    // Keep the progress bar smooth without spinning the CPU.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(80));
+    ui.small_button("⏹").clicked()
+}
+
+/// Idle / Recording / Preview UI rendered above the text input.
+fn voice_composer(
+    app: &mut VoicetasticApp,
+    ui: &mut egui::Ui,
+    nodes: &std::collections::HashMap<u32, voicetastic_core::proto::NodeInfo>,
+) {
+    let max_secs = app.app_settings.voice_max_secs();
+    // Take ownership of the state so we can transition without juggling
+    // borrow rules; we put the (possibly-new) state back at the end.
+    let prev = std::mem::take(&mut app.voice_compose);
+    let next = match prev {
+        VoiceCompose::Idle => render_idle(app, ui, max_secs),
+        VoiceCompose::Recording(rec) => render_recording(app, ui, rec, max_secs),
+        VoiceCompose::Preview { clip } => render_preview(app, ui, nodes, clip),
+    };
+    app.voice_compose = next;
+}
+
+fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> VoiceCompose {
+    ui.horizontal(|ui| {
+        let enabled = audio::is_available();
+        let resp = ui.add_enabled(enabled, egui::Button::new("🎙 Record voice"));
+        if !enabled {
+            resp.on_hover_text("Rebuild with `--features audio` to enable voice messages.");
+        } else if resp.clicked() {
+            match Recorder::start(max_secs) {
+                Ok(rec) => {
+                    return VoiceCompose::Recording(rec);
+                }
+                Err(e) => {
+                    app.chat_status = Some(format!("Mic error: {e}"));
+                }
+            }
+        }
+        ui.weak(format!("(max {max_secs} s)"));
+        VoiceCompose::Idle
+    })
+    .inner
+}
+
+fn render_recording(
+    app: &mut VoicetasticApp,
+    ui: &mut egui::Ui,
+    rec: Recorder,
+    max_secs: u32,
+) -> VoiceCompose {
+    let elapsed = rec.elapsed().as_secs_f32().min(max_secs as f32);
+    let mut next = VoiceCompose::Recording(rec);
+    ui.horizontal(|ui| {
+        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "● Recording");
+        ui.add(
+            egui::ProgressBar::new(elapsed / max_secs as f32)
+                .desired_width(160.0)
+                .text(format!("{:.1} / {} s", elapsed, max_secs)),
+        );
+        let stop = ui.button("⏹ Stop").clicked();
+        let cancel = ui.button("✖ Cancel").clicked();
+        // Auto-stop when the cap elapses.
+        let auto_stop = elapsed >= max_secs as f32;
+        if stop || auto_stop {
+            if let VoiceCompose::Recording(r) = std::mem::replace(&mut next, VoiceCompose::Idle) {
+                match r.finish() {
+                    Ok(clip) => {
+                        next = VoiceCompose::Preview { clip };
+                    }
+                    Err(e) => {
+                        app.chat_status = Some(format!("Recording failed: {e}"));
+                        next = VoiceCompose::Idle;
+                    }
+                }
+            }
+        } else if cancel {
+            // Drop the recorder; its `Drop` impl will signal the capture
+            // thread to stop.
+            next = VoiceCompose::Idle;
+        }
+    });
+    // Egui doesn't auto-repaint while a non-input task is running; nudge it
+    // so the timer/progress-bar update smoothly.
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(100));
+    next
+}
+
+fn render_preview(
+    app: &mut VoicetasticApp,
+    ui: &mut egui::Ui,
+    nodes: &std::collections::HashMap<u32, voicetastic_core::proto::NodeInfo>,
+    clip: RecordedClip,
+) -> VoiceCompose {
+    let mut send_now = false;
+    let mut delete_now = false;
+    let mut play_clicked = false;
+    let mut stop_clicked = false;
+    let is_playing =
+        app.playback_source == Some(PlaybackSource::Preview) && app.voice_playback.is_some();
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "🎙 Preview ({:.1}s, {} bytes)",
+            clip.duration.as_secs_f32(),
+            clip.opus_stream.len()
+        ));
+        if is_playing {
+            if inline_player(ui, app.voice_playback.as_ref()) {
+                stop_clicked = true;
+            }
+        } else if ui.button("▶ Play").clicked() {
+            play_clicked = true;
+        }
+        if ui.button("🗑 Delete").clicked() {
+            delete_now = true;
+        }
+        if ui.button("📤 Send").clicked() {
+            send_now = true;
+        }
+    });
+
+    if stop_clicked {
+        if let Some(h) = app.voice_playback.take() {
+            h.stop();
+        }
+        app.playback_source = None;
+    }
+
+    if play_clicked {
+        start_playback(app, &clip.opus_stream, PlaybackSource::Preview);
+    }
+
+    if delete_now {
+        if let Some(h) = app.voice_playback.take() {
+            h.stop();
+        }
+        app.playback_source = None;
+        return VoiceCompose::Idle;
+    }
+
+    if send_now {
+        if let Some(h) = app.voice_playback.take() {
+            h.stop();
+        }
+        app.playback_source = None;
+        let (ch, dest) = resolve_destination(app, nodes);
+        spawn_send_voice(app, clip, ch, dest);
+        return VoiceCompose::Idle;
+    }
+
+    VoiceCompose::Preview { clip }
+}
+
+fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest: Option<u32>) {
+    // Pick chunk_size + pacing from the live modem preset. Sending at
+    // MAX_BODY_SIZE (219 B) on slow presets like LongFast/LongModerate
+    // pushes each frame's airtime past 1 s, so a fixed 500 ms pacing
+    // overruns the firmware queue and most chunks are dropped before they
+    // ever hit the air. The recommended pairing comes from VOICE_PROTOCOL.md
+    // §2.1 / §4 and matches what the Android app uses.
+    let preset = app
+        .shared
+        .lock()
+        .lora
+        .as_ref()
+        .and_then(|l: &LoRaConfig| VoiceModemPreset::from_proto(l.modem_preset));
+    let chunk_size = preset
+        .map(VoiceModemPreset::recommended_chunk_size)
+        .unwrap_or(MAX_BODY_SIZE);
+    let pacing = preset
+        .map(VoiceModemPreset::pacing)
+        .unwrap_or_else(VoiceModemPreset::fallback_pacing);
+
+    // Scale FEC parity to message size. Real LoRa broadcast links
+    // routinely show 30–45 % per-chunk loss, so a fixed 8 parity shards
+    // can only ever heal short messages. For longer clips we add ~50 %
+    // parity (clamped to the protocol max of 128) so FEC alone closes
+    // most gaps and the NACK + retransmit loop only has to mop up.
+    let total_data = clip.opus_stream.len().div_ceil(chunk_size).max(1);
+    let parity_count = {
+        let target = total_data.div_ceil(2).max(8);
+        let cap = MAX_PARITY_PER_MESSAGE.min(255usize.saturating_sub(total_data));
+        target.min(cap).min(u8::MAX as usize) as u8
+    };
+
+    let cfg = BuildConfig {
+        message_id: random_message_id(),
+        stream_seq: 0,
+        codec: VoiceCodec::Opus,
+        codec_param: 0,
+        chunk_size,
+        parity_count,
+        last_in_stream: true,
+        encryption: None,
+    };
+    let encoded = match build_message(&clip.opus_stream, &cfg) {
+        Ok(e) => e,
+        Err(e) => {
+            app.shared.lock().status_msg = Some(format!("Voice build failed: {e}"));
+            return;
+        }
+    };
+
+    // Register frames so the inbound NACK watcher can retransmit them on
+    // demand. Skipped for broadcasts (the firmware drops want_ack on
+    // broadcast anyway and we have no single peer to receive NACKs from,
+    // although the assembler will still relay them — keeping the entry
+    // alive is cheap, so register unconditionally).
+    app.outgoing_voice
+        .register(cfg.message_id, &encoded, channel, dest);
+
+    let svc = app.service.clone();
+    let shared = Arc::clone(&app.shared);
+    let bytes = clip.opus_stream.clone();
+    let duration_ms = clip.duration.as_millis() as u32;
+    let to_num = dest.unwrap_or(BROADCAST_ADDR);
+    let total_chunks = encoded.total_data;
+    let total_bytes = clip.opus_stream.len();
+    let message_id = cfg.message_id;
+    let sending_label = format!("🎙 sending voice ({total_bytes} bytes, {total_chunks} chunks)…");
+    let sent_label = format!("🎙 voice message ({total_bytes} bytes, {total_chunks} chunks)");
+
+    // Push a placeholder entry now so the chat reflects the in-flight
+    // message immediately. `voice` stays `None` until the TX queue has
+    // actually transmitted every frame — that's what gates the ▶ Play
+    // button so users can't try to play back something that hasn't been
+    // sent yet.
+    shared.lock().chat_log.push(ChatEntry {
+        text: sending_label,
+        rx_time: 0,
+        outgoing: true,
+        channel,
+        from_num: 0,
+        to_num,
+        voice: None,
+        outgoing_voice_id: Some(message_id),
+        inbound_voice_id: None,
+    });
+
+    app.rt.spawn(async move {
+        // Subscribe to QueueStatus *before* sending so we don't miss the
+        // confirmation for the very first frame. `mesh_packet_id` lets
+        // us tick a "sent N/M" counter as each chunk leaves the radio
+        // (≈ goes on air), giving the chat live progress instead of a
+        // single transition from "sending …" to "sent".
+        let mut qs_rx = svc.subscribe_queue_status();
+        let want_ack = dest.is_some();
+        let total_frames = encoded.frames.len();
+        let total_data = encoded.total_data as usize;
+        let mut pending_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(total_frames);
+        // Subset of `pending_ids` that map to original DATA frames
+        // (indices < total_data). The user-visible "(N/M chunks)" counter
+        // only ticks for these so its denominator matches the final
+        // "voice message (... chunks)" label, which is also data-only.
+        // FEC parity frames still flow through `pending_ids` so the
+        // drain loop waits for the whole batch before flipping to
+        // "voice message", but they don't inflate the counter.
+        let mut pending_data_ids: std::collections::HashSet<u32> =
+            std::collections::HashSet::with_capacity(total_data);
+        let mut sent_on_air: usize = 0;
+        let mut send_err: Option<voicetastic_core::error::Error> = None;
+        for (i, frame) in encoded.frames.iter().enumerate() {
+            // Drain any QS events that landed since the last enqueue so
+            // the counter keeps up even if the firmware confirms faster
+            // than we can push. On `Lagged` we lose precise ticks for
+            // the missed events but must NOT abandon the loop — the
+            // drain at the bottom + the forced N/N at the end papers
+            // over the lost precision.
+            loop {
+                use tokio::sync::broadcast::error::TryRecvError;
+                match qs_rx.try_recv() {
+                    Ok(ev) => {
+                        if ev.mesh_packet_id != 0
+                            && pending_ids.remove(&ev.mesh_packet_id)
+                            && pending_data_ids.remove(&ev.mesh_packet_id)
+                        {
+                            sent_on_air += 1;
+                            update_sending_label(&shared, message_id, sent_on_air, total_data);
+                        }
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                    Err(TryRecvError::Lagged(_)) => continue,
+                }
+            }
+            match svc
+                .enqueue_voice_frame_with_id(frame.clone(), channel, dest, want_ack, pacing)
+                .await
+            {
+                Ok(id) => {
+                    pending_ids.insert(id);
+                    if i < total_data {
+                        pending_data_ids.insert(id);
+                    }
+                }
+                Err(e) => {
+                    send_err = Some(e);
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = send_err {
+            let mut st = shared.lock();
+            if let Some(entry) = st
+                .chat_log
+                .iter_mut()
+                .rev()
+                .find(|e| e.outgoing_voice_id == Some(message_id))
+            {
+                entry.text = format!("🎙 voice send failed: {e}");
+            }
+            st.status_msg = Some(format!("Voice send failed: {e}"));
+            return;
+        }
+
+        // Drain remaining QS confirmations until all enqueued packets
+        // are accounted for or a short safety timeout elapses. The
+        // firmware *should* emit a QS for every accepted packet but in
+        // practice can batch, drop, or report with `mesh_packet_id = 0`
+        // — so this loop is best-effort. On lag we keep going; on
+        // timeout we exit and force the visible counter to N/N below,
+        // because the for-loop completing already means every frame
+        // was handed to the radio successfully.
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pending_data_ids.is_empty() && tokio::time::Instant::now() < drain_deadline {
+            use tokio::sync::broadcast::error::RecvError;
+            let remaining = drain_deadline - tokio::time::Instant::now();
+            match tokio::time::timeout(remaining, qs_rx.recv()).await {
+                Ok(Ok(ev)) => {
+                    if ev.mesh_packet_id != 0
+                        && pending_ids.remove(&ev.mesh_packet_id)
+                        && pending_data_ids.remove(&ev.mesh_packet_id)
+                    {
+                        sent_on_air += 1;
+                        update_sending_label(&shared, message_id, sent_on_air, total_data);
+                    }
+                }
+                Ok(Err(RecvError::Lagged(_))) => continue,
+                Ok(Err(RecvError::Closed)) | Err(_) => break,
+            }
+        }
+
+        // Ensure the user sees a clean "N/N chunks" tick right before
+        // the final "voice message (... N chunks)" label, even if some
+        // QS events were lost / never matched. The for-loop completed
+        // successfully which means every data frame was accepted by
+        // the radio, so the count is honest.
+        if sent_on_air < total_data {
+            update_sending_label(&shared, message_id, total_data, total_data);
+        }
+
+        let mut st = shared.lock();
+        if let Some(entry) = st
+            .chat_log
+            .iter_mut()
+            .rev()
+            .find(|e| e.outgoing_voice_id == Some(message_id))
+        {
+            entry.text = sent_label;
+            entry.voice = Some(VoicePayload {
+                codec: VoiceCodec::Opus,
+                bytes,
+                duration_ms,
+            });
+        }
+    });
+}
+
+fn update_sending_label(
+    shared: &Arc<Mutex<SharedState>>,
+    message_id: u32,
+    sent: usize,
+    total: usize,
+) {
+    let label = format!("🎙 sending voice ({sent}/{total} chunks)…");
+    let mut st = shared.lock();
+    if let Some(entry) = st
+        .chat_log
+        .iter_mut()
+        .rev()
+        .find(|e| e.outgoing_voice_id == Some(message_id))
+    {
+        entry.text = label;
+    }
 }

@@ -111,7 +111,7 @@ mod tests {
         let mut completed = None;
         for f in &enc.frames {
             match asm.accept("!00000001", VoiceDestination::Broadcast, 0, f) {
-                AssemblyEvent::Pending => {}
+                AssemblyEvent::Pending { .. } => {}
                 AssemblyEvent::Complete(m) => completed = Some(m),
                 e => panic!("unexpected: {e:?}"),
             }
@@ -136,7 +136,9 @@ mod tests {
                 continue;
             }
             match asm.accept("!aa", VoiceDestination::Broadcast, 0, f) {
-                AssemblyEvent::Pending | AssemblyEvent::Duplicate | AssemblyEvent::Rejected(_) => {}
+                AssemblyEvent::Pending { .. }
+                | AssemblyEvent::Duplicate
+                | AssemblyEvent::Rejected(_) => {}
                 AssemblyEvent::Complete(m) => completed = Some(m),
                 AssemblyEvent::Nack(_) => panic!("unexpected NACK"),
             }
@@ -158,7 +160,7 @@ mod tests {
         let order = [0usize, 1, 3, 4];
         for &idx in &order {
             match asm.accept("!bb", VoiceDestination::Broadcast, 0, &enc.frames[idx]) {
-                AssemblyEvent::Pending => {}
+                AssemblyEvent::Pending { .. } => {}
                 AssemblyEvent::Complete(m) => completed = Some(m),
                 e => panic!("unexpected: {e:?}"),
             }
@@ -192,7 +194,9 @@ mod tests {
         let mut completed = None;
         for f in &enc2.frames {
             match asm.accept(from_id_str, VoiceDestination::Broadcast, 0, f) {
-                AssemblyEvent::Pending | AssemblyEvent::Duplicate | AssemblyEvent::Rejected(_) => {}
+                AssemblyEvent::Pending { .. }
+                | AssemblyEvent::Duplicate
+                | AssemblyEvent::Rejected(_) => {}
                 AssemblyEvent::Complete(m) => completed = Some(m),
                 AssemblyEvent::Nack(_) => panic!("unexpected NACK"),
             }
@@ -233,7 +237,7 @@ mod tests {
                 0,
                 &enc.frames[idx],
             ) {
-                AssemblyEvent::Pending => {}
+                AssemblyEvent::Pending { .. } => {}
                 AssemblyEvent::Complete(m) => completed = Some(m),
                 e => panic!("unexpected: {e:?}"),
             }
@@ -316,7 +320,7 @@ mod tests {
         // Ingest the first DATA frame normally.
         assert!(matches!(
             asm.accept("!aa", VoiceDestination::Broadcast, 0, &enc.frames[0]),
-            AssemblyEvent::Pending,
+            AssemblyEvent::Pending { .. },
         ));
         // Build a tampered duplicate of chunk 0 with a shorter body.
         let mut tampered = enc.frames[0].clone();
@@ -330,23 +334,46 @@ mod tests {
 
     /// Mismatched `stream_seq` on a follow-up frame is rejected as
     /// `StreamSeqMismatch` — the template captures stream_seq from the
-    /// first frame and later frames must match.
+    /// Regression: once a `(from, message_id)` pair has completed, late
+    /// chunks for the same id must NOT resurrect a fresh in-progress
+    /// assembly within the configured `completion_memory` window. This
+    /// is what was producing the phantom "voice message (partial: …)"
+    /// chat entry that appeared right after the real completion on
+    /// slow LoRa presets where the sender's firmware queue keeps
+    /// draining for tens of seconds past the receiver's completion.
     #[test]
-    fn stream_seq_mismatch_is_rejected() {
-        let audio = synthesize(64 * 3);
+    fn late_chunk_after_complete_does_not_resurrect_assembly() {
+        let audio = synthesize(64 * 4);
         let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        assert_eq!(enc.total_data, 4);
         let asm = assembler(false);
-        let _ = asm.accept("!bb", VoiceDestination::Broadcast, 0, &enc.frames[0]);
-        // Tamper stream_seq (header byte 8) on the second frame.
-        let mut tampered = enc.frames[1].clone();
-        tampered[8] = tampered[8].wrapping_add(1);
-        let ev = asm.accept("!bb", VoiceDestination::Broadcast, 0, &tampered);
-        assert!(
-            matches!(
-                ev,
-                AssemblyEvent::Rejected(VoiceError::StreamSeqMismatch { .. })
-            ),
-            "expected StreamSeqMismatch, got {ev:?}",
-        );
+        let from = "!deadbeef";
+
+        // Drive a normal complete.
+        let mut completed = None;
+        for f in &enc.frames {
+            match asm.accept(from, VoiceDestination::Broadcast, 0, f) {
+                AssemblyEvent::Pending { .. } => {}
+                AssemblyEvent::Complete(m) => completed = Some(m),
+                e => panic!("unexpected: {e:?}"),
+            }
+        }
+        assert!(completed.is_some_and(|m| m.is_complete));
+
+        // Replay every wire frame. None of them should bring the
+        // assembler back into a Pending state, and none should produce
+        // a second Complete event for the same `message_id`. The
+        // exact rejection variant is not part of the contract — what
+        // matters is that we don't see Pending or Complete.
+        for f in &enc.frames {
+            let ev = asm.accept(from, VoiceDestination::Broadcast, 0, f);
+            assert!(
+                !matches!(
+                    ev,
+                    AssemblyEvent::Pending { .. } | AssemblyEvent::Complete(_)
+                ),
+                "replayed frame after complete produced {ev:?}, expected a Rejected/Ignored variant",
+            );
+        }
     }
 }

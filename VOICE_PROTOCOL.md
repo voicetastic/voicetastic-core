@@ -79,6 +79,21 @@ duty-cycle limits, but the radio's queue still benefits from pacing; the
 recommended values above SHOULD be used regardless of the link to the
 radio.
 
+### 2.2 Firmware-queue backpressure
+
+In addition to the time-based pacing above, senders SHOULD honour the
+firmware's outbound queue depth, which Meshtastic devices advertise via
+`FromRadio.QueueStatus { res, free, maxlen, mesh_packet_id }` after every
+accept/drain. When `free` drops to a small low-water mark (the reference
+implementation uses **2**), the sender MUST pause until the next
+`QueueStatus` update before pushing another voice frame, with a safety
+timeout (≈ 2 s) so a missed update can't stall transmission indefinitely.
+
+Without this gate, a long voice burst can overflow the firmware's
+outbound queue and trigger an out-of-memory reboot on the sender device.
+NACK-driven retransmits MUST flow through the same paced + backpressured
+path as the initial DATA/PARITY frames.
+
 ---
 
 ## 3. Frame format
@@ -441,7 +456,13 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
   peer from starving everyone else).
 - `MAX_MESSAGE_BYTES = 255 × 219 = 55_845` (worst-case sum of data shards
   before FEC overhead). Refused beyond this.
-- `BLACKLIST_TTL = 60 s`, `BLACKLIST_MAX = 100`.
+- `BLACKLIST_TTL = 600 s`, `BLACKLIST_MAX = 100`. This is the
+  receiver's **completion-memory** window: once a `(from, message_id)`
+  pair has finalized (complete or partial), late chunks for that pair
+  are silently dropped for this long so the sender's firmware-queue
+  drain (which can outrun the receiver's completion by tens of seconds
+  on slow presets) doesn't resurrect a phantom partial reassembly.
+  The window should be ≥ the assembler's `message_timeout`.
 - `NACK_MAX_ROUNDS = 3` per message before the receiver gives up.
 - `NACK_WINDOW_MS = 1500` after the last seen chunk before issuing a NACK.
   Global NACK emission is bounded by `MAX_IN_PROGRESS_GLOBAL` per tick;

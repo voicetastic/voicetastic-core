@@ -93,13 +93,24 @@ pub enum ModemPreset {
 
 impl ModemPreset {
     /// Recommended inter-frame delay for adaptive pacing (see spec §2.1).
+    ///
+    /// Values are tuned so that `pacing >= air_time(recommended_chunk_size)`
+    /// for each preset (with ~30 % headroom for firmware CSMA, queue
+    /// drain, and ACK windows). Sending faster than this overruns the
+    /// firmware's small outbound queue and causes frames to be dropped
+    /// before they ever hit the air — which is exactly the failure mode
+    /// the receiver-side reassembler then has to chase with NACKs.
     pub fn pacing(self) -> Duration {
         Duration::from_millis(match self {
-            Self::ShortTurbo | Self::ShortFast => 100,
-            Self::ShortSlow | Self::MediumFast => 200,
-            Self::MediumSlow | Self::LongFast => 350,
-            Self::LongModerate | Self::LongSlow => 500,
-            Self::VeryLongSlow => 800,
+            Self::ShortTurbo => 150,
+            Self::ShortFast => 250,
+            Self::ShortSlow => 400,
+            Self::MediumFast => 500,
+            Self::MediumSlow => 700,
+            Self::LongFast => 900,
+            Self::LongModerate => 1200,
+            Self::LongSlow => 1800,
+            Self::VeryLongSlow => 3000,
         })
     }
 
@@ -116,5 +127,27 @@ impl ModemPreset {
     /// Default fallback when the radio's preset is unknown.
     pub fn fallback_pacing() -> Duration {
         Duration::from_millis(500)
+    }
+
+    /// Map the firmware's `LoRaConfig.modem_preset` enum value (i32) to
+    /// our local enum. Returns `None` for unknown values so callers can
+    /// fall back to safe defaults.
+    ///
+    /// Mirrors `meshtastic.Config.LoRaConfig.ModemPreset` integer values.
+    pub fn from_proto(value: i32) -> Option<Self> {
+        // SAFETY: numeric values come straight from the .proto enum.
+        // Keep this match in sync with `proto/meshtastic/config.proto`.
+        Some(match value {
+            0 => Self::LongFast,
+            1 => Self::LongSlow,
+            2 => Self::VeryLongSlow,
+            3 => Self::MediumSlow,
+            4 => Self::MediumFast,
+            5 => Self::ShortSlow,
+            6 => Self::ShortFast,
+            7 => Self::LongModerate,
+            8 => Self::ShortTurbo,
+            _ => return None,
+        })
     }
 }
