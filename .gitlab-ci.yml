@@ -123,20 +123,27 @@ release:
     # Patch workspace.package.version in root Cargo.toml.
     - |
       python3 - "$NEW_VERSION" <<'PY'
-      import re, sys, pathlib
+      import sys, pathlib, re
       new = sys.argv[1]
       p = pathlib.Path("Cargo.toml")
-      txt = p.read_text()
-      patched = re.sub(
-          r'(\[workspace\.package\][^\[]*?\nversion\s*=\s*")[^"]+(")',
-          lambda m: m.group(1) + new + m.group(2),
-          txt,
-          count=1,
-          flags=re.DOTALL,
-      )
-      if patched == txt:
+      lines = p.read_text().splitlines(keepends=True)
+      in_section = False
+      patched = False
+      for i, line in enumerate(lines):
+          stripped = line.strip()
+          if stripped.startswith("[") and stripped.endswith("]"):
+              in_section = stripped == "[workspace.package]"
+              continue
+          if in_section and re.match(r'\s*version\s*=\s*"[^"]*"', line):
+              lines[i] = re.sub(r'"[^"]*"', f'"{new}"', line, count=1)
+              patched = True
+              break
+      if not patched:
+          sys.stderr.write("---- Cargo.toml head ----\n")
+          sys.stderr.write("".join(lines[:30]))
           sys.exit("Failed to patch workspace.package.version in Cargo.toml")
-      p.write_text(patched)
+      p.write_text("".join(lines))
+      print(f"Patched workspace.package.version -> {new}")
       PY
     # Refresh Cargo.lock so workspace crate version entries match.
     - cargo update --workspace --offline || cargo update --workspace
