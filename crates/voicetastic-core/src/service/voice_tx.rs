@@ -117,6 +117,19 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
                 // Cap the wait so a missed/late QueueStatus can't stall
                 // the worker forever — re-check after the timeout and
                 // retry the send if the firmware still hasn't reported.
+                //
+                // Race note: the inbound handler uses `notify_one()`,
+                // which stores a permit if no waiter is currently
+                // registered. So a `QueueStatus` arriving between the
+                // `free` read above and the `.notified()` registration
+                // below cannot be lost — the next `.notified().await`
+                // consumes the stored permit and returns immediately,
+                // and we re-check `free` to confirm. (Earlier code used
+                // `notify_waiters()`, which only wakes already-registered
+                // waiters and silently dropped pre-arrival notifies,
+                // causing the worker to burn the full
+                // `RADIO_QUEUE_WAIT_TIMEOUT` per frame and the firmware
+                // queue to drain dry mid-burst.)
                 let waited_for = tokio::time::timeout(
                     RADIO_QUEUE_WAIT_TIMEOUT,
                     inner.radio_queue_notify.notified(),

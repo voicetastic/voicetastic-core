@@ -50,6 +50,15 @@ pub struct OutboundNack {
     pub channel: u32,
     pub frame: Vec<u8>,
     pub give_up: bool,
+    /// `message_id` of the in-progress message this NACK is for.
+    /// Diagnostic only.
+    pub message_id: u32,
+    /// Number of missing data indices this round is requesting.
+    /// Diagnostic only.
+    pub missing_count: usize,
+    /// 1-based round number (1 = first NACK, 2 = second, …).
+    /// Diagnostic only.
+    pub round: u8,
 }
 
 /// Receive-side state machine.
@@ -299,6 +308,9 @@ impl VoiceAssembler {
                     channel: state.channel,
                     frame,
                     give_up: false,
+                    message_id: state.header_template.message_id,
+                    missing_count: missing.len(),
+                    round: state.nack_rounds.saturating_add(1),
                 });
                 state.nack_rounds = state.nack_rounds.saturating_add(1);
                 state.last_chunk_at = now;

@@ -9,7 +9,7 @@
 //! [`MAX_RETRANSMITS_PER_MESSAGE`] retransmits have been issued, so the
 //! registry never grows unbounded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -42,19 +42,40 @@ pub struct OutgoingVoice {
     pub dest: Option<u32>,
     pub registered_at: Instant,
     pub retransmits: u8,
+    /// Earliest instant at which a new NACK round for this message is
+    /// allowed to consume more frames. Set after each `take_retransmit`
+    /// to `now + pacing × frames × 2` so the previous batch has time to
+    /// actually leave the radio (and reach the peer) before we honour
+    /// the next NACK. Without this guard, a remote receiver that fires
+    /// several NACK rounds while our paced TX is still in flight
+    /// causes the same chunks to be re-enqueued multiple times,
+    /// saturating the voice TX queue and the firmware's outbound queue
+    /// (`ERRNO_TOO_LARGE`/res=32) — visible as a sender that appears
+    /// stuck for tens of minutes until reboot.
+    pub cooldown_until: Option<Instant>,
+    /// Data-chunk indices currently in flight: either already enqueued
+    /// on the voice TX worker or just handed to the radio but not yet
+    /// confirmed. `take_retransmit` filters incoming NACK lists against
+    /// this set and adds the indices it returns; the watcher calls
+    /// [`OutgoingVoiceRegistry::mark_chunk_sent`] when the worker has
+    /// actually transmitted the frame, releasing the slot so a later
+    /// NACK can request it again.
+    pub pending_chunks: HashSet<u8>,
 }
 
 impl OutgoingVoice {
-    /// Collect the wire frames whose `chunk_index` is listed in `missing`.
-    /// Indices outside `[0..total_data]` are ignored.
-    pub fn frames_for(&self, missing: &[u8]) -> Vec<Vec<u8>> {
+    /// Collect `(chunk_index, wire_frame)` pairs for chunks listed in
+    /// `missing` that are *not* already in flight. Indices outside
+    /// `[0..total_data]` and chunks already present in `pending_chunks`
+    /// are skipped.
+    pub fn frames_for(&self, missing: &[u8]) -> Vec<(u8, Vec<u8>)> {
         let total = self.total_data as usize;
         missing
             .iter()
             .filter_map(|&idx| {
                 let i = idx as usize;
-                if i < total {
-                    Some(self.frames[i].clone())
+                if i < total && !self.pending_chunks.contains(&idx) {
+                    Some((idx, self.frames[i].clone()))
                 } else {
                     None
                 }
@@ -119,25 +140,91 @@ impl OutgoingVoiceRegistry {
                 dest,
                 registered_at: now,
                 retransmits: 0,
+                cooldown_until: None,
+                pending_chunks: HashSet::new(),
             },
         );
     }
 
+    /// Mark a previously-pending chunk as actually transmitted by the
+    /// voice TX worker, releasing it so a subsequent NACK can request
+    /// it again. No-op if the message has been GC'd or the chunk was
+    /// not pending.
+    pub fn mark_chunk_sent(&self, message_id: u32, chunk_index: u8) {
+        let mut map = self.inner.lock();
+        if let Some(entry) = map.get_mut(&message_id) {
+            entry.pending_chunks.remove(&chunk_index);
+        }
+    }
+
     /// Look up an entry, bump its retransmit counter, and return the frames
-    /// to resend. Returns `None` if no entry exists, the TTL elapsed, or
-    /// the retransmit budget is exhausted.
-    pub fn take_retransmit(&self, message_id: u32, missing: &[u8]) -> Option<Vec<Vec<u8>>> {
+    /// to resend. Returns `None` if no entry exists, the TTL elapsed, the
+    /// retransmit budget is exhausted, or a previous retransmit for this
+    /// message is still draining (cooldown window).
+    ///
+    /// `pacing` is the current per-frame TX pacing (modem-preset dependent);
+    /// it is used to compute the cooldown so the cooldown matches the
+    /// time the previous batch needs to actually leave the radio.
+    pub fn take_retransmit(
+        &self,
+        message_id: u32,
+        missing: &[u8],
+        pacing: Duration,
+    ) -> Option<Vec<(u8, Vec<u8>)>> {
         let ttl = self.retain_ttl();
         let mut map = self.inner.lock();
         let entry = map.get_mut(&message_id)?;
-        if Instant::now().duration_since(entry.registered_at) >= ttl {
+        let now = Instant::now();
+        if now.duration_since(entry.registered_at) >= ttl {
             map.remove(&message_id);
             return None;
         }
         if entry.retransmits >= MAX_RETRANSMITS_PER_MESSAGE {
             return None;
         }
+        if let Some(until) = entry.cooldown_until
+            && now < until
+        {
+            // Previous retransmit batch for this message is still being
+            // paced out by the worker (or in flight on the air). Drop
+            // this NACK round — once the batch lands the peer will
+            // (re)compute its missing-set and NACK again if it really
+            // needs more.
+            return None;
+        }
+        // Filter out chunks already in flight for this message so two
+        // overlapping NACK rounds can't enqueue the same chunk twice.
+        let frames = entry.frames_for(missing);
+        if frames.is_empty() {
+            return None;
+        }
+        // Mark these chunks pending; the watcher will clear them via
+        // `mark_chunk_sent` once the worker has actually transmitted
+        // each frame.
+        for (idx, _) in &frames {
+            entry.pending_chunks.insert(*idx);
+        }
         entry.retransmits = entry.retransmits.saturating_add(1);
-        Some(entry.frames_for(missing))
+        // Cooldown ≈ time the just-enqueued batch needs to actually
+        // leave the radio + slack for the peer's NACK round trip.
+        //
+        // We scale by `max(frames, total_data)` rather than just
+        // `frames.len()` so that an early small NACK (e.g. 3 missing
+        // chunks) still parks the message long enough for the *bulk*
+        // of the original burst to land — otherwise the next NACK
+        // round arrives while dozens of chunks from the original
+        // burst are still in our worker queue and re-enqueues them
+        // on top, ballooning the queue depth.
+        //
+        // Clamp the lower end so a degenerate pacing=0 doesn't
+        // disable the guard, and the upper end to the retain TTL
+        // (the entry would be GC'd past that point anyway).
+        let drain_frames = frames.len().max(entry.total_data as usize) as u32;
+        let cooldown = pacing
+            .saturating_mul(drain_frames)
+            .saturating_mul(2)
+            .clamp(Duration::from_secs(2), ttl);
+        entry.cooldown_until = Some(now + cooldown);
+        Some(frames)
     }
 }

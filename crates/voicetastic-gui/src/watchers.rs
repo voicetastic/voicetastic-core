@@ -265,6 +265,13 @@ pub fn spawn_watchers(
                                     continue;
                                 }
                             };
+                            tracing::debug!(
+                                to = %nack.from,
+                                message_id = nack.message_id,
+                                missing = nack.missing_count,
+                                round = nack.round,
+                                "voice: emitting NACK"
+                            );
                             // Route the NACK through the voice TX queue
                             // (rather than `send_data` directly) so it
                             // shares the firmware-driven backpressure +
@@ -338,36 +345,85 @@ pub fn spawn_watchers(
                                     // Selective retransmit: resend exactly
                                     // the data chunks the receiver lists as
                                     // missing. `take_retransmit` enforces
-                                    // TTL + budget caps.
+                                    // TTL + budget caps + per-message
+                                    // cooldown (so overlapping NACK rounds
+                                    // don't pile re-enqueues onto the
+                                    // voice TX queue while the previous
+                                    // batch is still being paced out).
+                                    tracing::debug!(
+                                        from = %from_id,
+                                        message_id = info.message_id,
+                                        missing = info.missing.len(),
+                                        give_up = info.give_up,
+                                        "voice: NACK received"
+                                    );
                                     if info.give_up { continue; }
-                                    if let Some(frames) =
-                                        outgoing.take_retransmit(info.message_id, &info.missing)
-                                    {
+                                    let pacing = s
+                                        .lock()
+                                        .lora
+                                        .as_ref()
+                                        .and_then(|l| {
+                                            VoiceModemPreset::from_proto(l.modem_preset)
+                                        })
+                                        .map(VoiceModemPreset::pacing)
+                                        .unwrap_or_else(VoiceModemPreset::fallback_pacing);
+                                    let retransmit = outgoing.take_retransmit(
+                                        info.message_id,
+                                        &info.missing,
+                                        pacing,
+                                    );
+                                    match retransmit.as_ref() {
+                                        Some(frames) => tracing::debug!(
+                                            message_id = info.message_id,
+                                            requested = info.missing.len(),
+                                            scheduled = frames.len(),
+                                            "voice: retransmit scheduled"
+                                        ),
+                                        None => tracing::debug!(
+                                            message_id = info.message_id,
+                                            requested = info.missing.len(),
+                                            "voice: retransmit skipped (TTL/budget/cooldown)"
+                                        ),
+                                    }
+                                    if let Some(frames) = retransmit {
                                         let svc = svc.clone();
+                                        let outgoing = Arc::clone(&outgoing);
                                         let dest_node = d.from;
                                         let channel = d.channel;
-                                        let pacing = s
-                                            .lock()
-                                            .lora
-                                            .as_ref()
-                                            .and_then(|l| {
-                                                VoiceModemPreset::from_proto(l.modem_preset)
-                                            })
-                                            .map(VoiceModemPreset::pacing)
-                                            .unwrap_or_else(VoiceModemPreset::fallback_pacing);
+                                        let message_id = info.message_id;
                                         tokio::spawn(async move {
-                                            for frame in frames {
-                                                if let Err(e) = svc
-                                                    .enqueue_voice_frame(
+                                            // Serialise retransmits through the worker the
+                                            // same way the initial burst does: each call
+                                            // awaits the worker's actual `send_data`, so
+                                            // we never push the next retransmit frame
+                                            // until the previous one has left the
+                                            // mpsc. This caps the voice TX queue's
+                                            // contribution from a retransmit task at 1
+                                            // slot regardless of how many chunks the
+                                            // peer asked for.
+                                            //
+                                            // `mark_chunk_sent` clears the pending flag
+                                            // so a *later* NACK round can request the
+                                            // same chunk again if it's still missing,
+                                            // while the dedup in `take_retransmit`
+                                            // prevents two overlapping NACK rounds
+                                            // from re-enqueuing chunks still in flight.
+                                            for (idx, frame) in frames {
+                                                let r = svc
+                                                    .enqueue_voice_frame_with_id(
                                                         frame,
                                                         channel,
                                                         Some(dest_node),
                                                         false,
                                                         pacing,
                                                     )
-                                                    .await
-                                                {
-                                                    tracing::warn!(?e, "voice retransmit failed");
+                                                    .await;
+                                                outgoing.mark_chunk_sent(message_id, idx);
+                                                if let Err(e) = r {
+                                                    tracing::warn!(
+                                                        ?e,
+                                                        "voice retransmit failed"
+                                                    );
                                                     break;
                                                 }
                                             }

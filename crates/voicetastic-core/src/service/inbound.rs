@@ -135,7 +135,15 @@ impl MeshService {
                     "queue_status"
                 );
                 *self.inner.radio_queue_free.lock() = qs.free;
-                self.inner.radio_queue_notify.notify_waiters();
+                // `notify_one` (not `notify_waiters`): if the voice TX
+                // worker isn't currently parked on `.notified()` — the
+                // common case during a frame-by-frame send burst — the
+                // permit is stored and consumed by the next call,
+                // closing the check-then-wait race that `notify_waiters`
+                // had (which would silently drop pre-arrival notifies
+                // and stall the worker for the full backpressure
+                // timeout per frame).
+                self.inner.radio_queue_notify.notify_one();
                 let _ = self
                     .inner
                     .queue_status_tx
