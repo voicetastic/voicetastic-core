@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use super::super::consts::{BLACKLIST_TTL, NACK_MAX_ROUNDS, NACK_WINDOW_MS};
+use super::super::types::VoiceCodec;
 
 /// After this many post-template validation failures (codec / total_data /
 /// stream_seq mismatch) on the same in-progress entry, the entry is
@@ -32,6 +33,18 @@ pub struct AssemblerConfig {
     /// by tens of seconds on slow presets) doesn't resurrect a phantom
     /// partial reassembly.
     pub completion_memory: Duration,
+    /// Codecs the local stack can actually decode. Frames whose header
+    /// advertises a codec outside this set are rejected with
+    /// [`super::super::error::VoiceError::UnsupportedCodec`] before any
+    /// reassembly state is allocated, so an Opus-only build won't waste
+    /// a per-sender slot trying to reassemble an AMR-NB message it can
+    /// never play back.
+    ///
+    /// `None` (the default) means "accept any known codec" — i.e. the
+    /// pre-existing behaviour. Callers that know their playback layer is
+    /// restricted (CLI's `voice send` is AMR-NB only, GUI without the
+    /// `audio` feature has no decoders at all) should populate this.
+    pub supported_codecs: Option<Vec<VoiceCodec>>,
 }
 
 impl Default for AssemblerConfig {
@@ -50,6 +63,7 @@ impl Default for AssemblerConfig {
             max_nack_rounds: NACK_MAX_ROUNDS,
             nack_window: Duration::from_millis(NACK_WINDOW_MS),
             completion_memory: BLACKLIST_TTL,
+            supported_codecs: None,
         }
     }
 }

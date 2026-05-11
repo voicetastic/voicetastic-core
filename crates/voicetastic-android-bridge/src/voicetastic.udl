@@ -82,10 +82,12 @@ enum VoiceError {
     "TotalMismatch",
     "StreamSeqMismatch",
     "UnknownCodec",
+    "UnsupportedCodec",
     "Blacklisted",
     "PerSenderCap",
     "EncryptedNoPsk",
     "BadFromForEncrypted",
+    "Rng",
 };
 
 // -----------------------------------------------------------------------------

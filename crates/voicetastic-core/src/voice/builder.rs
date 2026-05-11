@@ -38,10 +38,15 @@ pub struct EncodedMessage {
 }
 
 /// Generate a non-zero random `u32` suitable for use as a `message_id`.
-pub fn random_message_id() -> u32 {
+///
+/// Fails with [`VoiceError::Rng`] if the OS RNG is unreachable. Callers
+/// that want a panic-on-failure semantics can `.expect()` the result; the
+/// fallible signature exists so sandboxed / seccomp'd hosts surface a
+/// clean error instead of aborting the process.
+pub fn random_message_id() -> Result<u32> {
     let mut buf = [0u8; 4];
-    getrandom::fill(&mut buf).expect("OS RNG");
-    u32::from_be_bytes(buf).max(1)
+    getrandom::fill(&mut buf).map_err(|e| VoiceError::Rng(e.to_string()))?;
+    Ok(u32::from_be_bytes(buf).max(1))
 }
 
 /// Chunk `audio` (codec frame bytes — no container header) into frames.
@@ -142,10 +147,9 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
             total_data,
             parity_count,
         };
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        header.write_into(&mut header_bytes);
+        let header_bytes = header.serialize();
         let body = match &cfg.encryption {
-            Some(key) => encrypt_body(key, &header_bytes, body_plain),
+            Some(key) => encrypt_body(key, &header_bytes, body_plain)?,
             None => body_plain.to_vec(),
         };
         if HEADER_SIZE + body.len() > MAX_PACKET_SIZE {

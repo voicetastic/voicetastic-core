@@ -47,7 +47,7 @@ pub async fn send(
     connect(&svc, device).await?;
 
     let cfg = BuildConfig {
-        message_id: random_message_id(),
+        message_id: random_message_id().context("generating message id (OS RNG)")?,
         stream_seq: 0,
         codec: VoiceCodec::AmrNb,
         codec_param: bitrate,

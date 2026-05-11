@@ -14,6 +14,7 @@ mod state;
 pub use config::AssemblerConfig;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -31,7 +32,7 @@ use super::types::{PacketType, VoiceDestination};
 
 use config::MAX_VALIDATION_STRIKES;
 use finalize::{finalize, push_blacklist};
-use state::{AssemblerInner, AssemblyState};
+use state::{AssemblerInner, AssemblyState, SenderKey};
 
 /// Outcome of [`VoiceAssembler::tick`].
 #[derive(Debug)]
@@ -138,7 +139,7 @@ impl VoiceAssembler {
             return Ok(AssemblyEvent::Nack(parse_nack_body(&header, body)?));
         }
 
-        let key = (from.to_string(), header.message_id);
+        let key: SenderKey = (Arc::<str>::from(from), header.message_id);
         let mut inner = self.inner.lock();
         let now = Instant::now();
 
@@ -150,12 +151,19 @@ impl VoiceAssembler {
 
         // Apply per-sender / global caps only when this is a *new* message.
         if !inner.in_progress.contains_key(&key) {
-            apply_caps(&mut inner, from, now)?;
+            apply_caps(&mut inner, &key.0, now)?;
         }
 
         // Reject unknown codecs (spec §3.2).
         if let super::types::VoiceCodec::Unknown(b) = header.codec {
             return Err(VoiceError::UnknownCodec(b));
+        }
+        // Reject codecs the receiver explicitly doesn't support, so we don't
+        // waste a per-sender slot reassembling a message we can't play back.
+        if let Some(allow) = &self.cfg.lock().supported_codecs
+            && !allow.contains(&header.codec)
+        {
+            return Err(VoiceError::UnsupportedCodec(header.codec));
         }
 
         // Decrypt body if needed (uses original header bytes as AAD).
@@ -166,7 +174,7 @@ impl VoiceAssembler {
         let state = match inner.in_progress.get_mut(&key) {
             Some(s) => s,
             None => {
-                let cnt = inner.per_sender.entry(from.to_string()).or_default();
+                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
                 *cnt = cnt.saturating_add(1);
                 inner
                     .in_progress
@@ -181,7 +189,7 @@ impl VoiceAssembler {
             state.validation_strikes = state.validation_strikes.saturating_add(1);
             if state.validation_strikes >= MAX_VALIDATION_STRIKES {
                 inner.in_progress.remove(&key);
-                let cnt = inner.per_sender.entry(from.to_string()).or_default();
+                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
                 *cnt = cnt.saturating_sub(1);
                 push_blacklist(&mut inner.blacklist, key, now);
             }
@@ -225,7 +233,7 @@ impl VoiceAssembler {
                     channel,
                 });
             };
-            let cnt = inner.per_sender.entry(from.to_string()).or_default();
+            let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
             *cnt = cnt.saturating_sub(1);
             push_blacklist(&mut inner.blacklist, key.clone(), now);
             let msg = finalize(from, &key, state, true);
@@ -279,8 +287,10 @@ impl VoiceAssembler {
         let timeout = cfg.message_timeout;
         let max_nack_rounds = cfg.max_nack_rounds;
 
-        // Snapshot keys to satisfy the borrow checker.
-        let keys: Vec<(String, u32)> = inner.in_progress.keys().cloned().collect();
+        // Snapshot keys to satisfy the borrow checker. Cloning each
+        // `SenderKey` here is just an `Arc<str>` refcount bump + a `u32`
+        // copy — cheap even with the per-sender / global cap maxed out.
+        let keys: Vec<SenderKey> = inner.in_progress.keys().cloned().collect();
         for key in keys {
             let Some(state) = inner.in_progress.get_mut(&key) else {
                 continue;
@@ -296,7 +306,7 @@ impl VoiceAssembler {
                 let Some(state) = inner.in_progress.remove(&key) else {
                     continue;
                 };
-                let cnt = inner.per_sender.entry(key.0.clone()).or_default();
+                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
                 *cnt = cnt.saturating_sub(1);
                 push_blacklist(&mut inner.blacklist, key.clone(), now);
                 if cfg.partial_play_on_timeout {
@@ -321,7 +331,7 @@ impl VoiceAssembler {
                     false,
                 );
                 nacks.push(OutboundNack {
-                    from: key.0.clone(),
+                    from: key.0.to_string(),
                     channel: state.channel,
                     frame,
                     give_up: false,
@@ -347,16 +357,16 @@ impl VoiceAssembler {
 // to unit-test independently.
 // ---------------------------------------------------------------------------
 
-fn prune_blacklist(bl: &mut Vec<((String, u32), Instant)>, now: Instant, ttl: std::time::Duration) {
+fn prune_blacklist(bl: &mut Vec<(SenderKey, Instant)>, now: Instant, ttl: std::time::Duration) {
     bl.retain(|(_, t)| now.duration_since(*t) < ttl);
 }
 
 /// Enforce per-sender and global in-progress caps. May evict the globally
 /// oldest entry to make room.
-fn apply_caps(inner: &mut AssemblerInner, from: &str, now: Instant) -> Result<()> {
+fn apply_caps(inner: &mut AssemblerInner, from: &Arc<str>, now: Instant) -> Result<()> {
     let in_use = *inner.per_sender.get(from).unwrap_or(&0);
     if in_use >= MAX_IN_PROGRESS_PER_SENDER {
-        warn!(from, "voice per-sender cap reached; dropping new message");
+        warn!(from = %from, "voice per-sender cap reached; dropping new message");
         return Err(VoiceError::PerSenderCap(from.to_string()));
     }
     if inner.in_progress.len() >= MAX_IN_PROGRESS_GLOBAL
@@ -368,7 +378,7 @@ fn apply_caps(inner: &mut AssemblerInner, from: &str, now: Instant) -> Result<()
     {
         debug!(victim_from = %victim.0, victim_id = victim.1, "voice global cap; evicting");
         if inner.in_progress.remove(&victim).is_some() {
-            let cnt = inner.per_sender.entry(victim.0.clone()).or_default();
+            let cnt = inner.per_sender.entry(Arc::clone(&victim.0)).or_default();
             *cnt = cnt.saturating_sub(1);
         }
         push_blacklist(&mut inner.blacklist, victim, now);

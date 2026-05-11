@@ -1,6 +1,7 @@
 //! Per-message reassembly state and the shared `AssemblerInner` table.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -8,6 +9,15 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use super::super::error::{Result, VoiceError};
 use super::super::header::ChunkHeader;
 use super::super::types::VoiceDestination;
+
+/// Map key for in-progress assembly entries: `(sender_id, message_id)`.
+///
+/// Stored as `Arc<str>` rather than `String` so the per-tick key snapshot
+/// in [`super::VoiceAssembler::tick`] and the per-frame `push_blacklist` /
+/// eviction paths can clone the sender id with a refcount bump instead of
+/// a fresh allocation. With many concurrent senders on a busy mesh this
+/// is the single hottest allocation in the receive path.
+pub(super) type SenderKey = (Arc<str>, u32);
 
 /// One in-progress voice message, keyed by `(from_id, message_id)` in
 /// [`AssemblerInner::in_progress`].
@@ -136,8 +146,8 @@ impl AssemblyState {
 /// Shared in-progress reassembly table + per-sender counts + recent
 /// completion/eviction blacklist.
 pub(super) struct AssemblerInner {
-    pub(super) in_progress: HashMap<(String, u32), AssemblyState>,
+    pub(super) in_progress: HashMap<SenderKey, AssemblyState>,
     /// Per-sender count of in-progress entries, for rate-limiting.
-    pub(super) per_sender: HashMap<String, usize>,
-    pub(super) blacklist: Vec<((String, u32), Instant)>,
+    pub(super) per_sender: HashMap<Arc<str>, usize>,
+    pub(super) blacklist: Vec<(SenderKey, Instant)>,
 }

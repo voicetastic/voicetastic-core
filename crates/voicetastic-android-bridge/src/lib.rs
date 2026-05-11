@@ -72,6 +72,8 @@ pub enum VoiceError {
     StreamSeqMismatch,
     #[error("unknown codec byte")]
     UnknownCodec,
+    #[error("codec is not supported by this receiver")]
+    UnsupportedCodec,
     #[error("(from, message_id) is on the recently-completed blacklist")]
     Blacklisted,
     #[error("per-sender in-flight cap reached")]
@@ -80,6 +82,8 @@ pub enum VoiceError {
     EncryptedNoPsk,
     #[error("`from` field is not a valid !hex8 node id (required for encrypted frames)")]
     BadFromForEncrypted,
+    #[error("OS RNG unavailable")]
+    Rng,
 }
 
 impl From<v::VoiceError> for VoiceError {
@@ -109,10 +113,12 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::TotalMismatch { .. } => Self::TotalMismatch,
             v::VoiceError::StreamSeqMismatch { .. } => Self::StreamSeqMismatch,
             v::VoiceError::UnknownCodec(_) => Self::UnknownCodec,
+            v::VoiceError::UnsupportedCodec(_) => Self::UnsupportedCodec,
             v::VoiceError::Blacklisted => Self::Blacklisted,
             v::VoiceError::PerSenderCap(_) => Self::PerSenderCap,
             v::VoiceError::EncryptedNoPsk => Self::EncryptedNoPsk,
             v::VoiceError::BadFromForEncrypted(_) => Self::BadFromForEncrypted,
+            v::VoiceError::Rng(_) => Self::Rng,
         }
     }
 }
@@ -189,7 +195,12 @@ impl From<v::EncodedMessage> for EncodedMessage {
 }
 
 pub fn random_message_id() -> u32 {
-    v::random_message_id()
+    // Bridge keeps the infallible signature: Android always has a working
+    // OS RNG, and panicking here would only happen if /dev/urandom is
+    // unavailable at process start — a configuration error worth surfacing
+    // loudly. Desktop callers should use `voicetastic_core::voice::random_message_id`
+    // directly to get the fallible variant.
+    v::random_message_id().expect("OS RNG unavailable")
 }
 
 pub fn detect_version(payload: Vec<u8>) -> Option<u8> {
@@ -417,6 +428,11 @@ impl From<AssemblerConfig> for v::AssemblerConfig {
             max_nack_rounds: c.max_nack_rounds,
             nack_window: Duration::from_millis(c.nack_window_ms),
             completion_memory: Duration::from_millis(c.completion_memory_ms),
+            // Bridge surface doesn't expose a codec allowlist yet (the
+            // Android UI hasn't grown a "which codecs do we play back?"
+            // setting). `None` keeps the legacy behaviour: accept any
+            // known codec, defer codec-mismatch errors to playback.
+            supported_codecs: None,
         }
     }
 }

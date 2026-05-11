@@ -5,14 +5,10 @@ use std::time::Instant;
 
 use super::super::consts::BLACKLIST_MAX;
 use super::super::message::VoiceMessage;
-use super::state::AssemblyState;
+use super::state::{AssemblyState, SenderKey};
 
 /// Append `key` to the blacklist, capped at [`BLACKLIST_MAX`]. Idempotent.
-pub(super) fn push_blacklist(
-    bl: &mut Vec<((String, u32), Instant)>,
-    key: (String, u32),
-    now: Instant,
-) {
+pub(super) fn push_blacklist(bl: &mut Vec<(SenderKey, Instant)>, key: SenderKey, now: Instant) {
     if bl.iter().any(|(k, _)| *k == key) {
         return;
     }
@@ -28,7 +24,7 @@ pub(super) fn push_blacklist(
 /// see a stable buffer layout.
 pub(super) fn finalize(
     from: &str,
-    key: &(String, u32),
+    key: &SenderKey,
     state: AssemblyState,
     complete: bool,
 ) -> VoiceMessage {

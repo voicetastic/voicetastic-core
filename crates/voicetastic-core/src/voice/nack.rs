@@ -44,9 +44,7 @@ pub fn build_nack(
         parity_count,
     };
     let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
-    let mut hb = [0u8; HEADER_SIZE];
-    header.write_into(&mut hb);
-    frame.extend_from_slice(&hb);
+    frame.extend_from_slice(&header.serialize());
     frame.extend_from_slice(&body);
     frame
 }

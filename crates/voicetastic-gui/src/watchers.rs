@@ -18,6 +18,13 @@ use crate::state::{ChatEntry, Section, SharedState, VoicePayload};
 /// Spawn a watcher for a single `tokio::sync::watch` channel that copies the
 /// new value into `SharedState` via `apply` and respects the dirty flag at
 /// `dirty_for` (if `Some`).
+///
+/// Race-freedom note: the `if !st.dirty.contains(...)` check and the
+/// corresponding `st.dirty.insert(...)` on the UI side both run while
+/// holding `SharedState`'s mutex, so check-then-write is atomic and
+/// in-progress edits cannot be clobbered by a watcher write that landed
+/// between the user's read and write. Do not move the dirty check out of
+/// the macro's `$state` critical section.
 macro_rules! spawn_watch {
     ($rt:expr, $rx:expr, $shared:expr, $ctx:expr, |$value:ident, $state:ident| $apply:block) => {{
         let mut rx = $rx;

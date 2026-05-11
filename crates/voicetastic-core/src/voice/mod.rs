@@ -262,6 +262,31 @@ mod tests {
         );
     }
 
+    /// Codec known to the wire (e.g. AMR-NB byte 0) but not in the
+    /// receiver's `supported_codecs` allowlist is rejected with
+    /// `UnsupportedCodec` *before* any reassembly state is allocated.
+    /// Otherwise an Opus-only build would waste a per-sender slot
+    /// reassembling an AMR-NB message it can never play back.
+    #[test]
+    fn unsupported_codec_is_rejected_when_allowlist_set() {
+        let audio = synthesize(64 * 2);
+        // Default cfg uses Opus on the sender side.
+        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        // Receiver only accepts AMR-NB.
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            supported_codecs: Some(vec![VoiceCodec::AmrNb]),
+            ..Default::default()
+        });
+        let ev = asm.accept("!aa", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        assert!(
+            matches!(
+                ev,
+                AssemblyEvent::Rejected(VoiceError::UnsupportedCodec(VoiceCodec::Opus))
+            ),
+            "expected UnsupportedCodec(Opus), got {ev:?}",
+        );
+    }
+
     /// Spec §7: encrypted frames whose `from` is not a valid !hex8 must be
     /// rejected (otherwise the receiver would silently derive a wrong key).
     #[test]

@@ -45,11 +45,15 @@ pub fn derive_key(channel_psk: &[u8], message_id: u32, from_node_num: u32) -> En
 
 /// Encrypt `plaintext` under `key` with random nonce, binding the 12-byte
 /// `header_aad`. Returns `nonce || ciphertext || tag`.
-pub fn encrypt_body(key: &EnvelopeKey, header_aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+///
+/// Fails with [`VoiceError::Rng`] if the OS RNG is unreachable (sandboxed /
+/// seccomp'd hosts, /dev/urandom not mounted, …). The AES-GCM encryption
+/// step itself is infallible for valid inputs.
+pub fn encrypt_body(key: &EnvelopeKey, header_aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let aes_key = Key::<Aes256Gcm>::from_slice(&key.0);
     let cipher = Aes256Gcm::new(aes_key);
     let mut nonce_bytes = [0u8; GCM_NONCE_LEN];
-    getrandom::fill(&mut nonce_bytes).expect("OS RNG");
+    getrandom::fill(&mut nonce_bytes).map_err(|e| VoiceError::Rng(e.to_string()))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ct = cipher
         .encrypt(
@@ -63,7 +67,7 @@ pub fn encrypt_body(key: &EnvelopeKey, header_aad: &[u8], plaintext: &[u8]) -> V
     let mut out = Vec::with_capacity(GCM_NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
-    out
+    Ok(out)
 }
 
 /// Reverse of [`encrypt_body`]. Verifies the GCM tag against `header_aad`.
@@ -95,7 +99,7 @@ mod tests {
         let key = derive_key(b"psk", 0xDEADBEEF, 0x12345678);
         let header = [0u8; HEADER_SIZE];
         let pt = b"some plaintext";
-        let ct = encrypt_body(&key, &header, pt);
+        let ct = encrypt_body(&key, &header, pt).unwrap();
         assert!(ct.len() >= GCM_NONCE_LEN + GCM_TAG_LEN);
         let pt2 = decrypt_body(&key, &header, &ct).unwrap();
         assert_eq!(pt2, pt);

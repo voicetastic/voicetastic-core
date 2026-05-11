@@ -62,6 +62,12 @@ impl VoicetasticApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Runtime>, service: MeshService) -> Self {
         let shared = Arc::new(Mutex::new(SharedState::default()));
         let settings = SettingsApi::open();
+        // NB: the `..AssemblerConfig::default()` spread is safe here because
+        // this is the single writer of the config at construction time. Do
+        // NOT copy this pattern into `apply_voice_settings` / `apply_lora_*`
+        // — multiple call sites using the spread will silently clobber each
+        // other's field contributions. Use `VoiceAssembler::update_config`
+        // for in-place mutation after construction.
         let voice_assembler = Arc::new(VoiceAssembler::new(AssemblerConfig {
             message_timeout: std::time::Duration::from_secs(
                 settings.reassembly_timeout_secs() as u64

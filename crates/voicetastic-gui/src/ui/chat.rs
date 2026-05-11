@@ -604,8 +604,15 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         target.min(cap).min(u8::MAX as usize) as u8
     };
 
+    let message_id = match random_message_id() {
+        Ok(id) => id,
+        Err(e) => {
+            app.shared.lock().status_msg = Some(format!("Voice send aborted: {e}"));
+            return;
+        }
+    };
     let cfg = BuildConfig {
-        message_id: random_message_id(),
+        message_id,
         stream_seq: 0,
         codec: clip.codec,
         codec_param: clip.codec_param,

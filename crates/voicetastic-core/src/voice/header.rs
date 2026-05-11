@@ -31,9 +31,13 @@ impl ChunkHeader {
         b
     }
 
-    /// Serialise into the leading 12 bytes of `out`. Panics if `out.len() < 12`.
-    pub fn write_into(&self, out: &mut [u8]) {
-        assert!(out.len() >= HEADER_SIZE);
+    /// Serialise to a fixed 12-byte buffer.
+    ///
+    /// Returning a `[u8; HEADER_SIZE]` instead of taking `&mut [u8]` removes
+    /// the previous `assert!(out.len() >= HEADER_SIZE)` panic risk for any
+    /// future caller that hands us a too-small buffer.
+    pub(crate) fn serialize(&self) -> [u8; HEADER_SIZE] {
+        let mut out = [0u8; HEADER_SIZE];
         out[0] = PROTOCOL_VERSION;
         out[1] = self.type_flags_byte();
         out[2..6].copy_from_slice(&self.message_id.to_be_bytes());
@@ -43,6 +47,7 @@ impl ChunkHeader {
         out[9] = self.chunk_index;
         out[10] = self.total_data;
         out[11] = self.parity_count;
+        out
     }
 
     /// Parse a frame header from `bytes`. Returns the header and the body
@@ -147,7 +152,7 @@ mod tests {
             parity_count: 4,
         };
         let mut buf = vec![0u8; HEADER_SIZE + 5];
-        h.write_into(&mut buf);
+        buf[..HEADER_SIZE].copy_from_slice(&h.serialize());
         buf[HEADER_SIZE..].copy_from_slice(b"hello");
         let (parsed, body) = ChunkHeader::parse(&buf).unwrap();
         assert_eq!(parsed, h);
