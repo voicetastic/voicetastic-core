@@ -145,7 +145,7 @@ impl AppSettings {
 /// Resolve `$XDG_CONFIG_HOME/voicetastic/config.toml`, falling back to
 /// `$HOME/.config/voicetastic/config.toml`. Returns `None` if neither env
 /// var is set (e.g. on a headless container with no `$HOME`).
-fn config_path() -> Option<PathBuf> {
+pub(super) fn config_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {

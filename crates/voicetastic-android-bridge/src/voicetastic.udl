@@ -30,6 +30,12 @@ namespace voicetastic {
     /// Build a NACK frame for `(message_id)` reporting `missing` data
     /// chunk indices. Mirrors `voicetastic_core::voice::build_nack`.
     bytes build_nack(NackConfig cfg);
+
+    /// Wire-stable string id for a [`SettingKey`] (e.g. `"voice.codec"`).
+    string setting_key_id(SettingKey key);
+
+    /// Parse a wire-stable id back to a [`SettingKey`], or `null`.
+    SettingKey? setting_key_from_id(string id);
 };
 
 /// Configuration for `build_nack`.
@@ -217,5 +223,90 @@ interface VoiceAssembler {
     /// Drive timeouts and emit pending NACK frames. Should be polled at
     /// roughly `nack_window_ms / 2` cadence.
     TickOutput tick();
+};
+
+// -----------------------------------------------------------------------------
+// Settings (client-side, persisted as TOML on the host)
+// -----------------------------------------------------------------------------
+
+/// Errors raised by the settings facade.
+[Error]
+enum SettingsError {
+    "UnknownKey",
+    "Invalid",
+    "Io",
+};
+
+/// Stable identifier for every persisted client setting. Mirrors
+/// `voicetastic_core::settings::SettingKey`.
+enum SettingKey {
+    "LastDevice",
+    "VoiceMaxDurationSecs",
+    "VoiceReassemblyTimeoutSecs",
+    "VoiceCodec",
+    "VoiceCodec2Mode",
+};
+
+/// Typed mirror of the `voice.codec` value.
+enum VoiceCodecKind {
+    "Opus",
+    "Codec2",
+};
+
+/// Kind of value a setting accepts. Used by `list` to render a generic UI.
+[Enum]
+interface SettingKind {
+    OptionalString();
+    IntRange(u32 min, u32 max);
+    EnumVariants(sequence<string> variants);
+};
+
+/// Static + dynamic metadata about one setting.
+dictionary SettingDescriptor {
+    SettingKey key;
+    string label;
+    string help;
+    SettingKind kind;
+    string value;
+    string default_value;
+};
+
+/// Centralised settings facade. The Android host is expected to pass
+/// its per-app data directory (`Context.filesDir`) as `path`; pass
+/// `null` for an in-memory store (e.g. unit tests).
+interface SettingsApi {
+    [Name=open_at]
+    constructor(string? path);
+
+    string get_str(SettingKey key);
+    [Throws=SettingsError]
+    void set_str(SettingKey key, string value);
+    [Throws=SettingsError]
+    void reset(SettingKey key);
+    [Throws=SettingsError]
+    void reset_all();
+    sequence<SettingDescriptor> list();
+
+    // Typed conveniences (the bridge exposes a few commonly-used ones
+    // so Kotlin callers don't have to round-trip through strings).
+    string? last_device();
+    [Throws=SettingsError]
+    void set_last_device(string? value);
+
+    u32 voice_max_secs();
+    [Throws=SettingsError]
+    void set_voice_max_secs(u32 secs);
+
+    u32 reassembly_timeout_secs();
+    [Throws=SettingsError]
+    void set_reassembly_timeout_secs(u32 secs);
+
+    VoiceCodecKind voice_codec();
+    [Throws=SettingsError]
+    void set_voice_codec(VoiceCodecKind kind);
+
+    u8 voice_codec2_mode();
+    [Throws=SettingsError]
+    void set_voice_codec2_mode(u8 mode);
 };
 

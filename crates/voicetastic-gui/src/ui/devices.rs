@@ -16,8 +16,9 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             // Persist the address best-effort — keep any other settings
             // fields intact. Failure to write the config file must never
             // block the connection attempt.
-            app.app_settings.last_device = Some(addr.clone());
-            app.save_settings();
+            if let Err(e) = app.settings.set_last_device(Some(addr.clone())) {
+                tracing::warn!(error = %e, "failed to persist last_device");
+            }
             let svc = app.service.clone();
             let shared = Arc::clone(&app.shared);
             app.rt.spawn(async move {

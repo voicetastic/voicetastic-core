@@ -46,6 +46,34 @@ pub enum Command {
         #[command(subcommand)]
         cmd: DeviceCmd,
     },
+    /// Client-side settings (persisted under `$XDG_CONFIG_HOME/voicetastic`).
+    Settings {
+        #[command(subcommand)]
+        cmd: SettingsCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SettingsCmd {
+    /// List every known setting with its current value and default.
+    List,
+    /// Print one setting's current value (machine-friendly, no trailing newline).
+    Get {
+        /// Setting id (e.g. `voice.codec`, `voice.max_duration_secs`).
+        key: String,
+    },
+    /// Set one setting to a value.
+    Set {
+        /// Setting id.
+        key: String,
+        /// New value (use the same format `list` displays).
+        value: String,
+    },
+    /// Reset one setting (or all) to its default.
+    Reset {
+        /// Setting id. Omit to reset every setting.
+        key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

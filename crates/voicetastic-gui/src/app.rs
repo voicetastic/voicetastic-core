@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
 use voicetastic_core::service::{ConnectionState, MeshService};
-use voicetastic_core::settings::{AppSettings, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS};
+use voicetastic_core::settings::{SettingKey, SettingsApi, SettingsListener};
 use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceCodec};
 
 use crate::outgoing::OutgoingVoiceRegistry;
@@ -48,12 +48,10 @@ pub struct VoicetasticApp {
     /// Latest status / error message from the chat tab (e.g. playback or
     /// mic failures). Shown inline under the voice composer.
     pub chat_status: Option<String>,
-    /// Persistent app settings (last device, voice duration cap, …).
-    /// Mutated in place by the UI; `save_settings()` flushes to disk.
-    pub app_settings: AppSettings,
-    /// Shared voice reassembler. Held here so settings changes can hot-
-    /// reload its config via [`Self::apply_voice_settings`].
-    pub voice_assembler: Arc<VoiceAssembler>,
+    /// Centralised settings facade. Cloned `Arc` shared with watchers /
+    /// listeners; UI widgets call its typed setters and never poke the
+    /// underlying `AppSettings` directly.
+    pub settings: Arc<SettingsApi>,
     /// Registry of outgoing voice messages retained for NACK-driven
     /// retransmit. Populated by the chat composer, consumed by the
     /// inbound-data watcher.
@@ -63,15 +61,24 @@ pub struct VoicetasticApp {
 impl VoicetasticApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Runtime>, service: MeshService) -> Self {
         let shared = Arc::new(Mutex::new(SharedState::default()));
-        let prefs = AppSettings::load();
+        let settings = SettingsApi::open();
         let voice_assembler = Arc::new(VoiceAssembler::new(AssemblerConfig {
-            message_timeout: std::time::Duration::from_secs(prefs.reassembly_timeout_secs() as u64),
+            message_timeout: std::time::Duration::from_secs(
+                settings.reassembly_timeout_secs() as u64
+            ),
             ..AssemblerConfig::default()
         }));
         let outgoing_voice = OutgoingVoiceRegistry::new();
         outgoing_voice.set_retain_ttl(std::time::Duration::from_secs(
-            prefs.reassembly_timeout_secs() as u64,
+            settings.reassembly_timeout_secs() as u64,
         ));
+        // Auto-apply voice-runtime-affecting settings whenever they change
+        // anywhere (UI, CLI sharing the same file, future Android host).
+        settings.subscribe(Arc::new(VoiceRuntimeListener {
+            assembler: Arc::clone(&voice_assembler),
+            outgoing: Arc::clone(&outgoing_voice),
+            settings: Arc::clone(&settings),
+        }));
         spawn_watchers(
             &rt,
             &service,
@@ -81,7 +88,7 @@ impl VoicetasticApp {
             Arc::clone(&outgoing_voice),
         );
 
-        let device_addr = prefs.last_device.clone().unwrap_or_default();
+        let device_addr = settings.last_device().unwrap_or_default();
 
         Self {
             rt,
@@ -96,50 +103,45 @@ impl VoicetasticApp {
             voice_playback: None,
             playback_source: None,
             chat_status: None,
-            app_settings: prefs,
-            voice_assembler,
+            settings,
             outgoing_voice,
         }
     }
 
-    /// Push the current `app_settings` values that affect the voice
-    /// assembler into the shared instance. Cheap; safe to call on every
-    /// slider change.
-    pub fn apply_voice_settings(&self) {
+    /// Resolve the outgoing-codec settings to a `(VoiceCodec, codec_param)`
+    /// pair suitable for [`Recorder::start`] and the voice protocol header.
+    pub fn outgoing_voice_codec(&self) -> (VoiceCodec, u8) {
+        self.settings.voice_codec_for_protocol()
+    }
+}
+
+/// Bridges [`SettingsApi`] change notifications to the live voice
+/// runtime so updating either field via *any* front-end (GUI widget,
+/// CLI `settings set`, Android host) immediately reflects on the wire.
+struct VoiceRuntimeListener {
+    assembler: Arc<VoiceAssembler>,
+    outgoing: Arc<crate::outgoing::OutgoingVoiceRegistry>,
+    settings: Arc<SettingsApi>,
+}
+
+impl SettingsListener for VoiceRuntimeListener {
+    fn on_change(&self, key: SettingKey) {
+        if !matches!(key, SettingKey::VoiceReassemblyTimeoutSecs) {
+            return;
+        }
+        let timeout =
+            std::time::Duration::from_secs(self.settings.reassembly_timeout_secs() as u64);
         // Mutate in place — do NOT use `set_config(... ..default())`
         // here, because [`watchers::apply_lora_to_assembler`] writes the
         // preset-derived `nack_window` and would clobber it (and vice
         // versa). See `VoiceAssembler::update_config` rustdoc.
-        let timeout =
-            std::time::Duration::from_secs(self.app_settings.reassembly_timeout_secs() as u64);
-        self.voice_assembler.update_config(|cfg| {
+        self.assembler.update_config(|cfg| {
             cfg.message_timeout = timeout;
         });
         // Keep the sender-side retransmit registry's retention aligned
         // with the receiver's reassembly window so a NACK can never
         // arrive for a frame we've already forgotten.
-        self.outgoing_voice.set_retain_ttl(timeout);
-    }
-
-    /// Persist `app_settings` to disk best-effort. Failures are logged but
-    /// never surfaced — the UI must keep working on read-only filesystems.
-    pub fn save_settings(&self) {
-        if let Err(e) = self.app_settings.save() {
-            tracing::warn!(error = %e, "failed to save app settings");
-        }
-    }
-
-    /// Resolve `app_settings.voice_codec` + `voice_codec2_mode` to a
-    /// `(VoiceCodec, codec_param)` pair suitable for [`Recorder::start`]
-    /// and the voice protocol header.
-    pub fn app_settings_voice_codec(&self) -> (VoiceCodec, u8) {
-        match self.app_settings.voice_codec() {
-            VOICE_CODEC_OPUS => (VoiceCodec::Opus, 0),
-            VOICE_CODEC_CODEC2 => (VoiceCodec::Codec2, self.app_settings.voice_codec2_mode()),
-            // `voice_codec()` already normalises unknowns to the default;
-            // this branch is unreachable but kept exhaustive.
-            _ => (VoiceCodec::Codec2, self.app_settings.voice_codec2_mode()),
-        }
+        self.outgoing.set_retain_ttl(timeout);
     }
 }
 

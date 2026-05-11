@@ -1,25 +1,33 @@
-//! "Voice messages" settings card — purely client-side preferences (max
+//! "Voice messages" settings card -- purely client-side preferences (max
 //! recording duration). Distinct from the device-config sections because
-//! none of this is shipped over the air; it lives in `AppSettings` and is
-//! persisted to the local config file.
+//! none of this is shipped over the air; it lives in the centralised
+//! [`SettingsApi`] (persisted as TOML under `$XDG_CONFIG_HOME`).
+//!
+//! Widgets in this module are display-only: every mutation flows through
+//! `app.settings.set_*` so any other front-end (CLI, Android) sharing
+//! the same config file sees identical effects.
 
 use eframe::egui;
 
 use voicetastic_core::settings::{
     CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400, CODEC2_MODE_1600, CODEC2_MODE_2400,
     CODEC2_MODE_3200, DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS,
-    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_CODEC2,
-    VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER,
+    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER,
+    VoiceCodecKind,
 };
 
 use crate::app::VoicetasticApp;
 use crate::audio;
 
+fn warn(ctx: &str, err: impl std::fmt::Display) {
+    tracing::warn!(target: "voicetastic_gui::settings", "{ctx} failed: {err}");
+}
+
 pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
     egui::CollapsingHeader::new("Voice messages")
         .id_salt("voice_settings")
         .show(ui, |ui| {
-            let mut secs = app.app_settings.voice_max_secs();
+            let mut secs = app.settings.voice_max_secs();
             ui.horizontal(|ui| {
                 ui.label("Max recording duration:");
                 if ui
@@ -29,13 +37,14 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                             .clamping(egui::SliderClamping::Always),
                     )
                     .changed()
+                    && let Err(e) = app.settings.set_voice_max_secs(secs)
                 {
-                    app.app_settings.max_voice_duration_secs = Some(secs);
-                    app.save_settings();
+                    warn("set voice_max_secs", e);
                 }
-                if ui.small_button("Reset").clicked() {
-                    app.app_settings.max_voice_duration_secs = None;
-                    app.save_settings();
+                if ui.small_button("Reset").clicked()
+                    && let Err(e) = app.settings.reset(SettingKey::VoiceMaxDurationSecs)
+                {
+                    warn("reset voice_max_secs", e);
                 }
             });
             ui.weak(format!(
@@ -43,7 +52,7 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
             ));
 
             ui.add_space(6.0);
-            let mut timeout = app.app_settings.reassembly_timeout_secs();
+            let mut timeout = app.settings.reassembly_timeout_secs();
             ui.horizontal(|ui| {
                 ui.label("Reassembly timeout:");
                 if ui
@@ -57,15 +66,14 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                         .clamping(egui::SliderClamping::Always),
                     )
                     .changed()
+                    && let Err(e) = app.settings.set_reassembly_timeout_secs(timeout)
                 {
-                    app.app_settings.reassembly_timeout_secs = Some(timeout);
-                    app.save_settings();
-                    app.apply_voice_settings();
+                    warn("set reassembly_timeout_secs", e);
                 }
-                if ui.small_button("Reset").clicked() {
-                    app.app_settings.reassembly_timeout_secs = None;
-                    app.save_settings();
-                    app.apply_voice_settings();
+                if ui.small_button("Reset").clicked()
+                    && let Err(e) = app.settings.reset(SettingKey::VoiceReassemblyTimeoutSecs)
+                {
+                    warn("reset reassembly_timeout_secs", e);
                 }
             });
             ui.weak(format!(
@@ -75,35 +83,28 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
 
             ui.add_space(6.0);
             ui.label("Outgoing codec:");
-            let current = app.app_settings.voice_codec().to_string();
-            let mut next = current.clone();
-            let label = match current.as_str() {
-                VOICE_CODEC_OPUS => "Opus (12 kbps wideband)",
-                _ => "Codec2 (1.2–3.2 kbps narrowband)",
+            let current = app.settings.voice_codec();
+            let mut next = current;
+            let label = |k: VoiceCodecKind| match k {
+                VoiceCodecKind::Opus => "Opus (12 kbps wideband)",
+                VoiceCodecKind::Codec2 => "Codec2 (1.2-3.2 kbps narrowband)",
             };
             egui::ComboBox::from_id_salt("voice_codec_select")
-                .selected_text(label)
+                .selected_text(label(current))
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(
-                        &mut next,
-                        VOICE_CODEC_CODEC2.to_string(),
-                        "Codec2 (1.2–3.2 kbps narrowband)",
-                    );
-                    ui.selectable_value(
-                        &mut next,
-                        VOICE_CODEC_OPUS.to_string(),
-                        "Opus (12 kbps wideband)",
-                    );
+                    ui.selectable_value(&mut next, VoiceCodecKind::Codec2, label(VoiceCodecKind::Codec2));
+                    ui.selectable_value(&mut next, VoiceCodecKind::Opus, label(VoiceCodecKind::Opus));
                 });
-            if next != current {
-                app.app_settings.voice_codec = Some(next);
-                app.save_settings();
+            if next != current
+                && let Err(e) = app.settings.set_voice_codec(next)
+            {
+                warn("set voice_codec", e);
             }
 
-            if app.app_settings.voice_codec() == VOICE_CODEC_CODEC2 {
+            if app.settings.voice_codec() == VoiceCodecKind::Codec2 {
                 ui.add_space(4.0);
                 ui.label("Codec2 bitrate:");
-                let mut mode = app.app_settings.voice_codec2_mode();
+                let mut mode = app.settings.voice_codec2_mode();
                 let mode_label = |m: u8| match m {
                     CODEC2_MODE_3200 => "3200 bps (best quality)",
                     CODEC2_MODE_2400 => "2400 bps",
@@ -128,14 +129,15 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                             ui.selectable_value(&mut mode, m, mode_label(m));
                         }
                     });
-                if mode != prev {
-                    app.app_settings.voice_codec2_mode = Some(mode);
-                    app.save_settings();
+                if mode != prev
+                    && let Err(e) = app.settings.set_voice_codec2_mode(mode)
+                {
+                    warn("set voice_codec2_mode", e);
                 }
             }
             ui.weak(format!(
                 "Default codec: {DEFAULT_VOICE_CODEC}. Codec2 at 1200 bps fits a 30 s clip in \
-                 ~4.5 kB — recommended for slow LoRa presets. Received messages are always \
+                 ~4.5 kB -- recommended for slow LoRa presets. Received messages are always \
                  decoded with the codec advertised in their header."
             ));
 

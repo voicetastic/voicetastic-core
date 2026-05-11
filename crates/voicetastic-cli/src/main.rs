@@ -9,7 +9,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, DeviceCmd, TextCmd, VoiceCmd};
+use crate::cli::{Cli, Command, DeviceCmd, SettingsCmd, TextCmd, VoiceCmd};
 use crate::util::{read_stdin_line, require_device};
 
 #[tokio::main]
@@ -61,5 +61,11 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Command::Settings { cmd } => match cmd {
+            SettingsCmd::List => commands::settings::list(),
+            SettingsCmd::Get { key } => commands::settings::get(&key),
+            SettingsCmd::Set { key, value } => commands::settings::set(&key, &value),
+            SettingsCmd::Reset { key } => commands::settings::reset(key.as_deref()),
+        },
     }
 }

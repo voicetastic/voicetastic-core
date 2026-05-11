@@ -420,7 +420,7 @@ fn voice_composer(
     ui: &mut egui::Ui,
     nodes: &std::collections::HashMap<u32, voicetastic_core::proto::NodeInfo>,
 ) {
-    let max_secs = app.app_settings.voice_max_secs();
+    let max_secs = app.settings.voice_max_secs();
     // Take ownership of the state so we can transition without juggling
     // borrow rules; we put the (possibly-new) state back at the end.
     let prev = std::mem::take(&mut app.voice_compose);
@@ -439,7 +439,7 @@ fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> Vo
         if !enabled {
             resp.on_hover_text("Rebuild with `--features audio` to enable voice messages.");
         } else if resp.clicked() {
-            let (codec, codec_param) = app.app_settings_voice_codec();
+            let (codec, codec_param) = app.outgoing_voice_codec();
             match Recorder::start(max_secs, codec, codec_param) {
                 Ok(rec) => {
                     return VoiceCompose::Recording(rec);

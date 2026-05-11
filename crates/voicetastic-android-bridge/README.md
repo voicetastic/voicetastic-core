@@ -3,11 +3,23 @@ UniFFI scenario that exposes [`voicetastic-core`](../voicetastic-core)'s
 voice protocol (`build_message`, `VoiceAssembler`, `build_nack`,
 `random_message_id`, `detect_version`) to Kotlin/Android.
 ## Scope
-Voice protocol layer only. The Android app keeps its existing BLE / USB
-transport stack and Meshtastic state machine; this bridge replaces the
-Kotlin `VoiceChunker` / `VoiceAssembler` (protocol v1) with calls into
-`voicetastic-core::voice::*` (protocol v2: 12-byte header, AES-GCM
-envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
+Two surfaces:
+
+1. **Voice protocol** — `build_message`, `VoiceAssembler`, `build_nack`,
+   `random_message_id`, `detect_version`. Replaces the Kotlin
+   `VoiceChunker` / `VoiceAssembler` (protocol v1) with calls into
+   `voicetastic-core::voice::*` (protocol v2: 12-byte header, AES-GCM
+   envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
+2. **Settings** — `SettingsApi`, the centralised client-side preference
+   facade (last device, voice max duration, reassembly timeout,
+   outgoing codec, Codec2 mode). Same TOML schema as the desktop GUI /
+   CLI. Persistence path is **host-injected**: pass the app's private
+   data directory (typically `Context.filesDir.path`) as the
+   constructor argument, or `null` for an in-memory store. Use the
+   typed accessors (`set_voice_codec(...)` etc.) for known keys, and
+   the generic `list()` / `get_str()` / `set_str()` if you want to
+   render a descriptor-driven settings screen.
+
 Out of scope here: the `MeshService` façade and the `Transport` foreign
 trait. A follow-up bridge can add those when the Android side is ready
 to also retire its Kotlin Meshtastic state machine.

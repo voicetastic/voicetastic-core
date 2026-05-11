@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use voicetastic_core::settings as s;
 use voicetastic_core::voice as v;
 
 // -----------------------------------------------------------------------------
@@ -452,6 +453,207 @@ impl VoiceAssembler {
 
     pub fn tick(&self) -> TickOutput {
         self.0.tick().into()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Settings facade
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, thiserror::Error)]
+pub enum SettingsError {
+    #[error("unknown setting key")]
+    UnknownKey,
+    #[error("invalid value")]
+    Invalid,
+    #[error("settings I/O failed")]
+    Io,
+}
+
+impl From<s::SettingsError> for SettingsError {
+    fn from(e: s::SettingsError) -> Self {
+        match e {
+            s::SettingsError::UnknownKey(_) => Self::UnknownKey,
+            s::SettingsError::Invalid { .. } => Self::Invalid,
+            s::SettingsError::Io(_) => Self::Io,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingKey {
+    LastDevice,
+    VoiceMaxDurationSecs,
+    VoiceReassemblyTimeoutSecs,
+    VoiceCodec,
+    VoiceCodec2Mode,
+}
+
+impl From<SettingKey> for s::SettingKey {
+    fn from(k: SettingKey) -> Self {
+        match k {
+            SettingKey::LastDevice => Self::LastDevice,
+            SettingKey::VoiceMaxDurationSecs => Self::VoiceMaxDurationSecs,
+            SettingKey::VoiceReassemblyTimeoutSecs => Self::VoiceReassemblyTimeoutSecs,
+            SettingKey::VoiceCodec => Self::VoiceCodec,
+            SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
+        }
+    }
+}
+
+impl From<s::SettingKey> for SettingKey {
+    fn from(k: s::SettingKey) -> Self {
+        match k {
+            s::SettingKey::LastDevice => Self::LastDevice,
+            s::SettingKey::VoiceMaxDurationSecs => Self::VoiceMaxDurationSecs,
+            s::SettingKey::VoiceReassemblyTimeoutSecs => Self::VoiceReassemblyTimeoutSecs,
+            s::SettingKey::VoiceCodec => Self::VoiceCodec,
+            s::SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceCodecKind {
+    Opus,
+    Codec2,
+}
+
+impl From<VoiceCodecKind> for s::VoiceCodecKind {
+    fn from(k: VoiceCodecKind) -> Self {
+        match k {
+            VoiceCodecKind::Opus => Self::Opus,
+            VoiceCodecKind::Codec2 => Self::Codec2,
+        }
+    }
+}
+
+impl From<s::VoiceCodecKind> for VoiceCodecKind {
+    fn from(k: s::VoiceCodecKind) -> Self {
+        match k {
+            s::VoiceCodecKind::Opus => Self::Opus,
+            s::VoiceCodecKind::Codec2 => Self::Codec2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum SettingKind {
+    OptionalString,
+    IntRange { min: u32, max: u32 },
+    EnumVariants { variants: Vec<String> },
+}
+
+impl From<s::SettingKind> for SettingKind {
+    fn from(k: s::SettingKind) -> Self {
+        match k {
+            s::SettingKind::OptionalString => Self::OptionalString,
+            s::SettingKind::IntRange { min, max } => Self::IntRange { min, max },
+            s::SettingKind::Enum { variants } => Self::EnumVariants {
+                variants: variants.iter().map(|v| (*v).to_string()).collect(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingDescriptor {
+    pub key: SettingKey,
+    pub label: String,
+    pub help: String,
+    pub kind: SettingKind,
+    pub value: String,
+    pub default_value: String,
+}
+
+impl From<s::SettingDescriptor> for SettingDescriptor {
+    fn from(d: s::SettingDescriptor) -> Self {
+        Self {
+            key: d.key.into(),
+            label: d.label.to_string(),
+            help: d.help.to_string(),
+            kind: d.kind.into(),
+            value: d.value,
+            default_value: d.default,
+        }
+    }
+}
+
+pub fn setting_key_id(key: SettingKey) -> String {
+    s::SettingKey::from(key).id().to_string()
+}
+
+pub fn setting_key_from_id(id: String) -> Option<SettingKey> {
+    s::SettingKey::from_id(&id).map(Into::into)
+}
+
+/// Settings facade mirror. Android passes its `filesDir` as `path` so
+/// the TOML store lives under the app's private data directory.
+pub struct SettingsApi(std::sync::Arc<s::SettingsApi>);
+
+impl SettingsApi {
+    pub fn open_at(path: Option<String>) -> Self {
+        Self(s::SettingsApi::open_at(path.map(std::path::PathBuf::from)))
+    }
+
+    pub fn get_str(&self, key: SettingKey) -> String {
+        self.0.get_str(key.into())
+    }
+
+    pub fn set_str(&self, key: SettingKey, value: String) -> Result<(), SettingsError> {
+        self.0.set_str(key.into(), &value).map_err(Into::into)
+    }
+
+    pub fn reset(&self, key: SettingKey) -> Result<(), SettingsError> {
+        self.0.reset(key.into()).map_err(Into::into)
+    }
+
+    pub fn reset_all(&self) -> Result<(), SettingsError> {
+        self.0.reset_all().map_err(Into::into)
+    }
+
+    pub fn list(&self) -> Vec<SettingDescriptor> {
+        self.0.list().into_iter().map(Into::into).collect()
+    }
+
+    pub fn last_device(&self) -> Option<String> {
+        self.0.last_device()
+    }
+
+    pub fn set_last_device(&self, value: Option<String>) -> Result<(), SettingsError> {
+        self.0.set_last_device(value).map_err(Into::into)
+    }
+
+    pub fn voice_max_secs(&self) -> u32 {
+        self.0.voice_max_secs()
+    }
+
+    pub fn set_voice_max_secs(&self, secs: u32) -> Result<(), SettingsError> {
+        self.0.set_voice_max_secs(secs).map_err(Into::into)
+    }
+
+    pub fn reassembly_timeout_secs(&self) -> u32 {
+        self.0.reassembly_timeout_secs()
+    }
+
+    pub fn set_reassembly_timeout_secs(&self, secs: u32) -> Result<(), SettingsError> {
+        self.0.set_reassembly_timeout_secs(secs).map_err(Into::into)
+    }
+
+    pub fn voice_codec(&self) -> VoiceCodecKind {
+        self.0.voice_codec().into()
+    }
+
+    pub fn set_voice_codec(&self, kind: VoiceCodecKind) -> Result<(), SettingsError> {
+        self.0.set_voice_codec(kind.into()).map_err(Into::into)
+    }
+
+    pub fn voice_codec2_mode(&self) -> u8 {
+        self.0.voice_codec2_mode()
+    }
+
+    pub fn set_voice_codec2_mode(&self, mode: u8) -> Result<(), SettingsError> {
+        self.0.set_voice_codec2_mode(mode).map_err(Into::into)
     }
 }
 
