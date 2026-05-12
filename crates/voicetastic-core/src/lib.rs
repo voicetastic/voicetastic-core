@@ -27,6 +27,8 @@ pub mod voice;
 
 #[cfg(feature = "ble-btleplug")]
 pub mod ble;
+#[cfg(all(feature = "ble-btleplug", target_os = "linux"))]
+pub mod pairing;
 #[cfg(feature = "serial-tokio")]
 pub mod serial;
 pub mod service;

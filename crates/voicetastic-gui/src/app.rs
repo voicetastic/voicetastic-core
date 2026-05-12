@@ -178,5 +178,122 @@ impl eframe::App for VoicetasticApp {
             Tab::Chat => ui::chat::show(self, ui),
             Tab::Settings => ui::settings::show(self, ui),
         });
+
+        #[cfg(target_os = "linux")]
+        self.show_pairing_modal(ui.ctx());
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl VoicetasticApp {
+    /// Render the BlueZ passkey-entry modal when a pairing prompt is
+    /// pending. The radio displays the 6-digit passkey on its OLED; the
+    /// user types it here and we reply over the `org.bluez.Agent1`
+    /// channel that's parked on a `oneshot`.
+    fn show_pairing_modal(&self, ctx: &egui::Context) {
+        use voicetastic_core::pairing::{PairingPromptKind, PairingResponse};
+
+        // Snapshot what we need to render without holding the lock
+        // across the egui call (the modal's input field writes back
+        // under a fresh short-lived lock).
+        let snapshot = {
+            let st = self.shared.lock();
+            st.pending_pairing
+                .as_ref()
+                .map(|p| (p.address.clone(), p.kind.clone(), p.input.clone()))
+        };
+        let Some((address, kind, mut input)) = snapshot else {
+            return;
+        };
+
+        let mut submit: Option<PairingResponse> = None;
+        let mut cancel = false;
+
+        egui::Window::new("Pair Meshtastic radio")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!("Device: {address}"));
+                ui.add_space(8.0);
+                match &kind {
+                    PairingPromptKind::Passkey | PairingPromptKind::PinCode => {
+                        let label = if matches!(kind, PairingPromptKind::Passkey) {
+                            "Enter the 6-digit passkey shown on the radio's display:"
+                        } else {
+                            "Enter the PIN shown on the radio's display:"
+                        };
+                        ui.label(label);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut input)
+                                .desired_width(120.0)
+                                .hint_text("123456"),
+                        );
+                        ui.horizontal(|ui| {
+                            let submit_clicked = ui.button("Pair").clicked();
+                            if ui.button("Cancel").clicked() {
+                                cancel = true;
+                            }
+                            if submit_clicked {
+                                submit = match kind {
+                                    PairingPromptKind::Passkey => input
+                                        .trim()
+                                        .parse::<u32>()
+                                        .ok()
+                                        .map(PairingResponse::Passkey),
+                                    PairingPromptKind::PinCode => {
+                                        Some(PairingResponse::Pin(input.trim().to_string()))
+                                    }
+                                    _ => None,
+                                };
+                            }
+                        });
+                    }
+                    PairingPromptKind::Confirmation(passkey) => {
+                        ui.label(format!(
+                            "Does the radio display this passkey?\n\n    {passkey:06}"
+                        ));
+                        ui.horizontal(|ui| {
+                            if ui.button("Yes, pair").clicked() {
+                                submit = Some(PairingResponse::Confirm(true));
+                            }
+                            if ui.button("No").clicked() {
+                                submit = Some(PairingResponse::Confirm(false));
+                            }
+                        });
+                    }
+                    PairingPromptKind::Authorization { uuid } => {
+                        ui.label(format!("Authorise service {uuid} for this device?"));
+                        ui.horizontal(|ui| {
+                            if ui.button("Allow").clicked() {
+                                submit = Some(PairingResponse::Confirm(true));
+                            }
+                            if ui.button("Deny").clicked() {
+                                submit = Some(PairingResponse::Confirm(false));
+                            }
+                        });
+                    }
+                }
+            });
+
+        // Persist the in-progress input back into shared state.
+        {
+            let mut st = self.shared.lock();
+            if let Some(p) = st.pending_pairing.as_mut() {
+                p.input = input;
+            }
+        }
+
+        if cancel {
+            submit = Some(PairingResponse::Cancel);
+        }
+        if let Some(resp) = submit {
+            let mut st = self.shared.lock();
+            if let Some(mut p) = st.pending_pairing.take()
+                && let Some(reply) = p.reply.take()
+            {
+                let _ = reply.send(resp);
+            }
+        }
     }
 }

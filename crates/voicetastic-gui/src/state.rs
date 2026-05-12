@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use voicetastic_core::ble::DiscoveredDevice;
+#[cfg(target_os = "linux")]
+use voicetastic_core::pairing::{PairingPromptKind, PairingResponse};
 use voicetastic_core::proto::{
     Channel, DeviceMetadata, MyNodeInfo, NodeInfo, User,
     config::{
@@ -118,6 +120,25 @@ pub struct SharedState {
     /// Position section is opened; survives frame-to-frame so the text
     /// fields remember in-progress edits. Coordinates are in degrees.
     pub fixed_pos_edit: Option<FixedPosEdit>,
+
+    /// An in-flight BlueZ pairing prompt waiting for the user to type
+    /// the 6-digit passkey shown on the radio's OLED. `None` when no
+    /// pairing is in progress.
+    #[cfg(target_os = "linux")]
+    pub pending_pairing: Option<PendingPairing>,
+}
+
+/// A pairing prompt routed from `org.bluez.Agent1` to the GUI modal.
+/// `reply` is consumed when the user clicks OK / Cancel; the dialog
+/// MUST always either send a reply or drop the slot (drop is treated
+/// as cancel by the agent).
+#[cfg(target_os = "linux")]
+pub struct PendingPairing {
+    pub address: String,
+    pub kind: PairingPromptKind,
+    pub reply: Option<tokio::sync::oneshot::Sender<PairingResponse>>,
+    /// In-progress text input for `Passkey` / `PinCode` kinds.
+    pub input: String,
 }
 
 /// Maximum number of entries kept in [`SharedState::chat_log`]. Long-running
@@ -164,6 +185,8 @@ impl Default for SharedState {
             dirty: HashSet::new(),
             config_status: None,
             fixed_pos_edit: None,
+            #[cfg(target_os = "linux")]
+            pending_pairing: None,
         }
     }
 }

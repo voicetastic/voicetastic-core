@@ -51,6 +51,41 @@ pub fn spawn_watchers(
     assembler: Arc<VoiceAssembler>,
     outgoing: Arc<crate::outgoing::OutgoingVoiceRegistry>,
 ) {
+    // Pairing-prompt forwarder (Linux only). Takes ownership of the
+    // BlueZ Agent1 receiver and stuffs each prompt into `SharedState`
+    // so the modal in `app.rs` can render it. If a previous prompt is
+    // still pending we reject the older one (BlueZ tolerates concurrent
+    // pairings poorly anyway).
+    #[cfg(target_os = "linux")]
+    {
+        let svc = svc.clone();
+        let shared = Arc::clone(&shared);
+        let ctx_clone = ctx.clone();
+        rt.spawn(async move {
+            let mut rx = match svc.pairing_prompts().await {
+                Some(rx) => rx,
+                None => return,
+            };
+            while let Some(prompt) = rx.recv().await {
+                let mut st = shared.lock();
+                // Cancel any previous in-flight prompt.
+                if let Some(mut prev) = st.pending_pairing.take()
+                    && let Some(reply) = prev.reply.take()
+                {
+                    let _ = reply.send(voicetastic_core::pairing::PairingResponse::Cancel);
+                }
+                st.pending_pairing = Some(crate::state::PendingPairing {
+                    address: prompt.address,
+                    kind: prompt.kind,
+                    reply: Some(prompt.reply),
+                    input: String::new(),
+                });
+                drop(st);
+                ctx_clone.request_repaint();
+            }
+        });
+    }
+
     spawn_watch!(rt, svc.watch_state(), shared, ctx, |v, st| {
         st.conn_state = v;
     });

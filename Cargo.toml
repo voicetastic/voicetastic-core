@@ -42,6 +42,8 @@ prost-types = "0.14"
 btleplug = "0.12"
 uuid = { version = "1.23", features = ["v4"] }
 
+zbus = { version = "5.13", default-features = false, features = ["tokio"] }
+
 # Serial
 tokio-serial = "5.4.5"
 

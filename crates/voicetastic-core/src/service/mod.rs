@@ -28,8 +28,8 @@ use tracing::warn;
 const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "ble-btleplug")]
-use crate::ble::{BleManager, CONFIG_REQUEST_DELAY, Connection, DiscoveredDevice};
-use crate::error::Result;
+use crate::ble::{BleManager, Connection, DiscoveredDevice};
+use crate::error::{Error, Result};
 use crate::proto::{
     Channel, DeviceMetadata, MyNodeInfo, NodeInfo, User,
     config::{
@@ -301,17 +301,40 @@ impl MeshService {
     }
 
     /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).
+    ///
+    /// If the device is not currently connected at the OS level we run
+    /// the in-process equivalent of `bluetoothctl pair → trust → connect`
+    /// (see [`BleManager::prepare_link`]) and retry once. On a stale bond
+    /// the pair step auto-recovers via `remove → pair`.
     #[cfg(feature = "ble-btleplug")]
     pub async fn connect_by_address(&self, address: &str) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
-        let peripheral = self.ble().await?.peripheral_by_address(address).await?;
-        let conn = Arc::new(Connection::open(peripheral).await?);
+        let ble = self.ble().await?;
+        let peripheral = ble.peripheral_by_address(address).await?;
+        let conn = match Connection::open(peripheral).await {
+            Ok(c) => Arc::new(c),
+            Err(Error::NotConnected) => {
+                // Bring the link up the same way `bluetoothctl` would,
+                // then look the peripheral up again (BlueZ may have
+                // re-issued the DBus object path during pairing).
+                ble.prepare_link(address).await?;
+                let peripheral = ble.peripheral_by_address(address).await?;
+                Arc::new(Connection::open(peripheral).await?)
+            }
+            Err(e) => return Err(e),
+        };
         // `subscribe_inbound` already drains on every notify and on the safety
         // poll, so we must NOT drain here too: btleplug serialises GATT reads
         // per peripheral, but issuing concurrent drains would still race for
         // the FROMRADIO queue ordering.
         let inbound = conn.clone().subscribe_inbound().await?;
-        self.connect_with_transport(conn as Arc<dyn Transport>, inbound, CONFIG_REQUEST_DELAY)
+        // No settle delay: we attach to a link that the operating system has
+        // already opened and `Connection::open` has already validated
+        // (services resolved, FROMNUM subscribed). Meshtastic firmware
+        // starts a short "phone API session" timer the moment the LE link
+        // comes up; if we sleep here we risk that timer firing before our
+        // `WantConfigId` lands.
+        self.connect_with_transport(conn as Arc<dyn Transport>, inbound, Duration::ZERO)
             .await
     }
 
@@ -346,6 +369,30 @@ impl MeshService {
         }
         self.set_state(ConnectionState::Disconnected);
         Ok(())
+    }
+
+    /// Active-scan for advertising Meshtastic devices, including those that
+    /// are **not** currently paired with this host. Intended for an
+    /// in-app "pair new device" flow; the everyday device picker should
+    /// keep using the OS-only [`Self::scan`].
+    #[cfg(feature = "ble-btleplug")]
+    pub async fn discover_pairable(&self, timeout: Duration) -> Result<Vec<DiscoveredDevice>> {
+        self.ble().await?.discover_pairable(timeout).await
+    }
+
+    /// Take ownership of the BlueZ pairing-prompt receiver. Returns
+    /// `None` if the agent failed to register (e.g. another process is
+    /// already the system default agent with a higher-priority hold),
+    /// or if the receiver has already been taken.
+    ///
+    /// Only one consumer can hold the receiver at a time — typically
+    /// the GUI's modal-dialog task.
+    #[cfg(all(feature = "ble-btleplug", target_os = "linux"))]
+    pub async fn pairing_prompts(&self) -> Option<mpsc::Receiver<crate::pairing::PairingPrompt>> {
+        match self.ble().await {
+            Ok(ble) => ble.take_pairing_prompts().await,
+            Err(_) => None,
+        }
     }
 
     pub(super) fn set_state(&self, state: ConnectionState) {

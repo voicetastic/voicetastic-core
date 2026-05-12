@@ -30,6 +30,13 @@ btleplug = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 tokio-serial = { workspace = true, optional = true }
 
+# Linux-only DBus client for the in-process BlueZ pairing agent. Always
+# compiled on Linux (no opt-in needed); the `pairing` module is also gated
+# on `feature = "ble-btleplug"` so a serial-only Linux build does not pull
+# it in transitively (zbus brings ~30 crates).
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
+
 [features]
 # Default features keep desktop (CLI/GUI) builds working without changes.
 default = ["ble-btleplug", "serial-tokio"]
