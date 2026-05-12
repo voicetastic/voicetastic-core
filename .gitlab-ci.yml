@@ -14,21 +14,21 @@ default:
 build:
   stage: check
   script:
-    - cargo build --workspace
+    - cargo build --workspace --locked
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 test:
   stage: check
   script:
-    - cargo test --workspace
+    - cargo test --workspace --locked
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
 clippy:
   stage: check
   script:
-    - cargo clippy --workspace --all-targets -- -D warnings
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
