@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Voicetastic command-line client"
+build = "build.rs"
 
 [[bin]]
 name = "voicetastic"

@@ -39,7 +39,12 @@ fmt:
   rules:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
 
-# Auto-bump semver on every push to main.
+# Auto-tag a semver release on every push to main.
+#
+# The release pipeline never rewrites Cargo.toml. The binary version
+# shown by `--version` is derived at build time from the latest
+# `vX.Y.Z` git tag by each binary crate's `build.rs`, via the
+# `VOICETASTIC_VERSION` env var.
 #
 # Bump rules (Conventional Commits over the range since last tag):
 #   - any commit message containing "BREAKING CHANGE" or a "!:" marker -> major
@@ -48,19 +53,23 @@ fmt:
 #
 # Pipeline does:
 #   1. compute new vX.Y.Z from last tag + commits since
-#   2. update workspace.package.version in Cargo.toml + refresh Cargo.lock
-#   3. commit chore(release): vX.Y.Z back to main
-#   4. push annotated tag vX.Y.Z
-#   5. create a GitLab Release with auto-generated notes
+#   2. push annotated tag vX.Y.Z
+#   3. ask GitLab's changelog API to prepend a section to CHANGELOG.md
+#      on the default branch (using .gitlab/changelog_config.yml and
+#      the `Changelog:` trailer on each commit). GitLab commits the
+#      file change itself; we never push to main from this job.
+#   4. create a GitLab Release whose description is the generated
+#      changelog section (with a git-log fallback).
 #
 # Requirements:
 #   - CI/CD variable PROJECT_ACCESS_TOKEN (Project Access Token with
 #     `api` + `write_repository` scopes, role Maintainer).
-#   - Settings -> Repository -> Protected branches: allow Maintainers
-#     to push to `main` (or add the token's bot user to allowed
-#     pushers / unprotect for the token).
 #   - Settings -> Repository -> Protected tags: allow Maintainers to
 #     create `v*`.
+#   - To populate the changelog, commits must carry a `Changelog:` git
+#     trailer (`added`, `changed`, `deprecated`, `removed`, `fixed`,
+#     `security`, `performance`, `other`). Commits without a trailer
+#     are intentionally omitted.
 release:
   stage: release
   before_script:
@@ -71,19 +80,11 @@ release:
     - git config --global user.name  "GitLab CI"
     - |
       if [ -z "${PROJECT_ACCESS_TOKEN:-}" ]; then
-        echo "PROJECT_ACCESS_TOKEN is not set; cannot push tag/commit." >&2
+        echo "PROJECT_ACCESS_TOKEN is not set; cannot push tag." >&2
         exit 1
       fi
     - git remote set-url origin "https://oauth2:${PROJECT_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.git"
     - git fetch --tags origin
-    # Detach onto main so we can commit (CI checks out a detached HEAD by default).
-    - git checkout -B main "origin/main"
-    # Skip if the head commit is itself the release commit (avoid infinite loop).
-    - |
-      if git log -1 --pretty=%B | grep -Eq '^chore\(release\): v[0-9]+\.[0-9]+\.[0-9]+'; then
-        echo "Head commit is a release commit; nothing to do."
-        exit 0
-      fi
     - LAST_TAG="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
     - |
       if [ -z "$LAST_TAG" ]; then
@@ -120,51 +121,51 @@ release:
         echo "Tag ${NEW_TAG} already exists, skipping."
         exit 0
       fi
-    # Patch workspace.package.version in root Cargo.toml.
-    - |
-      python3 - "$NEW_VERSION" <<'PY'
-      import sys, pathlib, re
-      new = sys.argv[1]
-      p = pathlib.Path("Cargo.toml")
-      lines = p.read_text().splitlines(keepends=True)
-      in_section = False
-      patched = False
-      for i, line in enumerate(lines):
-          stripped = line.strip()
-          if stripped.startswith("[") and stripped.endswith("]"):
-              in_section = stripped == "[workspace.package]"
-              continue
-          if in_section and re.match(r'\s*version\s*=\s*"[^"]*"', line):
-              lines[i] = re.sub(r'"[^"]*"', f'"{new}"', line, count=1)
-              patched = True
-              break
-      if not patched:
-          sys.stderr.write("---- Cargo.toml head ----\n")
-          sys.stderr.write("".join(lines[:30]))
-          sys.exit("Failed to patch workspace.package.version in Cargo.toml")
-      p.write_text("".join(lines))
-      print(f"Patched workspace.package.version -> {new}")
-      PY
-    # Refresh Cargo.lock so workspace crate version entries match.
-    - cargo update --workspace --offline || cargo update --workspace
-    - git add Cargo.toml Cargo.lock
-    # Commit only if there are staged changes (version may already match, e.g. first release).
-    - |
-      if git diff --cached --quiet; then
-        echo "No version/lockfile changes to commit; tagging current HEAD as ${NEW_TAG}."
-        PUSH_COMMIT=0
-      else
-        git commit -m "chore(release): ${NEW_TAG}" -m "[skip ci]"
-        PUSH_COMMIT=1
-      fi
     - git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
-    - |
-      if [ "$PUSH_COMMIT" = "1" ]; then
-        git push origin "HEAD:main"
-      fi
     - git push origin "${NEW_TAG}"
+    # Ask GitLab to generate the CHANGELOG.md section for this tag from
+    # the `Changelog:` trailers on commits in (LAST_TAG, NEW_TAG]. The
+    # API prepends the section to CHANGELOG.md on the default branch and
+    # commits the change as the GitLab system user.
+    #
+    # `from`/`to` are commit SHAs; when omitted, `from` defaults to the
+    # most recent matching tag before `to`, which is exactly what we
+    # want here. We still pass them explicitly for safety.
     - |
-      NOTES="$(git log --pretty=format:'- %s (%h)' ${RANGE_FROM}HEAD^ | head -n 200)"
+      FROM_SHA=""
+      if [ -n "${LAST_TAG:-}" ]; then
+        FROM_SHA="$(git rev-parse "${LAST_TAG}^{commit}")"
+      fi
+      TO_SHA="$(git rev-parse "${NEW_TAG}^{commit}")"
+      CHANGELOG_REQ="$(jq -n \
+        --arg version "${NEW_VERSION}" \
+        --arg from    "${FROM_SHA}" \
+        --arg to      "${TO_SHA}" \
+        --arg branch  "${CI_DEFAULT_BRANCH}" \
+        --arg config  ".gitlab/changelog_config.yml" \
+        --arg file    "CHANGELOG.md" \
+        '{version:$version, branch:$branch, config_file:$config, file:$file, to:$to}
+         + (if $from == "" then {} else {from:$from} end)')"
+      curl -fsS --request POST \
+        --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "$CHANGELOG_REQ" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/changelog" \
+        || echo "Changelog API call failed (tag still pushed)."
+    # Fetch the just-generated section so we can use it as the Release
+    # description. GET /repository/changelog returns plain Markdown.
+    - |
+      NOTES_FILE="$(mktemp)"
+      if curl -fsS --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN}" \
+           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/changelog?version=${NEW_VERSION}&config_file=.gitlab/changelog_config.yml" \
+           | jq -r '.notes' > "${NOTES_FILE}" && [ -s "${NOTES_FILE}" ]; then
+        echo "Got changelog notes from API."
+      else
+        echo "Falling back to git log for Release description."
+        git log --pretty=format:'- %s (%h)' "${LAST_TAG:+${LAST_TAG}..}HEAD" \
+          | head -n 200 > "${NOTES_FILE}"
+      fi
+      NOTES="$(cat "${NOTES_FILE}")"
       JSON="$(jq -n --arg name "${NEW_TAG}" --arg tag "${NEW_TAG}" --arg desc "$NOTES" \
         '{name:$name, tag_name:$tag, description:$desc}')"
       curl -fsS --request POST \
@@ -174,4 +175,5 @@ release:
         "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/releases" || \
         echo "Release API call failed (tag still pushed)."
   rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_MESSAGE !~ /^chore\(release\): v[0-9]+\.[0-9]+\.[0-9]+/'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+

@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(
     name = "voicetastic",
-    version,
+    version = env!("VOICETASTIC_VERSION"),
     about = "Voicetastic — Meshtastic text + voice CLI"
 )]
 pub struct Cli {
