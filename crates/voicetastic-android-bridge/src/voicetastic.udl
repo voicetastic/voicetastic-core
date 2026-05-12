@@ -335,11 +335,11 @@ interface SettingsApi {
 interface MeshServiceError {
     NotConnected();
     NoLocalNode();
-    Transport(string message);
-    Protocol(string message);
-    Voice(string message);
-    InvalidArgument(string message);
-    Other(string message);
+    Transport(string error_message);
+    Protocol(string error_message);
+    Voice(string error_message);
+    InvalidArgument(string error_message);
+    Other(string error_message);
 };
 
 /// Coarse connection state. Mirrors `core::ConnectionState`.
@@ -384,12 +384,16 @@ dictionary QueueStatusEvent {
 /// Outbound half of the radio transport. Kotlin implements this for BLE
 /// (GATT write) and USB-serial. Methods are called from Rust threads;
 /// implementations must be thread-safe.
+///
+/// Note: named `shutdown` (not `close`) to avoid conflicting with the
+/// `AutoCloseable.close()` method that UniFFI automatically adds via the
+/// generated Kotlin bindings.
 [Trait, WithForeign]
 interface MeshTransport {
     /// Send one already-encoded `ToRadio` protobuf message.
     void write_to_radio(bytes data);
     /// Close the underlying transport. Idempotent.
-    void close();
+    void shutdown();
 };
 
 /// Listener for connection-state changes. Fired once with the current
@@ -429,10 +433,10 @@ interface MeshConfigListener {
 
 /// Handle returned by [`MeshService.connect`]. Kotlin's BLE / serial
 /// callback path calls `push_inbound` for every decoded `FromRadio`
-/// frame; `close` signals EOF.
+/// frame; `shutdown` signals EOF.
 interface MeshTransportSink {
     void push_inbound(bytes frame);
-    void close();
+    void shutdown();
 };
 
 /// UniFFI-exposed Meshtastic service. Construct once, reuse across the

@@ -64,16 +64,16 @@ pub enum MeshServiceError {
     NotConnected,
     #[error("local node info not yet received (my_node_num is 0)")]
     NoLocalNode,
-    #[error("transport error: {message}")]
-    Transport { message: String },
-    #[error("protocol error: {message}")]
-    Protocol { message: String },
-    #[error("voice protocol error: {message}")]
-    Voice { message: String },
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
-    #[error("{message}")]
-    Other { message: String },
+    #[error("transport error: {error_message}")]
+    Transport { error_message: String },
+    #[error("protocol error: {error_message}")]
+    Protocol { error_message: String },
+    #[error("voice protocol error: {error_message}")]
+    Voice { error_message: String },
+    #[error("invalid argument: {error_message}")]
+    InvalidArgument { error_message: String },
+    #[error("{error_message}")]
+    Other { error_message: String },
 }
 
 impl From<voicetastic_core::Error> for MeshServiceError {
@@ -83,33 +83,33 @@ impl From<voicetastic_core::Error> for MeshServiceError {
             E::NotConnected => Self::NotConnected,
             E::NoLocalNode => Self::NoLocalNode,
             E::ProtoDecode(err) => Self::Protocol {
-                message: err.to_string(),
+                error_message: err.to_string(),
             },
             E::ProtoEncode(err) => Self::Protocol {
-                message: err.to_string(),
+                error_message: err.to_string(),
             },
             E::Voice(err) => Self::Voice {
-                message: err.to_string(),
+                error_message: err.to_string(),
             },
             E::Io(err) => Self::Transport {
-                message: err.to_string(),
+                error_message: err.to_string(),
             },
             E::WriteTimeout => Self::Transport {
-                message: "write timeout".into(),
+                error_message: "write timeout".into(),
             },
             E::MissingCharacteristic(name) => Self::Transport {
-                message: format!("missing GATT characteristic: {name}"),
+                error_message: format!("missing GATT characteristic: {name}"),
             },
             E::InvalidNodeId(s) => Self::InvalidArgument {
-                message: format!("invalid node id: {s}"),
+                error_message: format!("invalid node id: {s}"),
             },
-            E::Other(msg) => Self::Other { message: msg },
+            E::Other(msg) => Self::Other { error_message: msg },
             // BLE variant only exists with the ble-btleplug feature, which
             // the Android bridge intentionally disables; the catch-all keeps
             // the match exhaustive should that change.
             #[allow(unreachable_patterns)]
             _ => Self::Other {
-                message: e.to_string(),
+                error_message: e.to_string(),
             },
         }
     }
@@ -118,7 +118,7 @@ impl From<voicetastic_core::Error> for MeshServiceError {
 impl From<v::VoiceError> for MeshServiceError {
     fn from(e: v::VoiceError) -> Self {
         Self::Voice {
-            message: e.to_string(),
+            error_message: e.to_string(),
         }
     }
 }
@@ -237,7 +237,7 @@ pub trait MeshTransport: Send + Sync {
     /// Send one already-encoded `ToRadio` protobuf message.
     fn write_to_radio(&self, bytes: Vec<u8>);
     /// Close the underlying transport. Idempotent.
-    fn close(&self);
+    fn shutdown(&self);
 }
 
 pub trait MeshStateListener: Send + Sync {
@@ -281,11 +281,11 @@ pub trait MeshConfigListener: Send + Sync {
 
 /// Handle returned by [`MeshService::connect`]. Kotlin's BLE / serial
 /// callback path calls [`MeshTransportSink::push_inbound`] for every
-/// decoded `FromRadio` frame; calling [`MeshTransportSink::close`]
+/// decoded `FromRadio` frame; calling [`MeshTransportSink::shutdown`]
 /// signals EOF (e.g. on BLE disconnect) and moves the service to
 /// `Disconnected`.
 pub struct MeshTransportSink {
-    /// `None` after `close()`; `Some` while inbound is live.
+    /// `None` after `shutdown()`; `Some` while inbound is live.
     sender: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
@@ -302,7 +302,7 @@ impl MeshTransportSink {
         }
     }
 
-    pub fn close(&self) {
+    pub fn shutdown(&self) {
         self.sender.lock().expect("sink mutex").take();
     }
 }
@@ -331,9 +331,9 @@ impl Transport for ForeignTransportAdapter {
 
     async fn disconnect(&self) -> voicetastic_core::Result<()> {
         let cb = self.inner.clone();
-        tokio::task::spawn_blocking(move || cb.close())
+        tokio::task::spawn_blocking(move || cb.shutdown())
             .await
-            .map_err(|e| voicetastic_core::Error::Other(format!("close join: {e}")))?;
+            .map_err(|e| voicetastic_core::Error::Other(format!("shutdown join: {e}")))?;
         Ok(())
     }
 }
@@ -532,13 +532,13 @@ impl MeshService {
     pub fn write_admin(&self, admin_proto: Vec<u8>) -> Result<u32, MeshServiceError> {
         let admin = AdminMessage::decode(admin_proto.as_slice()).map_err(|e| {
             MeshServiceError::Protocol {
-                message: format!("AdminMessage decode: {e}"),
+                error_message: format!("AdminMessage decode: {e}"),
             }
         })?;
         let variant = admin
             .payload_variant
             .ok_or_else(|| MeshServiceError::InvalidArgument {
-                message: "AdminMessage.payload_variant is empty".into(),
+                error_message: "AdminMessage.payload_variant is empty".into(),
             })?;
         let svc = self.core.clone();
         let id = runtime().block_on(async move { svc.send_admin(variant).await })?;
@@ -848,7 +848,7 @@ mod tests {
         fn write_to_radio(&self, bytes: Vec<u8>) {
             self.writes.lock().unwrap().push(bytes);
         }
-        fn close(&self) {
+        fn shutdown(&self) {
             self.closed.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -881,7 +881,7 @@ mod tests {
         // panicking. We don't assert on `disconnect()` here because that
         // would try to issue another write through the (already-closed)
         // transport.
-        sink.close();
+        sink.shutdown();
     }
 
     #[test]
