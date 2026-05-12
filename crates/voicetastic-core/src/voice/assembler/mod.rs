@@ -195,6 +195,16 @@ impl VoiceAssembler {
             }
             return Err(err);
         }
+        // Spec §5: parity_count MAY grow on retransmit but MUST NOT shrink.
+        // Validation passed (parity_count >= first observed); if it grew we
+        // must resize `parity_shards` before any ingest_parity call below,
+        // otherwise an index in `[first_parity_count..new_parity_count)`
+        // would panic on out-of-bounds slot access.
+        if header.parity_count > state.header_template.parity_count {
+            let new_len = header.parity_count as usize;
+            state.parity_shards.resize(new_len, None);
+            state.header_template.parity_count = header.parity_count;
+        }
         state.encrypted_seen = state.encrypted_seen || header.encrypted;
         state.last_chunk_at = now;
 
@@ -207,13 +217,15 @@ impl VoiceAssembler {
             return Ok(ev);
         }
 
-        // Progress! A new chunk landed, so reset the NACK round counter.
-        // `max_nack_rounds` is meant to bound *consecutive* quiet windows
-        // (i.e. the sender has gone silent), not the total number of
-        // NACK rounds across the lifetime of the message. Without this
-        // reset, a long message that trickles in slowly will exhaust
-        // the round budget and finalize partial even though chunks are
-        // still arriving — exactly the "35/41 chunks" failure mode.
+        // Progress! A new chunk landed, so reset the *consecutive* NACK
+        // round counter. This drives the wire-visible `round` field on
+        // future NACKs and means a long, slow-trickling message keeps
+        // reporting rounds 1..N rather than monotonically counting up.
+        //
+        // The hard give-up bound is `total_nack_rounds` (never reset), so
+        // a malicious or merely chatty sender that trickles one shard per
+        // NACK window can no longer keep an assembly slot alive past
+        // `max_nack_rounds` cumulative rounds.
         state.nack_rounds = 0;
 
         // Try FEC recovery if we now have enough shards.
@@ -298,8 +310,11 @@ impl VoiceAssembler {
             let elapsed_total = now.duration_since(state.started_at);
             let elapsed_quiet = now.duration_since(state.last_chunk_at);
 
-            // Hard timeout — give up.
-            if elapsed_total >= timeout || state.nack_rounds >= max_nack_rounds {
+            // Hard timeout — give up. The total NACK budget is cumulative
+            // (never reset on progress) so a trickle-feeder cannot keep the
+            // slot alive indefinitely; `nack_rounds` is only used for the
+            // wire `round` field.
+            if elapsed_total >= timeout || state.total_nack_rounds >= max_nack_rounds {
                 // The key came from the snapshot above; the only way it would
                 // be missing here is a concurrent mutation, which can't happen
                 // under `&mut inner`. Skip defensively rather than panic.
@@ -340,6 +355,7 @@ impl VoiceAssembler {
                     round: state.nack_rounds.saturating_add(1),
                 });
                 state.nack_rounds = state.nack_rounds.saturating_add(1);
+                state.total_nack_rounds = state.total_nack_rounds.saturating_add(1);
                 state.last_chunk_at = now;
             }
         }
@@ -432,6 +448,16 @@ fn validate_template(state: &AssemblyState, header: &ChunkHeader) -> Result<()> 
         return Err(VoiceError::StreamSeqMismatch {
             first: state.header_template.stream_seq,
             got: header.stream_seq,
+        });
+    }
+    // Spec §5: parity_count MAY grow on retransmit; receivers MUST accept
+    // values >= the first observed and reject decreases. Without this check
+    // a later PARITY frame whose index is within the original range but
+    // whose `parity_count` shrank would silently reshape RS expectations.
+    if header.parity_count < state.header_template.parity_count {
+        return Err(VoiceError::ParityCountDecrease {
+            first: state.header_template.parity_count,
+            got: header.parity_count,
         });
     }
     Ok(())
@@ -568,5 +594,66 @@ mod tests {
         let (h, body) = ChunkHeader::parse(&out.nacks[0].frame).unwrap();
         let info = parse_nack_body(&h, body).unwrap();
         assert_eq!(info.missing, vec![1, 2]);
+    }
+
+    /// Regression for finding #3: a sender that trickles one new shard
+    /// just before every NACK window must NOT be able to keep an
+    /// assembly slot alive past `max_nack_rounds` cumulative rounds.
+    /// Previously `nack_rounds` was reset on every accepted shard, so
+    /// the consecutive bound never tripped \u2014 the slot only died at the
+    /// hard message timeout.
+    #[test]
+    fn trickle_feed_cannot_bypass_round_cap() {
+        // 6 data chunks, no FEC. Round cap = 3.
+        let audio: Vec<u8> = (0..(64 * 6)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            max_nack_rounds: 3,
+            partial_play_on_timeout: true,
+            ..Default::default()
+        });
+
+        // Deliver chunk 0 to establish the assembly slot.
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+
+        // Round 1: backdate last_chunk_at, tick, expect a NACK.
+        for round in 1..=3 {
+            {
+                let mut inner = asm.inner.lock();
+                for (_, st) in inner.in_progress.iter_mut() {
+                    st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS + 100);
+                }
+            }
+            let out = asm.tick();
+            assert_eq!(out.nacks.len(), 1, "round {round}: expected 1 NACK");
+            // Sender "responds" with one new shard \u2014 in the buggy code this
+            // resets the round counter and the loop could go forever.
+            if round < 3 {
+                let _ = asm.accept(
+                    "!cc",
+                    VoiceDestination::Broadcast,
+                    0,
+                    &enc.frames[round as usize],
+                );
+            }
+        }
+
+        // Fourth tick after another quiet window: the cumulative cap
+        // should now trigger a hard timeout (partial finalize), not
+        // another NACK.
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS + 100);
+            }
+        }
+        let out = asm.tick();
+        assert!(
+            out.nacks.is_empty(),
+            "round 4: cumulative cap should suppress NACK, got {:?}",
+            out.nacks,
+        );
+        assert_eq!(out.finalized.len(), 1, "expected partial finalize");
+        assert!(!out.finalized[0].is_complete);
     }
 }

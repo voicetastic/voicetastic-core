@@ -50,6 +50,10 @@ pub enum VoiceError {
     TotalMismatch { first: u8, got: u8 },
     #[error("stream_seq mismatch within message: {first} vs {got}")]
     StreamSeqMismatch { first: u8, got: u8 },
+    #[error("parity_count decreased within message: first={first}, got={got}")]
+    ParityCountDecrease { first: u8, got: u8 },
+    #[error("NACK frame chunk_index must be 0, got {0}")]
+    BadNackIndex(u8),
     #[error("unknown codec byte: 0x{0:02x}")]
     UnknownCodec(u8),
     #[error("codec {0:?} is not supported by this receiver")]

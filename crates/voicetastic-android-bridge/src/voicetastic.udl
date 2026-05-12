@@ -88,6 +88,8 @@ enum VoiceError {
     "CodecMismatch",
     "TotalMismatch",
     "StreamSeqMismatch",
+    "ParityCountDecrease",
+    "BadNackIndex",
     "UnknownCodec",
     "UnsupportedCodec",
     "Blacklisted",

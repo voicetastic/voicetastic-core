@@ -70,6 +70,10 @@ pub enum VoiceError {
     TotalMismatch,
     #[error("stream_seq mismatch within message")]
     StreamSeqMismatch,
+    #[error("parity_count decreased within message")]
+    ParityCountDecrease,
+    #[error("NACK frame chunk_index must be 0")]
+    BadNackIndex,
     #[error("unknown codec byte")]
     UnknownCodec,
     #[error("codec is not supported by this receiver")]
@@ -112,6 +116,8 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::CodecMismatch { .. } => Self::CodecMismatch,
             v::VoiceError::TotalMismatch { .. } => Self::TotalMismatch,
             v::VoiceError::StreamSeqMismatch { .. } => Self::StreamSeqMismatch,
+            v::VoiceError::ParityCountDecrease { .. } => Self::ParityCountDecrease,
+            v::VoiceError::BadNackIndex(_) => Self::BadNackIndex,
             v::VoiceError::UnknownCodec(_) => Self::UnknownCodec,
             v::VoiceError::UnsupportedCodec(_) => Self::UnsupportedCodec,
             v::VoiceError::Blacklisted => Self::Blacklisted,

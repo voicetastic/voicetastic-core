@@ -112,6 +112,10 @@ impl ChunkHeader {
                 if encrypted {
                     return Err(VoiceError::EncryptedNack);
                 }
+                // Spec §3.4: NACK frames carry chunk_index = 0.
+                if chunk_index != 0 {
+                    return Err(VoiceError::BadNackIndex(chunk_index));
+                }
             }
         }
         Ok((

@@ -137,7 +137,8 @@ Every frame is at most 231 bytes and starts with a 12-byte header:
 |   0     | `AMR_NB`    | AMR-NB bitrate ordinal (0..=7), see §3.2.1                  |
 |   1     | `OPUS`      | bitrate / 1000 (kbps); typical range 6..=64, advisory only   |
 |   2     | `PCM_S16LE` | sample rate index: 0=8 kHz, 1=16 kHz                         |
-| 3..255  | reserved    | receivers MUST drop unknown codecs                           |
+|   3     | `CODEC2`    | Codec2 mode ordinal, see §3.2.2                             |
+| 4..255  | reserved    | receivers MUST drop unknown codecs                           |
 
 `codec_param` is codec-specific metadata passed through unmodified by the
 protocol; receivers SHOULD interpret it per the codec column above but the
@@ -146,7 +147,7 @@ protocol does not range-check it.
 The codec/codec_param fields are advisory: the protocol does not transcode.
 Receivers that do not support the advertised codec MUST drop the frame and
 SHOULD surface a "codec unsupported" event to the application layer.
-`codec` values in the `3..=255` range are reserved; receivers MUST drop
+`codec` values in the `4..=255` range are reserved; receivers MUST drop
 frames carrying them.
 
 #### 3.2.1 AMR-NB bitrates
@@ -166,6 +167,20 @@ Default: `MR795`. Frame duration: 20 ms. The AMR file header `#!AMR\n` is
 **not** carried on the wire; senders strip it before chunking and receivers
 re-prepend it before writing files. The protocol body holds raw codec
 frames only.
+
+#### 3.2.2 Codec2 modes
+
+| Ordinal | Mode  | bitrate | Frame bytes |
+|---------|-------|---------|-------------|
+| 0       | 3200  | 3.2 kbps | 8           |
+| 1       | 2400  | 2.4 kbps | 6           |
+| 2       | 1600  | 1.6 kbps | 8           |
+| 3       | 1400  | 1.4 kbps | 7           |
+| 4       | 1300  | 1.3 kbps | 7           |
+| 5       | 1200  | 1.2 kbps | 6           |
+
+Default: `1200`. Frame duration is mode-dependent (20–40 ms). Like AMR-NB,
+the protocol body carries raw codec frames only; no container header.
 
 ### 3.3 Body layout
 
@@ -267,6 +282,15 @@ FEC uses **Reed-Solomon over GF(2⁸)** (`reed-solomon-erasure` crate) with
   `total_data` shards out of the `total_data + parity_count` total (any
   combination of DATA and PARITY shards counts toward the threshold).
   Loss up to `parity_count` shards is recoverable without a NACK.
+- **Final-chunk caveat.** The trimmed length of the final DATA chunk is
+  not carried on the wire (§3.3); receivers only learn it when they
+  observe the real final DATA frame. If the final DATA chunk is the
+  one missing, FEC alone cannot recover it without inventing trailing
+  zero-padding. Receivers MUST NOT finalize a message via FEC when the
+  final DATA shard's real length is unknown — they MUST either wait for
+  the real frame (via NACK-driven retransmit) or fall back to a partial
+  finalize on hard timeout. The reference implementation defers FEC
+  recovery of the last shard in exactly this case.
 - `parity_count` is sender policy; recommended values:
 
 | Mesh profile      | `parity_count` (% of `total_data`) |
@@ -463,7 +487,13 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
   drain (which can outrun the receiver's completion by tens of seconds
   on slow presets) doesn't resurrect a phantom partial reassembly.
   The window should be ≥ the assembler's `message_timeout`.
-- `NACK_MAX_ROUNDS = 3` per message before the receiver gives up.
+- `NACK_MAX_ROUNDS = 32` cumulative per message before the receiver
+  gives up. This counter is *not* reset on progress: a sender that
+  trickles one shard just before every quiet-window deadline must
+  still finish within this many NACK rounds, otherwise the assembler
+  finalizes partial. The previous value of `3` gave up after only
+  ~4–5 s of quiet, which is far too aggressive on slow LoRa presets
+  where inter-chunk gaps routinely exceed a second.
 - `NACK_WINDOW_MS = 1500` after the last seen chunk before issuing a NACK.
   Global NACK emission is bounded by `MAX_IN_PROGRESS_GLOBAL` per tick;
   senders / transports SHOULD pace NACK transmission per §2.1.
@@ -484,12 +514,16 @@ following hold:
   frame of this `(from, message_id)`
 - the frame's `total_data` differs from the value established by the first
   frame of this `(from, message_id)`
+- the frame's `parity_count` is **less than** the value established by the
+  first frame of this `(from, message_id)` (spec §5: it MAY grow on
+  retransmit but MUST NOT shrink)
 - DATA body length differs from the message's established `chunk_size` and
   this is not the last data chunk
 - PARITY body length differs from the message's established `chunk_size`
 - AES-GCM tag verification fails
 - `encrypted = 1` but the receiver has no channel PSK configured, or the
   frame's `from` is not a strict `!hex8` Meshtastic node id
+- a NACK frame's `chunk_index` is non-zero (spec §3.4)
 - the `(from, message_id)` is on the recently-completed blacklist
 - the sender already has `MAX_IN_PROGRESS_PER_SENDER` in-flight messages
   and this is a new `message_id`
@@ -516,7 +550,7 @@ pub struct VoiceMessage {
     pub encrypted: bool,                    // was on the wire?
 }
 
-pub enum VoiceCodec { AmrNb, Opus, PcmS16Le, Unknown(u8) }
+pub enum VoiceCodec { AmrNb, Opus, PcmS16Le, Codec2, Unknown(u8) }
 pub enum VoiceDestination { Node(u32), Broadcast }
 ```
 
@@ -537,7 +571,7 @@ container themselves if needed (e.g. `#!AMR\n` for AMR-NB playback).
 | Stream sequence wrap             | 256             | per-(from,channel)                      |
 | Encryption                       | AES-256-GCM     | end-to-end on top of channel AES-CTR    |
 | FEC                              | RS over GF(2⁸)  | survives any `parity_count` losses      |
-| Max NACK rounds                  | 3               | bounds total airtime per message        |
+| Max NACK rounds                  | 32 cumulative  | bounds total airtime per message        |
 | Codec                            | application-decided | protocol carries opaque bytes        |
 
 The protocol explicitly does **not** provide:
@@ -569,9 +603,9 @@ pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
 pub const MAX_PARITY_PER_MESSAGE: usize = 128;
 pub const MAX_IN_PROGRESS_GLOBAL: usize = 64;
 pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
-pub const BLACKLIST_TTL: Duration = Duration::from_secs(60);
+pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 pub const BLACKLIST_MAX: usize = 100;
-pub const NACK_MAX_ROUNDS: u8 = 3;
+pub const NACK_MAX_ROUNDS: u8 = 32;
 pub const NACK_WINDOW_MS: u64 = 1500;
 pub const GCM_NONCE_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;

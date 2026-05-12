@@ -34,7 +34,15 @@ pub(super) struct AssemblyState {
     pub(super) started_at: Instant,
     pub(super) last_chunk_at: Instant,
     pub(super) first_seen: chrono::DateTime<chrono::Utc>,
+    /// Number of NACK rounds emitted *since the last accepted shard*. Reset
+    /// to 0 in the ingest path so a slowly trickling message doesn't burn
+    /// through the round budget. Used purely for the wire `round` field on
+    /// emitted NACKs; the hard give-up bound lives on `total_nack_rounds`.
     pub(super) nack_rounds: u8,
+    /// Cumulative NACK rounds emitted across the lifetime of this message.
+    /// Never reset. Compared against `max_nack_rounds` to bound how long a
+    /// trickle-feeding sender can keep an assembly slot alive.
+    pub(super) total_nack_rounds: u8,
     /// Count of post-template validation failures (codec / total_data /
     /// stream_seq mismatch). After [`super::config::MAX_VALIDATION_STRIKES`]
     /// the entry is evicted and blacklisted to keep a chatty bad sender
@@ -65,6 +73,7 @@ impl AssemblyState {
             last_chunk_at: Instant::now(),
             first_seen: chrono::Utc::now(),
             nack_rounds: 0,
+            total_nack_rounds: 0,
             validation_strikes: 0,
             to,
             channel,
@@ -76,6 +85,14 @@ impl AssemblyState {
     /// Attempt Reed–Solomon recovery if we have at least `total_data` shards
     /// in total (data + parity). No-op when `parity_count == 0` or the
     /// chunk size is not yet pinned.
+    ///
+    /// Note: when the final DATA chunk is the missing shard and its real
+    /// (un-padded) length is unknown (we never saw the original frame),
+    /// recovery is skipped — reconstructing it from parity would yield a
+    /// padded `chunk_size`-byte shard with no way to trim the trailing
+    /// zeros, silently corrupting the tail of the audio for many codecs.
+    /// The receiver falls back to NACK-driven retransmit of that specific
+    /// chunk, or to a partial finalize on hard timeout.
     pub(super) fn try_fec_recover(&mut self) -> Result<()> {
         if self.header_template.parity_count == 0 {
             return Ok(());
@@ -88,6 +105,14 @@ impl AssemblyState {
         let parity_count = self.header_template.parity_count as usize;
         let present = self.received_data as usize + self.received_parity as usize;
         if present < total_data {
+            return Ok(());
+        }
+        // Guard against the silent-truncation case: the final DATA chunk is
+        // missing and we never observed its real length. RS would happily
+        // hand us back `chunk_size` zero-padded bytes that we cannot trim.
+        // Wait for the real frame (via NACK) or timeout instead.
+        let last_idx = total_data - 1;
+        if total_data > 0 && self.data_shards[last_idx].is_none() && self.last_data_len.is_none() {
             return Ok(());
         }
 

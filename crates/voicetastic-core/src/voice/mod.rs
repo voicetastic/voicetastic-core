@@ -401,4 +401,93 @@ mod tests {
             );
         }
     }
+
+    /// Regression for finding #1: when the **last** DATA chunk is lost and
+    /// we have enough parity to reconstruct it, the assembler must NOT
+    /// silently emit a padded shard \u2014 its real (un-padded) length was
+    /// never observed on the wire, so any trailing zeros would corrupt the
+    /// audio tail. The expected behaviour is: defer FEC recovery for the
+    /// final chunk and stay Pending until a NACK retransmit brings the
+    /// real frame in.
+    #[test]
+    fn fec_does_not_pad_recovered_last_data() {
+        // 3 data chunks + 1 trimmed last chunk; 2 parity shards.
+        let audio = synthesize(64 * 3 + 17);
+        let enc = build_message(&audio, &cfg(2, false)).unwrap();
+        assert_eq!(enc.total_data, 4);
+        assert_eq!(enc.parity_count, 2);
+        let asm = assembler(false);
+        // Deliver the first 3 data chunks + both parity shards, but
+        // omit the trimmed final data chunk. Parity alone could in
+        // principle reconstruct slot 3 \u2014 the test pins that we do NOT
+        // synthesize a corrupt last shard.
+        for i in [0usize, 1, 2, 4, 5] {
+            match asm.accept("!ab", VoiceDestination::Broadcast, 0, &enc.frames[i]) {
+                AssemblyEvent::Pending { .. } => {}
+                e => panic!("unexpected event for idx {i}: {e:?}"),
+            }
+        }
+        // Now deliver the real final DATA chunk; this should complete the
+        // message cleanly with the correct audio bytes (no trailing pad).
+        match asm.accept("!ab", VoiceDestination::Broadcast, 0, &enc.frames[3]) {
+            AssemblyEvent::Complete(m) => {
+                assert!(m.is_complete);
+                assert_eq!(m.audio, audio, "audio must match exactly — no padding");
+            }
+            e => panic!("expected Complete on final DATA arrival, got {e:?}"),
+        }
+    }
+
+    /// Regression for finding #7: a follow-up frame whose `parity_count`
+    /// is **less than** the value established by the first frame is
+    /// rejected as `ParityCountDecrease`.
+    #[test]
+    fn parity_count_decrease_is_rejected() {
+        let audio = synthesize(64 * 3);
+        let enc = build_message(&audio, &cfg(2, false)).unwrap();
+        let asm = assembler(false);
+        // Establish template with parity_count = 2.
+        let _ = asm.accept("!cd", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        // Forge a follow-up DATA frame for chunk 1 with parity_count = 1.
+        let mut tampered = enc.frames[1].clone();
+        tampered[11] = 1; // parity_count byte
+        let ev = asm.accept("!cd", VoiceDestination::Broadcast, 0, &tampered);
+        assert!(
+            matches!(
+                ev,
+                AssemblyEvent::Rejected(VoiceError::ParityCountDecrease { first: 2, got: 1 })
+            ),
+            "expected ParityCountDecrease, got {ev:?}",
+        );
+    }
+
+    /// Spec \u00a73.4: NACK frames carry `chunk_index = 0`. The header parser
+    /// MUST reject any other value before the body is touched.
+    #[test]
+    fn nack_with_nonzero_chunk_index_is_rejected() {
+        use super::types::PacketType;
+        // Build a syntactically valid NACK header with chunk_index = 5.
+        let h = ChunkHeader {
+            packet_type: PacketType::Nack,
+            encrypted: false,
+            last_in_stream: false,
+            message_id: 0xCAFEBABE,
+            codec: VoiceCodec::Opus,
+            codec_param: 16,
+            stream_seq: 0,
+            chunk_index: 5,
+            total_data: 4,
+            parity_count: 0,
+        };
+        let mut frame = vec![0u8; HEADER_SIZE + 4];
+        frame[..HEADER_SIZE].copy_from_slice(&h.serialize());
+        // Minimal NACK body (nack_version + flags + 1 bitmap byte).
+        frame[HEADER_SIZE..].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        let asm = assembler(false);
+        let ev = asm.accept("!ef", VoiceDestination::Broadcast, 0, &frame);
+        assert!(
+            matches!(ev, AssemblyEvent::Rejected(VoiceError::BadNackIndex(5))),
+            "expected BadNackIndex(5), got {ev:?}",
+        );
+    }
 }
