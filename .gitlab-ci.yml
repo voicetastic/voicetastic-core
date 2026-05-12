@@ -54,22 +54,14 @@ fmt:
 # Pipeline does:
 #   1. compute new vX.Y.Z from last tag + commits since
 #   2. push annotated tag vX.Y.Z
-#   3. ask GitLab's changelog API to prepend a section to CHANGELOG.md
-#      on the default branch (using .gitlab/changelog_config.yml and
-#      the `Changelog:` trailer on each commit). GitLab commits the
-#      file change itself; we never push to main from this job.
-#   4. create a GitLab Release whose description is the generated
-#      changelog section (with a git-log fallback).
+#   3. create a GitLab Release whose description is the raw `git log`
+#      since the previous tag.
 #
 # Requirements:
 #   - CI/CD variable PROJECT_ACCESS_TOKEN (Project Access Token with
 #     `api` + `write_repository` scopes, role Maintainer).
 #   - Settings -> Repository -> Protected tags: allow Maintainers to
 #     create `v*`.
-#   - To populate the changelog, commits must carry a `Changelog:` git
-#     trailer (`added`, `changed`, `deprecated`, `removed`, `fixed`,
-#     `security`, `performance`, `other`). Commits without a trailer
-#     are intentionally omitted.
 release:
   stage: release
   before_script:
@@ -123,48 +115,12 @@ release:
       fi
     - git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
     - git push origin "${NEW_TAG}"
-    # Ask GitLab to generate the CHANGELOG.md section for this tag from
-    # the `Changelog:` trailers on commits in (LAST_TAG, NEW_TAG]. The
-    # API prepends the section to CHANGELOG.md on the default branch and
-    # commits the change as the GitLab system user.
-    #
-    # `from`/`to` are commit SHAs; when omitted, `from` defaults to the
-    # most recent matching tag before `to`, which is exactly what we
-    # want here. We still pass them explicitly for safety.
-    - |
-      FROM_SHA=""
-      if [ -n "${LAST_TAG:-}" ]; then
-        FROM_SHA="$(git rev-parse "${LAST_TAG}^{commit}")"
-      fi
-      TO_SHA="$(git rev-parse "${NEW_TAG}^{commit}")"
-      CHANGELOG_REQ="$(jq -n \
-        --arg version "${NEW_VERSION}" \
-        --arg from    "${FROM_SHA}" \
-        --arg to      "${TO_SHA}" \
-        --arg branch  "${CI_DEFAULT_BRANCH}" \
-        --arg config  ".gitlab/changelog_config.yml" \
-        --arg file    "CHANGELOG.md" \
-        '{version:$version, branch:$branch, config_file:$config, file:$file, to:$to}
-         + (if $from == "" then {} else {from:$from} end)')"
-      curl -fsS --request POST \
-        --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data "$CHANGELOG_REQ" \
-        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/changelog" \
-        || echo "Changelog API call failed (tag still pushed)."
-    # Fetch the just-generated section so we can use it as the Release
-    # description. GET /repository/changelog returns plain Markdown.
+    # Build the Release description from the raw git log since the
+    # previous tag.
     - |
       NOTES_FILE="$(mktemp)"
-      if curl -fsS --header "PRIVATE-TOKEN: ${PROJECT_ACCESS_TOKEN}" \
-           "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/repository/changelog?version=${NEW_VERSION}&config_file=.gitlab/changelog_config.yml" \
-           | jq -r '.notes' > "${NOTES_FILE}" && [ -s "${NOTES_FILE}" ]; then
-        echo "Got changelog notes from API."
-      else
-        echo "Falling back to git log for Release description."
-        git log --pretty=format:'- %s (%h)' "${LAST_TAG:+${LAST_TAG}..}HEAD" \
-          | head -n 200 > "${NOTES_FILE}"
-      fi
+      git log --pretty=format:'- %s (%h)' "${LAST_TAG:+${LAST_TAG}..}HEAD" \
+        | head -n 200 > "${NOTES_FILE}"
       NOTES="$(cat "${NOTES_FILE}")"
       JSON="$(jq -n --arg name "${NEW_TAG}" --arg tag "${NEW_TAG}" --arg desc "$NOTES" \
         '{name:$name, tag_name:$tag, description:$desc}')"
