@@ -148,9 +148,20 @@ release:
     # Refresh Cargo.lock so workspace crate version entries match.
     - cargo update --workspace --offline || cargo update --workspace
     - git add Cargo.toml Cargo.lock
-    - 'git commit -m "chore(release): ${NEW_TAG}" -m "[skip ci]"'
+    # Commit only if there are staged changes (version may already match, e.g. first release).
+    - |
+      if git diff --cached --quiet; then
+        echo "No version/lockfile changes to commit; tagging current HEAD as ${NEW_TAG}."
+        PUSH_COMMIT=0
+      else
+        git commit -m "chore(release): ${NEW_TAG}" -m "[skip ci]"
+        PUSH_COMMIT=1
+      fi
     - git tag -a "${NEW_TAG}" -m "Release ${NEW_TAG}"
-    - git push origin "HEAD:main"
+    - |
+      if [ "$PUSH_COMMIT" = "1" ]; then
+        git push origin "HEAD:main"
+      fi
     - git push origin "${NEW_TAG}"
     - |
       NOTES="$(git log --pretty=format:'- %s (%h)' ${RANGE_FROM}HEAD^ | head -n 200)"
