@@ -630,7 +630,22 @@ impl MeshService {
 
             // Push initial snapshots so the UI doesn't wait for the next change.
             push_my_info(&listener, &my_info.borrow());
-            push_nodes(&listener, &nodes.borrow());
+            // Delta-tracking for the node map: we only call `on_node_info` for
+            // entries that are new or have changed since the last emission.
+            //
+            // Without this, `push_nodes` re-emitted the *entire* map every
+            // time any single node was added or updated. During a config burst
+            // of N nodes that produced N*(N+1)/2 cross-FFI calls (210 for 20
+            // nodes) instead of N. The extra calls also triggered an equal
+            // number of `_nodes.value` StateFlow emissions + UI recompositions
+            // on the Kotlin side.
+            let mut pushed_nodes: std::collections::HashMap<u32, NodeInfo> = {
+                let snap = nodes.borrow();
+                for ni in snap.values() {
+                    listener.on_node_info(encode(ni));
+                }
+                snap.clone()
+            };
             push_config_variant(
                 &listener,
                 lora.borrow().as_ref().map(|c| config::PayloadVariant::Lora(c.clone())),
@@ -682,7 +697,17 @@ impl MeshService {
                 tokio::select! {
                     biased;
                     Ok(_) = my_info.changed() => push_my_info(&listener, &my_info.borrow_and_update()),
-                    Ok(_) = nodes.changed() => push_nodes(&listener, &nodes.borrow_and_update()),
+                    Ok(_) = nodes.changed() => {
+                        // Only emit nodes that are new or have changed since the
+                        // last call. See the `pushed_nodes` comment above.
+                        let snap = nodes.borrow_and_update();
+                        for (num, ni) in snap.iter() {
+                            if pushed_nodes.get(num) != Some(ni) {
+                                listener.on_node_info(encode(ni));
+                            }
+                        }
+                        pushed_nodes = snap.clone();
+                    },
                     Ok(_) = lora.changed() => push_config_variant(
                         &listener,
                         lora.borrow_and_update()
@@ -756,18 +781,6 @@ fn encode<M: prost::Message>(msg: &M) -> Vec<u8> {
 fn push_my_info(listener: &Arc<dyn MeshConfigListener>, snap: &Option<MyNodeInfo>) {
     if let Some(info) = snap {
         listener.on_my_info(encode(info));
-    }
-}
-
-fn push_nodes(
-    listener: &Arc<dyn MeshConfigListener>,
-    snap: &std::collections::HashMap<u32, NodeInfo>,
-) {
-    // We don't get per-node deltas from the watch — emit each node every
-    // time the map changes. Cheap enough: nodes are small and the burst
-    // settles quickly.
-    for ni in snap.values() {
-        listener.on_node_info(encode(ni));
     }
 }
 
