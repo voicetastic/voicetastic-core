@@ -4070,7 +4070,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voicetastic-android-bridge"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "once_cell",
@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "voicetastic-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4096,7 +4096,7 @@ dependencies = [
 
 [[package]]
 name = "voicetastic-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -4121,7 +4121,7 @@ dependencies = [
 
 [[package]]
 name = "voicetastic-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "codec2",
  "cpal",
