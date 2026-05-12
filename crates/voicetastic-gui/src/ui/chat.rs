@@ -267,7 +267,10 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                     ui.label(format!("{prefix}: {}", entry.text));
                     if let Some(v) = entry.voice.as_ref()
                         && audio::is_available()
-                        && matches!(v.codec, VoiceCodec::Opus | VoiceCodec::Codec2)
+                        && matches!(
+                            v.codec,
+                            VoiceCodec::Opus | VoiceCodec::Codec2 | VoiceCodec::AmrNb
+                        )
                     {
                         if is_playing {
                             if inline_player(ui, app.voice_playback.as_ref()) {
