@@ -46,9 +46,9 @@ async fn main() -> Result<()> {
                 let device = require_device(cli.device)?;
                 commands::voice::send(&device, channel, to, &file, bitrate, parity).await
             }
-            VoiceCmd::Listen { out_dir } => {
+            VoiceCmd::Listen { out_dir, format } => {
                 let device = require_device(cli.device)?;
-                commands::voice::listen(&device, &out_dir).await
+                commands::voice::listen(&device, &out_dir, &format).await
             }
         },
         Command::Device { cmd } => {

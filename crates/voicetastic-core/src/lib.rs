@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 //! Shared core for the Voicetastic desktop client.
 //!
 //! Wire-compatible with the upstream Android app: same Meshtastic GATT UUIDs,

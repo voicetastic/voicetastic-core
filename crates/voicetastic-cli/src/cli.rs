@@ -113,11 +113,14 @@ pub enum VoiceCmd {
         #[arg(long)]
         to: Option<u32>,
     },
-    /// Listen for incoming voice messages and write each as a `.amr` file.
+    /// Listen for incoming voice messages.
     Listen {
         /// Output directory.
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
+        /// Output format: amr, opus, codec2, pcm (default: amr).
+        #[arg(long, default_value = "amr")]
+        format: String,
     },
 }
 

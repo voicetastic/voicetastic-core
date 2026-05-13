@@ -21,6 +21,17 @@ use crate::connect::connect;
 /// AMR-NB file header — stripped on send, re-prepended on receive.
 const AMR_FILE_HEADER: &[u8] = b"#!AMR\n";
 
+/// File extension for each codec.
+fn codec_extension(codec: VoiceCodec) -> &'static str {
+    match codec {
+        VoiceCodec::AmrNb => "amr",
+        VoiceCodec::Opus => "opus",
+        VoiceCodec::Codec2 => "c2",
+        VoiceCodec::PcmS16Le => "pcm",
+        VoiceCodec::Unknown(_) => "bin",
+    }
+}
+
 pub async fn send(
     device: &str,
     channel: u32,
@@ -111,7 +122,7 @@ pub async fn send(
     Ok(())
 }
 
-pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
+pub async fn listen(device: &str, out_dir: &Path, _format: &str) -> Result<()> {
     tokio::fs::create_dir_all(out_dir).await.ok();
     // Canonicalize once so symlinks / `..` segments in the user-provided path
     // are resolved up front. Subsequent writes are validated against this
@@ -138,12 +149,10 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
             _ = tick.tick() => {
                 let out = assembler.tick();
                 for completed in out.finalized {
-                    save_amr(&base_dir, &completed).await?;
+                    save_voice(&base_dir, &completed).await?;
                 }
                 // Forward outbound NACKs to the originating sender so the
                 // receive→send selective-retransmission loop can close.
-                // (A future commit will add the sender-side state machine
-                // that consumes these NACKs and retransmits missing chunks.)
                 for nack in out.nacks {
                     let to_node = match voicetastic_core::ids::node_id_to_num(&nack.from) {
                         Ok(n) => n,
@@ -177,7 +186,7 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
                         VoiceDestination::Node(d.to)
                     };
                     match assembler.accept(&from_id, to, d.channel, &d.payload) {
-                        AssemblyEvent::Complete(msg) => save_amr(&base_dir, &msg).await?,
+                        AssemblyEvent::Complete(msg) => save_voice(&base_dir, &msg).await?,
                         AssemblyEvent::Pending { .. } | AssemblyEvent::Duplicate => {}
                         AssemblyEvent::Nack(_) => {}
                         AssemblyEvent::Rejected(e) => warn!(?e, "rejected voice frame"),
@@ -220,27 +229,30 @@ fn safe_join(base_dir: &Path, filename: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-async fn save_amr(base_dir: &Path, msg: &VoiceMessage) -> Result<()> {
-    if msg.codec != VoiceCodec::AmrNb {
-        warn!(codec = ?msg.codec, "skipping non-AMR voice message");
-        return Ok(());
-    }
+async fn save_voice(base_dir: &Path, msg: &VoiceMessage) -> Result<()> {
+    let ext = codec_extension(msg.codec);
     let filename = format!(
-        "{}_{}.amr",
+        "{}_{}.{ext}",
         msg.from.trim_start_matches('!'),
-        msg.message_id
+        msg.message_id,
     );
     let path = safe_join(base_dir, &filename)?;
-    // Re-prepend the AMR file header so the resulting file is playable.
-    let mut out = Vec::with_capacity(AMR_FILE_HEADER.len() + msg.audio.len());
-    out.extend_from_slice(AMR_FILE_HEADER);
-    out.extend_from_slice(&msg.audio);
+    let out = if msg.codec == VoiceCodec::AmrNb {
+        // Re-prepend the AMR file header so the resulting file is playable.
+        let mut buf = Vec::with_capacity(AMR_FILE_HEADER.len() + msg.audio.len());
+        buf.extend_from_slice(AMR_FILE_HEADER);
+        buf.extend_from_slice(&msg.audio);
+        buf
+    } else {
+        msg.audio.clone()
+    };
     tokio::fs::write(&path, &out).await?;
     println!(
-        "received voice from {} ({} bytes, complete={}) -> {}",
+        "received voice from {} ({} bytes, complete={}, codec={:?}) -> {}",
         msg.from,
         out.len(),
         msg.is_complete,
+        msg.codec,
         path.display()
     );
     Ok(())
