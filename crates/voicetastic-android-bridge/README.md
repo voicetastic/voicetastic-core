@@ -8,8 +8,9 @@ Two surfaces:
 1. **Voice protocol** — `build_message`, `VoiceAssembler`, `build_nack`,
    `random_message_id`, `detect_version`. Replaces the Kotlin
    `VoiceChunker` / `VoiceAssembler` (protocol v1) with calls into
-   `voicetastic-core::voice::*` (protocol v2: 12-byte header, AES-GCM
-   envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
+   `voicetastic-core::voice::*` (protocol v2: 16-byte header with
+   4-byte trailing MAC, AES-GCM envelope, Reed-Solomon FEC, NACK-driven
+   selective retransmit).
 2. **Settings** — `SettingsApi`, the centralised client-side preference
    facade (last device, voice max duration, reassembly timeout,
    outgoing codec, Codec2 mode, AMR-NB mode). Same TOML schema as the desktop GUI /

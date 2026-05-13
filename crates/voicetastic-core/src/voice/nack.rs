@@ -7,6 +7,11 @@ use super::types::{PacketType, VoiceCodec};
 
 /// Build a NACK frame for `(from, message_id)` reporting `missing` data
 /// chunk indices.
+///
+/// `mac_key` controls the trailing header MAC: `Some(psk)` ⇒
+/// HMAC-SHA256, `None` ⇒ unkeyed SHA-256. A receiver emitting a NACK
+/// for a frame stream it accepted under a PSK SHOULD pass the same PSK
+/// here so the sender can authenticate the retransmit request.
 #[allow(clippy::too_many_arguments)]
 pub fn build_nack(
     message_id: u32,
@@ -17,6 +22,7 @@ pub fn build_nack(
     parity_count: u8,
     missing: &[u8],
     give_up: bool,
+    mac_key: Option<&[u8]>,
 ) -> Vec<u8> {
     let bitmap_len = (total_data as usize).div_ceil(8);
     let mut body = Vec::with_capacity(2 + bitmap_len);
@@ -31,7 +37,7 @@ pub fn build_nack(
         let bit = 7 - ((idx as usize) % 8);
         body[byte] |= 1 << bit;
     }
-    let header = ChunkHeader {
+    let mut header = ChunkHeader {
         packet_type: PacketType::Nack,
         encrypted: false,
         last_in_stream: false,
@@ -42,9 +48,10 @@ pub fn build_nack(
         chunk_index: 0,
         total_data,
         parity_count,
+        mac_keyed: false,
     };
     let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
-    frame.extend_from_slice(&header.serialize());
+    frame.extend_from_slice(&header.serialize_with_mac(mac_key));
     frame.extend_from_slice(&body);
     frame
 }
@@ -94,8 +101,18 @@ mod tests {
 
     #[test]
     fn nack_roundtrip() {
-        let frame = build_nack(0x1234, 0, VoiceCodec::Opus, 16, 10, 2, &[1, 4, 9], false);
-        let (h, body) = ChunkHeader::parse(&frame).unwrap();
+        let frame = build_nack(
+            0x1234,
+            0,
+            VoiceCodec::Opus,
+            16,
+            10,
+            2,
+            &[1, 4, 9],
+            false,
+            None,
+        );
+        let (h, body) = ChunkHeader::parse(&frame, None).unwrap();
         assert_eq!(h.packet_type, PacketType::Nack);
         let info = parse_nack_body(&h, body).unwrap();
         assert_eq!(info.missing, vec![1, 4, 9]);

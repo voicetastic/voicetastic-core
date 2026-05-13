@@ -4,7 +4,7 @@
 
 | Term                       | Definition                                                                                                                                       |
 |----------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| **AAD**                    | Additional Authenticated Data in AES-GCM. The voice protocol uses the 12-byte chunk header as AAD so any header tampering fails tag verification. |
+| **AAD**                    | Additional Authenticated Data in AES-GCM. The voice protocol uses the 12 logical header bytes (`header[0..12]`, excluding the 4-byte MAC trailer) as AAD so any header tampering fails tag verification. |
 | **AES-256-GCM**            | Authenticated symmetric cipher used for the optional end-to-end envelope. 96-bit nonce, 128-bit tag.                                              |
 | **AMR-NB**                 | Adaptive Multi-Rate Narrowband. The reference codec; 8 bitrates from 4.75 to 12.2 kbps, 20 ms frame.                                              |
 | **`channel`**              | Meshtastic channel index (`u32`). Determines the channel PSK used for both Meshtastic AES-CTR and the voice envelope HKDF salt.                   |
@@ -24,7 +24,7 @@
 | **MTU**                    | Maximum Transmission Unit. Meshtastic LoRa MTU = 231 bytes (= `MAX_PACKET_SIZE`).                                                                 |
 | **NACK frame**             | Negative ACK with bitmap of missing DATA chunk indices. See [Frame Format](Frame-Format.md#nack-frames).                                          |
 | **`nack_window_ms`**       | Quiet period (default 1500 ms) after the last seen chunk before the receiver issues a NACK round.                                                  |
-| **`nack_rounds`**          | Per-message counter; receiver gives up after `NACK_MAX_ROUNDS = 3`.                                                                               |
+| **`nack_rounds`**          | Per-message counter of consecutive NACK rounds without progress; reset whenever a new shard lands, capped at `NACK_MAX_ROUNDS = 32`.            |
 | **PARITY frame**           | A frame whose body is a Reed-Solomon parity shard. Always `chunk_size` bytes.                                                                     |
 | **`packet_type`**          | Top 2 bits of `type_flags`: 0 = DATA, 1 = PARITY, 2 = NACK, 3 reserved.                                                                           |
 | **`parity_count`**         | Number of FEC parity shards in a message. 0 disables FEC; max 128.                                                                                |

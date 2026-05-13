@@ -36,16 +36,14 @@ byte-by-byte, and provides recipes for senders and receivers.
    works. AMR-NB is the reference choice (see [Sender Guide](Sender-Guide.md)).
 2. **Encode your audio.** Strip codec container headers (e.g. `#!AMR\n`) — the
    wire only carries raw codec frames.
-3. **Build the message.** Call
-   [`build_message`](../../crates/voicetastic-core/src/voice/builder.rs) with
-   a [`BuildConfig`](../../crates/voicetastic-core/src/voice/builder.rs#L17)
-   that picks `chunk_size`, `parity_count`, and (optionally) an AES-GCM
-   envelope key.
-4. **Send each frame.** Push every entry of `EncodedMessage.frames` through
-   `MeshService::send_data` on `PortNum::PRIVATE_APP` (256), pacing per
-   [`ModemPreset::pacing`](../../crates/voicetastic-core/src/voice/types.rs#L94).
-5. **Receive.** On the other side, feed each PRIVATE_APP payload to
-   [`VoiceAssembler::accept`](../../crates/voicetastic-core/src/voice/assembler.rs);
+3. **Send.** Build a [`VoiceSender`](../../crates/voicetastic-core/src/voice/sender.rs)
+   once per `MeshService`, then call
+   [`VoiceSender::send`](../../crates/voicetastic-core/src/voice/sender.rs)
+   with a [`SendRequest`](../../crates/voicetastic-core/src/voice/sender.rs).
+   The sender owns build → burst → NACK → retransmit → linger; consume
+   `SendStatus` events from the returned handle.
+4. **Receive.** On the other side, feed each PRIVATE_APP payload to
+   [`VoiceAssembler::accept`](../../crates/voicetastic-core/src/voice/assembler/mod.rs);
    call `tick()` every ~100 ms to drive timeouts and NACKs.
 
 ---
@@ -53,8 +51,11 @@ byte-by-byte, and provides recipes for senders and receivers.
 ## Status
 
 - ✅ Builder, assembler, FEC, encryption envelope, NACK construction & parsing.
-- ✅ Receiver-driven NACK transmission (CLI listener forwards them).
-- ⏳ Sender-side state machine that consumes inbound NACKs and retransmits
-  selectively. Tracked as TODO; current senders do best-effort first transmission only.
+- ✅ Receiver-driven NACK transmission.
+- ✅ Sender-side state machine: [`VoiceSender`](../../crates/voicetastic-core/src/voice/sender.rs)
+  owns build → register → burst → NACK → retransmit → linger as a single
+  shared pipeline; CLI / GUI / Android frontends just submit a
+  `SendRequest` and consume `SendStatus` events. See the
+  [Sender Guide](Sender-Guide.md).
 
 See [`TODO.md`](../../TODO.md) for the wider roadmap.

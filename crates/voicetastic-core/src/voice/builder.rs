@@ -24,6 +24,12 @@ pub struct BuildConfig {
     /// If `Some`, every DATA/PARITY body is wrapped with the AES-GCM
     /// envelope. `None` keeps bodies plaintext.
     pub encryption: Option<EnvelopeKey>,
+    /// Channel PSK for the trailing 4-byte header MAC. `Some` ⇒
+    /// HMAC-SHA256 (authenticity); `None` ⇒ unkeyed SHA-256
+    /// (integrity only). Independent of `encryption`: a sender on a
+    /// PSK-configured channel SHOULD pass the PSK here even for
+    /// plaintext frames so the receiver can reject tampered headers.
+    pub mac_key: Option<Vec<u8>>,
 }
 
 /// Output of [`build_message`]: the wire frames to transmit, in send order.
@@ -146,8 +152,11 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
             chunk_index,
             total_data,
             parity_count,
+            // Overwritten by serialize_with_mac to mirror mac_key.
+            mac_keyed: false,
         };
-        let header_bytes = header.serialize();
+        let mut header = header;
+        let header_bytes = header.serialize_with_mac(cfg.mac_key.as_deref());
         let body = match &cfg.encryption {
             Some(key) => encrypt_body(key, &header_bytes, body_plain)?,
             None => body_plain.to_vec(),

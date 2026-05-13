@@ -27,7 +27,7 @@ sender/receiver recipes), see the [voice protocol wiki](docs/wiki/Home.md).
   authenticate payloads end-to-end on top of Meshtastic's channel encryption.
 
 Receivers MUST drop any frame whose first byte is not [`PROTOCOL_VERSION`]
-(`0x01`). The version byte exists so future revisions can coexist on the
+(`0x02`). The version byte exists so future revisions can coexist on the
 same port without breaking older receivers.
 
 ---
@@ -98,25 +98,29 @@ path as the initial DATA/PARITY frames.
 
 ## 3. Frame format
 
-Every frame is at most 231 bytes and starts with a 12-byte header:
+Every frame is at most 231 bytes and starts with a 16-byte header
+(12 logical bytes followed by a 4-byte MAC trailer):
 
 ```
  Byte  Size  Field            Encoding
  ───────────────────────────────────────────────────────────────────────
-   0     1   version          UInt8 = 0x01
+   0     1   version          UInt8 = 0x02
    1     1   type_flags       UInt8: bits 6-7 packet_type
                                      bit  5  encrypted
                                      bit  4  last_in_stream
-                                     bits 0-3 reserved (must be 0)
+                                     bit  3  mac_keyed
+                                     bits 0-2 reserved (must be 0)
    2     4   message_id       UInt32, big-endian
    6     1   codec            UInt8 (see §3.2)
    7     1   codec_param      UInt8 (codec-specific, see §3.2)
    8     1   stream_seq       UInt8 (per-(from,channel) monotonic)
    9     1   chunk_index      UInt8
   10     1   total_data       UInt8 (1..=255, original data chunks; 0 is reserved and rejected — see §9.2)
-  11     1   parity_count     UInt8 (0..=128, FEC parity chunks)
+  11     1   parity_count     UInt8 (0..=128, FEC parity chunks; 0 = no FEC, the default)
+  12     4   mac_tag          truncated HMAC-SHA256 (mac_keyed=1) or SHA-256
+                              (mac_keyed=0) over header[0..12]
  ───────────────────────────────────────────────────────────────────────
-  12   ≤219  body             see §3.3
+  16   ≤215  body             see §3.3
 ```
 
 ### 3.1 Packet types
@@ -197,7 +201,7 @@ encrypted; the `encrypted` bit MUST be zero.
 
 ### 3.4 NACK body
 
-A NACK frame carries the standard 12-byte header, with these constraints:
+A NACK frame carries the standard 16-byte header, with these constraints:
 
 - `packet_type = NACK` (binary `10` in `type_flags` bits 6–7)
 - `encrypted = 0` (NACKs MUST NOT use the AES-GCM envelope; see §7)
@@ -350,14 +354,15 @@ The protocol OPTIONALLY adds an end-to-end AES-256-GCM envelope on top:
   HKDF `info` string is preserved across protocol revisions for
   forward-compat with derivers that have already shipped — the literal
   `"voicetastic/v2"` is permanent and does not track the wire-protocol
-  version byte (currently `0x01`).
+  version byte (currently `0x02`).
 - **Sender id requirement**: when `encrypted = 1`, the receiver MUST
   reject any frame whose `from` is not a strict `!hex8` Meshtastic node
   id, since key derivation otherwise diverges silently.
 - **Nonce**: 96-bit random per frame, prepended to the body. Nonces are
   never reused for the same `key`; a fresh `message_id` ⇒ fresh `key` ⇒
   fresh nonce space.
-- **AAD** (additional authenticated data): the 12-byte chunk header,
+- **AAD** (additional authenticated data): the 12 logical header bytes
+  (`header[0..12]`, i.e. the header *excluding* the 4-byte MAC trailer),
   ensuring an attacker cannot tamper with `chunk_index`, `parity_count`,
   etc.
 - **Tag**: 16 bytes appended to the ciphertext, as per AES-GCM standard.
@@ -440,7 +445,8 @@ frame.
 chunk arrives
       │
       ▼
-parse 12-byte header  ─────► reject if version != 1
+parse 16-byte header  ─────► reject if version != 2
+                     ─────► reject if header MAC mismatches (§3)
       │
       ▼
 check blacklist        ─────► reject if already finalized
@@ -593,10 +599,10 @@ The protocol explicitly does **not** provide:
 ## Appendix A: Reference constants
 
 ```rust
-pub const PROTOCOL_VERSION: u8 = 0x01;
-pub const HEADER_SIZE: usize = 12;
+pub const PROTOCOL_VERSION: u8 = 0x02;
+pub const HEADER_SIZE: usize = 16;
 pub const MAX_PACKET_SIZE: usize = 231;
-pub const MAX_BODY_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;  // 219
+pub const MAX_BODY_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;  // 215
 pub const MAX_MESSAGE_BYTES: usize = MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE;  // 55_845
 pub const MIN_CHUNK_SIZE: usize = 16;
 pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
@@ -616,10 +622,10 @@ pub const GCM_TAG_LEN: usize = 16;
 ```
    type_flags byte:
      bit 7  bit 6  bit 5      bit 4           bits 3..0
-     ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────────┐
-     │ packet_type  │ │encrypted│ │last_in_stream│ │  reserved  │
-     └──────────────┘ └─────────┘ └──────────────┘ └────────────┘
-       (2 bits)       (1 bit)      (1 bit)         (4 bits, =0)
+     ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
+     │ packet_type  │ │encrypted│ │last_in_stream│ │mac_keyed│ │ reserved │
+     └──────────────┘ └─────────┘ └──────────────┘ └────────┘ └──────────┘
+       (2 bits)       (1 bit)      (1 bit)         (1 bit)    (3 bits, =0)
 ```
 
 | Field            | Mask   |
@@ -627,4 +633,5 @@ pub const GCM_TAG_LEN: usize = 16;
 | `packet_type`    | `0xC0` |
 | `encrypted`      | `0x20` |
 | `last_in_stream` | `0x10` |
-| reserved         | `0x0F` |
+| `mac_keyed`      | `0x08` |
+| reserved         | `0x07` |

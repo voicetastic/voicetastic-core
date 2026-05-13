@@ -22,6 +22,7 @@ getrandom = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 aes-gcm = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 
 # Optional desktop transports. Off-by-default for Android / embedded

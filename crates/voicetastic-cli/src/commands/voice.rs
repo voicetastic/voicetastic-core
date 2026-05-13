@@ -12,8 +12,8 @@ use tracing::{info, warn};
 use voicetastic_core::ports::PRIVATE_APP;
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
-    AssemblerConfig, AssemblyEvent, BuildConfig, MAX_BODY_SIZE, ModemPreset, VoiceAssembler,
-    VoiceCodec, VoiceDestination, VoiceMessage, build_message, detect_version, random_message_id,
+    AssemblerConfig, AssemblyEvent, PROTOCOL_VERSION, SendRequest, SendStatus, VoiceAssembler,
+    VoiceCodec, VoiceDestination, VoiceMessage, VoiceSender, detect_version,
 };
 
 use crate::connect::connect;
@@ -46,30 +46,67 @@ pub async fn send(
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
 
-    let cfg = BuildConfig {
-        message_id: random_message_id().context("generating message id (OS RNG)")?,
-        stream_seq: 0,
-        codec: VoiceCodec::AmrNb,
-        codec_param: bitrate,
-        chunk_size: MAX_BODY_SIZE,
-        parity_count: parity,
-        last_in_stream: true,
-        encryption: None,
-    };
-    let encoded = build_message(audio, &cfg).context("chunking audio")?;
-    info!(
-        message_id = cfg.message_id,
-        data = encoded.total_data,
-        parity = encoded.parity_count,
-        "sending voice"
-    );
-    let ids = svc
-        .send_voice(&encoded, channel, to, ModemPreset::fallback_pacing())
-        .await?;
-    println!(
-        "sent voice message_id={}, packet_ids={:?}",
-        cfg.message_id, ids
-    );
+    // `VoiceSender` owns build → register → burst → NACK-driven
+    // retransmit → linger; the CLI just consumes the status stream.
+    let sender = VoiceSender::new(svc.clone());
+    let handle = sender
+        .send(SendRequest {
+            audio: audio.to_vec(),
+            codec: VoiceCodec::AmrNb,
+            codec_param: bitrate,
+            channel,
+            to,
+            parity_count: parity,
+            last_in_stream: true,
+            ..Default::default()
+        })
+        .context("starting voice send")?;
+    info!(message_id = handle.message_id, "sending voice");
+    println!("sending voice message_id={}", handle.message_id);
+
+    let mut rx = handle.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(status) => {
+                let terminal = status.is_terminal();
+                match &status {
+                    SendStatus::Building {
+                        total_data,
+                        parity_count,
+                        ..
+                    } => {
+                        println!("  building: {total_data} data + {parity_count} parity frames");
+                    }
+                    SendStatus::Sending { sent, total, .. } => {
+                        info!(sent, total, "voice frame enqueued");
+                    }
+                    SendStatus::BurstComplete { packet_ids, .. } => {
+                        println!("  burst complete ({} frames on the wire)", packet_ids.len());
+                    }
+                    SendStatus::Retransmitting { chunks, .. } => {
+                        println!("  retransmitting {} chunk(s)", chunks.len());
+                    }
+                    SendStatus::Complete { message_id } => {
+                        println!("  complete (message_id={message_id})");
+                    }
+                    SendStatus::GaveUp { message_id } => {
+                        println!("  receiver gave up (message_id={message_id})");
+                    }
+                    SendStatus::Failed { message, .. } => {
+                        println!("  failed: {message}");
+                    }
+                }
+                if terminal {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!(skipped = n, "CLI status subscriber lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+
     let _ = svc.disconnect().await;
     Ok(())
 }
@@ -87,7 +124,11 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
     }
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let assembler = VoiceAssembler::new(AssemblerConfig::default());
+    let assembler = VoiceAssembler::new({
+        let mut cfg = AssemblerConfig::default();
+        cfg.sync_nack_cap_to_timeout();
+        cfg
+    });
     let mut rx = svc.subscribe_data();
     info!("listening for voice messages, ctrl-c to stop");
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -128,7 +169,7 @@ pub async fn listen(device: &str, out_dir: &Path) -> Result<()> {
             data = rx.recv() => match data {
                 Ok(d) => {
                     if d.portnum != PRIVATE_APP as i32 { continue; }
-                    if detect_version(&d.payload) != Some(0x01) { continue; }
+                    if detect_version(&d.payload) != Some(PROTOCOL_VERSION) { continue; }
                     let from_id = voicetastic_core::ids::node_num_to_id(d.from);
                     let to = if d.to == voicetastic_core::ports::BROADCAST_ADDR {
                         VoiceDestination::Broadcast

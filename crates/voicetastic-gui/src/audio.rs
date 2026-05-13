@@ -54,10 +54,28 @@ pub const AMRNB_SAMPLE_RATE_HZ: u32 = 8_000;
 /// Samples per AMR-NB frame (20 ms @ 8 kHz mono).
 #[allow(dead_code)]
 pub const AMRNB_SAMPLES_PER_FRAME: usize = 160;
-/// Target Opus bitrate. 12 kbps voice keeps a 30 s clip under the
-/// protocol's per-message size budget.
+/// Default Opus bitrate, in bps. Mirrors
+/// `voicetastic_core::settings::DEFAULT_OPUS_BITRATE_KBPS`. The actual
+/// bitrate is taken at runtime from the protocol header's
+/// `codec_param` field (interpreted as kbps for Opus). This constant
+/// is only used as a fallback when `codec_param == 0` (older sender
+/// that pre-dates per-message bitrate signalling).
 #[allow(dead_code)]
 pub const OPUS_BITRATE: i32 = 12_000;
+
+/// Sender-side Opus bandwidth selector. Receivers don't need this —
+/// the Opus bitstream self-describes per packet — so it travels
+/// out-of-band as an extra argument to [`Recorder::start`] (or via
+/// [`SettingsApi::voice_opus_bandwidth`] in the GUI flow).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpusBandwidth {
+    /// SILK 8 kHz — telephony-grade voice, lowest airtime.
+    Narrow,
+    /// SILK 16 kHz — HD voice, default.
+    #[default]
+    Wide,
+}
 
 /// Errors surfaced by the audio path. Kept small so the UI can map them to
 /// a user-facing status string without pattern matching every variant.
@@ -188,7 +206,7 @@ mod imp {
     use codec2::{Codec2, Codec2Mode};
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, SupportedStreamConfig};
-    use opus::{Application, Bitrate, Channels, Decoder, Encoder};
+    use opus::{Application, Bandwidth, Bitrate, Channels, Decoder, Encoder};
     use parking_lot::Mutex;
 
     // Raw FFI bindings to libopencore-amrnb. No -sys crate exists on
@@ -401,13 +419,30 @@ mod imp {
     }
 
     impl EncState {
-        fn new(codec_id: VoiceCodec, codec_param: u8) -> Result<Self, AudioError> {
+        fn new(
+            codec_id: VoiceCodec,
+            codec_param: u8,
+            opus_bw: OpusBandwidth,
+        ) -> Result<Self, AudioError> {
             match codec_id {
                 VoiceCodec::Opus => {
                     let mut enc = Encoder::new(SAMPLE_RATE_HZ, Channels::Mono, Application::Voip)
                         .map_err(codec)?;
-                    enc.set_bitrate(Bitrate::Bits(OPUS_BITRATE))
-                        .map_err(codec)?;
+                    // `codec_param` carries the bitrate in kbps for
+                    // Opus (see VOICE_PROTOCOL.md §3.2). A zero value
+                    // means "older sender, no preference" — fall
+                    // back to the long-standing 12 kbps default.
+                    let bps = if codec_param == 0 {
+                        OPUS_BITRATE
+                    } else {
+                        i32::from(codec_param) * 1000
+                    };
+                    enc.set_bitrate(Bitrate::Bits(bps)).map_err(codec)?;
+                    let bw = match opus_bw {
+                        OpusBandwidth::Narrow => Bandwidth::Narrowband,
+                        OpusBandwidth::Wide => Bandwidth::Wideband,
+                    };
+                    enc.set_bandwidth(bw).map_err(codec)?;
                     Ok(Self::Opus {
                         encoder: enc,
                         scratch: Vec::with_capacity(FRAME_SAMPLES),
@@ -624,9 +659,10 @@ mod imp {
             max_secs: u32,
             codec_id: VoiceCodec,
             codec_param: u8,
+            opus_bw: OpusBandwidth,
         ) -> Result<Self, AudioError> {
             // Fail fast on unsupported codecs.
-            let _ = EncState::new(codec_id, codec_param)?;
+            let _ = EncState::new(codec_id, codec_param, opus_bw)?;
 
             let max = Duration::from_secs(max_secs.max(1) as u64);
             let stop = Arc::new(AtomicBool::new(false));
@@ -635,7 +671,9 @@ mod imp {
 
             let thread = std::thread::Builder::new()
                 .name("voicetastic-rec".into())
-                .spawn(move || run_capture(stop_thread, max, codec_id, codec_param, ready_tx))
+                .spawn(move || {
+                    run_capture(stop_thread, max, codec_id, codec_param, opus_bw, ready_tx)
+                })
                 .map_err(backend)?;
 
             match ready_rx.recv() {
@@ -724,6 +762,7 @@ mod imp {
         max: Duration,
         codec_id: VoiceCodec,
         codec_param: u8,
+        opus_bw: OpusBandwidth,
         ready: mpsc::SyncSender<Result<(), AudioError>>,
     ) -> Result<RecordedClip, AudioError> {
         let host = cpal::default_host();
@@ -767,7 +806,7 @@ mod imp {
         }
         let _ = ready.send(Ok(()));
 
-        let mut enc = EncState::new(codec_id, codec_param)?;
+        let mut enc = EncState::new(codec_id, codec_param, opus_bw)?;
         let mut total_48k_samples: usize = 0;
         let started = Instant::now();
 

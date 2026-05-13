@@ -1,6 +1,5 @@
 mod app;
 mod audio;
-mod outgoing;
 mod state;
 mod ui;
 mod watchers;

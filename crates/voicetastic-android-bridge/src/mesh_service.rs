@@ -411,6 +411,10 @@ impl Drop for ListenerHandles {
 pub struct MeshService {
     core: CoreMeshService,
     listeners: StdMutex<ListenerHandles>,
+    /// Lazily-constructed shared outbound voice pipeline. First call
+    /// to `voice_sender()` builds it and spawns its NACK-listener task;
+    /// later calls return the same handle.
+    voice_sender: std::sync::OnceLock<Arc<crate::VoiceSender>>,
 }
 
 impl MeshService {
@@ -422,6 +426,7 @@ impl MeshService {
         Ok(Self {
             core,
             listeners: StdMutex::new(ListenerHandles::default()),
+            voice_sender: std::sync::OnceLock::new(),
         })
     }
 
@@ -515,6 +520,7 @@ impl MeshService {
             parity_count: cfg.parity_count,
             last_in_stream: cfg.last_in_stream,
             encryption,
+            mac_key: cfg.channel_psk.clone(),
         };
         let message = v::build_message(&audio, &core_cfg)?;
         let svc = self.core.clone();
@@ -763,6 +769,16 @@ impl MeshService {
             }
         });
         self.listeners.lock().unwrap().replace_config(handle);
+    }
+
+    /// Return the shared [`crate::VoiceSender`] bound to this service.
+    /// First call constructs it (and spawns its NACK-listener task);
+    /// subsequent calls return the same instance. Cheap to call from
+    /// any thread — `OnceLock::get_or_init` is racing-safe.
+    pub fn voice_sender(&self) -> Arc<crate::VoiceSender> {
+        self.voice_sender
+            .get_or_init(|| Arc::new(crate::VoiceSender::new(self.core.clone())))
+            .clone()
     }
 }
 

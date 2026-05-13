@@ -4284,6 +4284,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.2",
  "hkdf",
+ "hmac",
  "parking_lot 0.12.5",
  "prost",
  "prost-build",

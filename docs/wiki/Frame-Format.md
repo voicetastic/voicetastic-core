@@ -4,39 +4,47 @@
 
 Every voice frame is a Meshtastic `Data` payload sent on
 `PortNum::PRIVATE_APP` (256). The payload is **at most 231 bytes** (LoRa
-MTU) and consists of a fixed 12-byte header followed by an
+MTU) and consists of a fixed 16-byte header followed by an
 optionally-encrypted body.
 
 ```
-┌────────── 12 B header ───────────┬───── ≤ 219 B body ─────┐
-│ version  │ type_flags │  fields  │       payload          │
-└──────────┴────────────┴──────────┴────────────────────────┘
+┌────────── 16 B header ───────────────────────┬──── ≤ 215 B body ────┐
+│ version │ type_flags │ fields  │ 4 B MAC tag │      payload         │
+└─────────┴────────────┴─────────┴─────────────┴──────────────────────┘
 ```
 
 ---
 
-## Header (12 bytes)
+## Header (16 bytes)
+
+The header is logically 12 bytes followed by a 4-byte MAC trailer that
+covers the preceding 12 bytes. The MAC is either keyed
+(`HMAC-SHA256(channel_psk, header[0..12])[..4]`) or unkeyed
+(`SHA-256(header[0..12])[..4]`), selected by the `mac_keyed` flag bit.
+See [Encryption](Encryption.md) and
+[Header-MAC-Future-Work](Header-MAC-Future-Work.md).
 
 | Off | Size | Field         | Notes                                                |
 |-----|------|---------------|------------------------------------------------------|
-|  0  |  1   | `version`     | `0x01`. Drop frames where this is anything else.    |
-|  1  |  1   | `type_flags`  | bits 6–7 = `packet_type`, bit 5 = `encrypted`, bit 4 = `last_in_stream`, bits 0–3 reserved (must be 0). |
+|  0  |  1   | `version`     | `0x02`. Drop frames where this is anything else.    |
+|  1  |  1   | `type_flags`  | bits 6–7 = `packet_type`, bit 5 = `encrypted`, bit 4 = `last_in_stream`, bit 3 = `mac_keyed`, bits 0–2 reserved (must be 0). |
 |  2  |  4   | `message_id`  | `u32` big-endian, non-zero, sender-chosen.           |
 |  6  |  1   | `codec`       | See [codec table](#codec-table).                     |
 |  7  |  1   | `codec_param` | Codec-specific (e.g. AMR-NB bitrate ordinal).        |
 |  8  |  1   | `stream_seq`  | `u8` per-`(from, channel)` monotonic counter.        |
 |  9  |  1   | `chunk_index` | `u8`. Range depends on `packet_type`.                |
 | 10  |  1   | `total_data`  | `u8`. Number of original DATA chunks. `0` is reserved (rejected). |
-| 11  |  1   | `parity_count`| `u8`. Number of FEC parity chunks (≤ 128).           |
+| 11  |  1   | `parity_count`| `u8`. Number of FEC parity chunks (≤ 128). `0` = no FEC (default). |
+| 12  |  4   | `mac_tag`     | Truncated HMAC-SHA256 (if `mac_keyed`) or SHA-256 of `header[0..12]`. |
 
 ### `type_flags` bit layout
 
 ```
-   bit 7  bit 6     bit 5         bit 4           bits 3..0
-   ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────────┐
-   │ packet_type  │ │encrypted│ │last_in_stream│ │  reserved  │
-   └──────────────┘ └─────────┘ └──────────────┘ └────────────┘
-     (2 bits)        (1 bit)     (1 bit)         (4 bits, =0)
+   bit 7  bit 6     bit 5         bit 4         bit 3       bits 2..0
+   ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
+   │ packet_type  │ │encrypted│ │last_in_stream│ │mac_keyed│ │ reserved │
+   └──────────────┘ └─────────┘ └──────────────┘ └────────┘ └──────────┘
+     (2 bits)        (1 bit)     (1 bit)         (1 bit)    (3 bits, =0)
 ```
 
 | Field            | Mask   | Values                                  |
@@ -44,7 +52,8 @@ optionally-encrypted body.
 | `packet_type`    | `0xC0` | `0=DATA`, `1=PARITY`, `2=NACK`, `3` reserved |
 | `encrypted`      | `0x20` | `1` ⇒ body is `nonce ‖ ciphertext ‖ tag`     |
 | `last_in_stream` | `0x10` | `1` on the final frame of a recording session |
-| reserved         | `0x0F` | MUST be 0; receivers MUST reject otherwise   |
+| `mac_keyed`      | `0x08` | `1` ⇒ header MAC is HMAC-SHA256(channel_psk, …); `0` ⇒ unkeyed SHA-256 |
+| reserved         | `0x07` | MUST be 0; receivers MUST reject otherwise   |
 
 ---
 
@@ -113,8 +122,9 @@ re-prepend on receive when writing files.
 ```
 
 For encrypted bodies, the nonce is randomly chosen per frame, prepended,
-and authenticated against the **12-byte header as AAD**. See
-[Encryption](Encryption.md) for the full envelope.
+and authenticated against the **12 logical header bytes as AAD**
+(`header[0..12]`, i.e. the header *excluding* the 4-byte MAC trailer).
+See [Encryption](Encryption.md) for the full envelope.
 
 The unencrypted plaintext is:
 
@@ -126,7 +136,7 @@ The unencrypted plaintext is:
 
 ## NACK frames
 
-A NACK carries the standard 12-byte header with these constraints:
+A NACK carries the standard 16-byte header with these constraints:
 
 - `packet_type = NACK`
 - `encrypted = 0` (NACKs MUST NOT be enveloped)

@@ -9,8 +9,8 @@ use voicetastic_core::proto::{
     Channel, NodeInfo, channel::Role, config::LoRaConfig, config::lo_ra_config::ModemPreset,
 };
 use voicetastic_core::voice::{
-    BuildConfig, MAX_BODY_SIZE, MAX_PARITY_PER_MESSAGE, ModemPreset as VoiceModemPreset,
-    VoiceCodec, build_message, random_message_id,
+    MAX_BODY_SIZE, MAX_PARITY_PER_MESSAGE, ModemPreset as VoiceModemPreset, SendRequest,
+    SendStatus, VoiceCodec,
 };
 
 use crate::app::{PlaybackSource, VoicetasticApp};
@@ -443,7 +443,13 @@ fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> Vo
             resp.on_hover_text("Rebuild with `--features audio` to enable voice messages.");
         } else if resp.clicked() {
             let (codec, codec_param) = app.outgoing_voice_codec();
-            match Recorder::start(max_secs, codec, codec_param) {
+            let opus_bw = match app.settings.voice_opus_bandwidth() {
+                voicetastic_core::settings::OpusBandwidthKind::Narrow => {
+                    audio::OpusBandwidth::Narrow
+                }
+                voicetastic_core::settings::OpusBandwidthKind::Wide => audio::OpusBandwidth::Wide,
+            };
+            match Recorder::start(max_secs, codec, codec_param, opus_bw) {
                 Ok(rec) => {
                     return VoiceCompose::Recording(rec);
                 }
@@ -591,9 +597,6 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     let chunk_size = preset
         .map(VoiceModemPreset::recommended_chunk_size)
         .unwrap_or(MAX_BODY_SIZE);
-    let pacing = preset
-        .map(VoiceModemPreset::pacing)
-        .unwrap_or_else(VoiceModemPreset::fallback_pacing);
 
     // Scale FEC parity to message size. Real LoRa broadcast links
     // routinely show 30–45 % per-chunk loss, so a fixed 8 parity shards
@@ -607,57 +610,43 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         target.min(cap).min(u8::MAX as usize) as u8
     };
 
-    let message_id = match random_message_id() {
-        Ok(id) => id,
-        Err(e) => {
-            app.shared.lock().status_msg = Some(format!("Voice send aborted: {e}"));
-            return;
-        }
-    };
-    let cfg = BuildConfig {
-        message_id,
-        stream_seq: 0,
+    // Hand the whole pipeline (build → register → burst → NACK →
+    // retransmit → linger) to the shared `VoiceSender`. The GUI just
+    // consumes status events and reflects them on the chat row.
+    let handle = match app.voice_sender.send(SendRequest {
+        audio: clip.payload.clone(),
         codec: clip.codec,
         codec_param: clip.codec_param,
-        chunk_size,
+        channel,
+        to: dest,
         parity_count,
+        chunk_size: Some(chunk_size),
         last_in_stream: true,
-        encryption: None,
-    };
-    let encoded = match build_message(&clip.payload, &cfg) {
-        Ok(e) => e,
+        ..Default::default()
+    }) {
+        Ok(h) => h,
         Err(e) => {
             app.shared.lock().status_msg = Some(format!("Voice build failed: {e}"));
             return;
         }
     };
 
-    // Register frames so the inbound NACK watcher can retransmit them on
-    // demand. Skipped for broadcasts (the firmware drops want_ack on
-    // broadcast anyway and we have no single peer to receive NACKs from,
-    // although the assembler will still relay them — keeping the entry
-    // alive is cheap, so register unconditionally).
-    app.outgoing_voice
-        .register(cfg.message_id, &encoded, channel, dest);
-
-    let svc = app.service.clone();
     let shared = Arc::clone(&app.shared);
     let bytes = clip.payload.clone();
     let clip_codec = clip.codec;
     let clip_codec_param = clip.codec_param;
     let duration_ms = clip.duration.as_millis() as u32;
     let to_num = dest.unwrap_or(BROADCAST_ADDR);
-    let total_chunks = encoded.total_data;
+    let message_id = handle.message_id;
     let total_bytes = clip.payload.len();
-    let message_id = cfg.message_id;
+    let total_chunks = total_data;
     let sending_label = format!("🎙 sending voice ({total_bytes} bytes, {total_chunks} chunks)…");
     let sent_label = format!("🎙 voice message ({total_bytes} bytes, {total_chunks} chunks)");
 
     // Push a placeholder entry now so the chat reflects the in-flight
-    // message immediately. `voice` stays `None` until the TX queue has
-    // actually transmitted every frame — that's what gates the ▶ Play
-    // button so users can't try to play back something that hasn't been
-    // sent yet.
+    // message immediately. `voice` stays `None` until the burst is
+    // fully on-wire — that's what gates the ▶ Play button so users
+    // can't try to play back something that hasn't been sent yet.
     shared.lock().push_chat(ChatEntry {
         text: sending_label,
         rx_time: 0,
@@ -671,132 +660,68 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     });
 
     app.rt.spawn(async move {
-        // Subscribe to QueueStatus *before* sending so we don't miss the
-        // confirmation for the very first frame. `mesh_packet_id` lets
-        // us tick a "sent N/M" counter as each chunk leaves the radio
-        // (≈ goes on air), giving the chat live progress instead of a
-        // single transition from "sending …" to "sent".
-        let mut qs_rx = svc.subscribe_queue_status();
-        let want_ack = dest.is_some();
-        let total_frames = encoded.frames.len();
-        let total_data = encoded.total_data as usize;
-        let mut pending_ids: std::collections::HashSet<u32> =
-            std::collections::HashSet::with_capacity(total_frames);
-        // Subset of `pending_ids` that map to original DATA frames
-        // (indices < total_data). The user-visible "(N/M chunks)" counter
-        // only ticks for these so its denominator matches the final
-        // "voice message (... chunks)" label, which is also data-only.
-        // FEC parity frames still flow through `pending_ids` so the
-        // drain loop waits for the whole batch before flipping to
-        // "voice message", but they don't inflate the counter.
-        let mut pending_data_ids: std::collections::HashSet<u32> =
-            std::collections::HashSet::with_capacity(total_data);
-        let mut sent_on_air: usize = 0;
-        let mut send_err: Option<voicetastic_core::error::Error> = None;
-        for (i, frame) in encoded.frames.iter().enumerate() {
-            // Drain any QS events that landed since the last enqueue so
-            // the counter keeps up even if the firmware confirms faster
-            // than we can push. On `Lagged` we lose precise ticks for
-            // the missed events but must NOT abandon the loop — the
-            // drain at the bottom + the forced N/N at the end papers
-            // over the lost precision.
-            loop {
-                use tokio::sync::broadcast::error::TryRecvError;
-                match qs_rx.try_recv() {
-                    Ok(ev) => {
-                        if ev.mesh_packet_id != 0
-                            && pending_ids.remove(&ev.mesh_packet_id)
-                            && pending_data_ids.remove(&ev.mesh_packet_id)
-                        {
-                            sent_on_air += 1;
-                            update_sending_label(&shared, message_id, sent_on_air, total_data);
-                        }
-                    }
-                    Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-                    Err(TryRecvError::Lagged(_)) => continue,
+        let mut rx = handle.subscribe();
+        loop {
+            match rx.recv().await {
+                Ok(SendStatus::Sending { sent, total: _, .. }) => {
+                    // `sent` includes parity frames. Cap the visible
+                    // count at `total_chunks` so the label denominator
+                    // (data-only) doesn't drift past 100 %.
+                    let visible = (sent as usize).min(total_chunks);
+                    update_sending_label(&shared, message_id, visible, total_chunks);
                 }
-            }
-            match svc
-                .enqueue_voice_frame_with_id(frame.clone(), channel, dest, want_ack, pacing)
-                .await
-            {
-                Ok(id) => {
-                    pending_ids.insert(id);
-                    if i < total_data {
-                        pending_data_ids.insert(id);
+                Ok(SendStatus::BurstComplete { .. }) => {
+                    update_sending_label(&shared, message_id, total_chunks, total_chunks);
+                    // Flip the row to its terminal state so the play
+                    // button enables. NACK-driven retransmits may
+                    // continue in the background; we don't surface
+                    // them on the row to avoid flicker.
+                    let mut st = shared.lock();
+                    if let Some(entry) = st
+                        .chat_log
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.outgoing_voice_id == Some(message_id))
+                    {
+                        entry.text = sent_label.clone();
+                        entry.voice = Some(VoicePayload {
+                            codec: clip_codec,
+                            codec_param: clip_codec_param,
+                            bytes: bytes.clone(),
+                            duration_ms,
+                        });
                     }
                 }
-                Err(e) => {
-                    send_err = Some(e);
+                Ok(SendStatus::GaveUp { .. }) => {
+                    let mut st = shared.lock();
+                    if let Some(entry) = st
+                        .chat_log
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.outgoing_voice_id == Some(message_id))
+                    {
+                        entry.text = "🎙 voice send: receiver gave up".to_string();
+                    }
                     break;
                 }
-            }
-        }
-
-        if let Some(e) = send_err {
-            let mut st = shared.lock();
-            if let Some(entry) = st
-                .chat_log
-                .iter_mut()
-                .rev()
-                .find(|e| e.outgoing_voice_id == Some(message_id))
-            {
-                entry.text = format!("🎙 voice send failed: {e}");
-            }
-            st.status_msg = Some(format!("Voice send failed: {e}"));
-            return;
-        }
-
-        // Drain remaining QS confirmations until all enqueued packets
-        // are accounted for or a short safety timeout elapses. The
-        // firmware *should* emit a QS for every accepted packet but in
-        // practice can batch, drop, or report with `mesh_packet_id = 0`
-        // — so this loop is best-effort. On lag we keep going; on
-        // timeout we exit and force the visible counter to N/N below,
-        // because the for-loop completing already means every frame
-        // was handed to the radio successfully.
-        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pending_data_ids.is_empty() && tokio::time::Instant::now() < drain_deadline {
-            use tokio::sync::broadcast::error::RecvError;
-            let remaining = drain_deadline - tokio::time::Instant::now();
-            match tokio::time::timeout(remaining, qs_rx.recv()).await {
-                Ok(Ok(ev)) => {
-                    if ev.mesh_packet_id != 0
-                        && pending_ids.remove(&ev.mesh_packet_id)
-                        && pending_data_ids.remove(&ev.mesh_packet_id)
+                Ok(SendStatus::Failed { message, .. }) => {
+                    let mut st = shared.lock();
+                    if let Some(entry) = st
+                        .chat_log
+                        .iter_mut()
+                        .rev()
+                        .find(|e| e.outgoing_voice_id == Some(message_id))
                     {
-                        sent_on_air += 1;
-                        update_sending_label(&shared, message_id, sent_on_air, total_data);
+                        entry.text = format!("🎙 voice send failed: {message}");
                     }
+                    st.status_msg = Some(format!("Voice send failed: {message}"));
+                    break;
                 }
-                Ok(Err(RecvError::Lagged(_))) => continue,
-                Ok(Err(RecvError::Closed)) | Err(_) => break,
+                Ok(SendStatus::Complete { .. }) => break,
+                Ok(SendStatus::Building { .. }) | Ok(SendStatus::Retransmitting { .. }) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        }
-
-        // Ensure the user sees a clean "N/N chunks" tick right before
-        // the final "voice message (... N chunks)" label, even if some
-        // QS events were lost / never matched. The for-loop completed
-        // successfully which means every data frame was accepted by
-        // the radio, so the count is honest.
-        if sent_on_air < total_data {
-            update_sending_label(&shared, message_id, total_data, total_data);
-        }
-
-        let mut st = shared.lock();
-        if let Some(entry) = st
-            .chat_log
-            .iter_mut()
-            .rev()
-            .find(|e| e.outgoing_voice_id == Some(message_id))
-        {
-            entry.text = sent_label;
-            entry.voice = Some(VoicePayload {
-                codec: clip_codec,
-                codec_param: clip_codec_param,
-                bytes,
-                duration_ms,
-            });
         }
     });
 }

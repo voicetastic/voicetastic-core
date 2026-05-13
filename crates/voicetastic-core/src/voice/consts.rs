@@ -2,10 +2,15 @@
 
 use std::time::Duration;
 
-/// On-wire version byte.
-pub const PROTOCOL_VERSION: u8 = 0x01;
-/// Fixed header length preceding every frame.
-pub const HEADER_SIZE: usize = 12;
+/// On-wire version byte. v2 adds the 4-byte trailing header MAC.
+pub const PROTOCOL_VERSION: u8 = 0x02;
+/// Fixed header length preceding every frame: 12 logical bytes +
+/// [`HEADER_MAC_LEN`]-byte integrity/authenticity tag.
+pub const HEADER_SIZE: usize = 16;
+/// Width of the trailing header MAC tag — keyed (HMAC-SHA256) or
+/// unkeyed (SHA-256), depending on whether a channel PSK is configured.
+/// See [`super::mac`].
+pub const HEADER_MAC_LEN: usize = 4;
 /// Maximum total frame size (header + body) — Meshtastic LoRa MTU.
 pub const MAX_PACKET_SIZE: usize = 231;
 /// Maximum body bytes per frame (`MAX_PACKET_SIZE - HEADER_SIZE`).
@@ -36,10 +41,14 @@ pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 pub const BLACKLIST_MAX: usize = 100;
 /// Maximum NACK rounds per message before the receiver gives up. Each
 /// round fires after [`NACK_WINDOW_MS`] of silence, so this also bounds
-/// how long a stalled message survives. The previous value of `3` gave up
-/// after only ~4–5 s of quiet, which is far too aggressive on slow LoRa
-/// presets where inter-chunk gaps can routinely exceed a second.
-pub const NACK_MAX_ROUNDS: u8 = 32;
+/// how long a stalled message survives. Sized so the consecutive-silence
+/// budget (`NACK_MAX_ROUNDS × NACK_WINDOW_MS`) reaches the default
+/// `AssemblerConfig::message_timeout` of 600 s — i.e. the absolute
+/// per-message timeout is the only practical ceiling. The previous
+/// value of `32` (~48 s) tripped well before `message_timeout` and
+/// produced spurious "partial: N/M chunks" finalizes on slow LoRa
+/// presets where inter-chunk gaps can routinely exceed a few seconds.
+pub const NACK_MAX_ROUNDS: u16 = 400;
 /// Quiet-period after the last seen chunk before issuing a NACK.
 pub const NACK_WINDOW_MS: u64 = 1500;
 /// AES-GCM nonce length (96 bits per RFC 5288).

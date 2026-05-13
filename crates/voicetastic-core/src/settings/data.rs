@@ -66,6 +66,29 @@ pub const AMRNB_MODE_1220: u8 = 7;
 /// Highest-quality AMR-NB rate; matches the most common `.amr` files.
 pub const DEFAULT_AMRNB_MODE: u8 = AMRNB_MODE_1220;
 
+/// Opus encoder bitrate, in kbps. Values stored on disk as `u8` since
+/// the protocol's `codec_param` byte carries the same number on the
+/// wire (informative only — the decoder ignores it because the Opus
+/// bitstream self-describes).
+pub const OPUS_BITRATE_KBPS_MIN: u8 = 6;
+pub const OPUS_BITRATE_KBPS_MAX: u8 = 16;
+/// Default sender bitrate. 12 kbps mono is a sweet spot for voice over
+/// LoRa: clearly intelligible, decodes everywhere, fits a 30 s clip
+/// inside the protocol's per-message size budget on every preset.
+pub const DEFAULT_OPUS_BITRATE_KBPS: u8 = 12;
+
+/// Opus audio bandwidth identifier. We expose only the two useful
+/// modes for our LoRa-voice use case (`narrow` = SILK 8 kHz,
+/// `wide` = SILK 16 kHz). Higher modes (super-wide, full-band) are
+/// deliberately omitted — they cost airtime without helping voice
+/// intelligibility.
+pub const OPUS_BANDWIDTH_NARROW: &str = "narrow";
+pub const OPUS_BANDWIDTH_WIDE: &str = "wide";
+/// Default bandwidth for new senders. Wideband matches the previous
+/// hard-coded behaviour so existing config files don't change voice
+/// character on upgrade.
+pub const DEFAULT_OPUS_BANDWIDTH: &str = OPUS_BANDWIDTH_WIDE;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -104,6 +127,20 @@ pub struct AppSettings {
     /// outside `0..=7` are clamped to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_amrnb_mode: Option<u8>,
+
+    /// Opus encoder bitrate (kbps), used when [`Self::voice_codec`]
+    /// resolves to Opus. `None` falls back to
+    /// [`DEFAULT_OPUS_BITRATE_KBPS`]. Values outside
+    /// `OPUS_BITRATE_KBPS_MIN..=OPUS_BITRATE_KBPS_MAX` are clamped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_opus_bitrate_kbps: Option<u8>,
+
+    /// Opus audio bandwidth (`narrow` or `wide`), used when
+    /// [`Self::voice_codec`] resolves to Opus. `None` falls back to
+    /// [`DEFAULT_OPUS_BANDWIDTH`]. Unknown strings are treated as the
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_opus_bandwidth: Option<String>,
 }
 
 impl AppSettings {
@@ -145,6 +182,24 @@ impl AppSettings {
         match self.voice_amrnb_mode {
             Some(m) if m <= AMRNB_MODE_1220 => m,
             _ => DEFAULT_AMRNB_MODE,
+        }
+    }
+
+    /// Effective Opus bitrate in kbps, clamped to
+    /// `OPUS_BITRATE_KBPS_MIN..=OPUS_BITRATE_KBPS_MAX`.
+    pub fn voice_opus_bitrate_kbps(&self) -> u8 {
+        self.voice_opus_bitrate_kbps
+            .unwrap_or(DEFAULT_OPUS_BITRATE_KBPS)
+            .clamp(OPUS_BITRATE_KBPS_MIN, OPUS_BITRATE_KBPS_MAX)
+    }
+
+    /// Effective Opus bandwidth identifier (validated). Unknown values
+    /// fall back to [`DEFAULT_OPUS_BANDWIDTH`].
+    pub fn voice_opus_bandwidth(&self) -> &'static str {
+        match self.voice_opus_bandwidth.as_deref() {
+            Some(OPUS_BANDWIDTH_NARROW) => OPUS_BANDWIDTH_NARROW,
+            Some(OPUS_BANDWIDTH_WIDE) => OPUS_BANDWIDTH_WIDE,
+            _ => DEFAULT_OPUS_BANDWIDTH,
         }
     }
 

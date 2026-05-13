@@ -19,9 +19,11 @@ use crate::voice::VoiceCodec;
 
 use super::data::{
     AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
-    DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS,
-    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB,
-    VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER, config_path,
+    DEFAULT_OPUS_BANDWIDTH, DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
+    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS, OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE,
+    OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, REASSEMBLY_TIMEOUT_LOWER_SECS,
+    REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS,
+    VOICE_MAX_SECS_UPPER, config_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -44,6 +46,10 @@ pub enum SettingKey {
     VoiceCodec2Mode,
     /// AMR-NB mode index (0..=7).
     VoiceAmrnbMode,
+    /// Opus encoder bitrate in kbps.
+    VoiceOpusBitrateKbps,
+    /// Opus audio bandwidth (`narrow` | `wide`).
+    VoiceOpusBandwidth,
 }
 
 impl SettingKey {
@@ -56,6 +62,8 @@ impl SettingKey {
             Self::VoiceCodec => "voice.codec",
             Self::VoiceCodec2Mode => "voice.codec2_mode",
             Self::VoiceAmrnbMode => "voice.amrnb_mode",
+            Self::VoiceOpusBitrateKbps => "voice.opus_bitrate_kbps",
+            Self::VoiceOpusBandwidth => "voice.opus_bandwidth",
         }
     }
 
@@ -67,6 +75,8 @@ impl SettingKey {
             "voice.codec" => Self::VoiceCodec,
             "voice.codec2_mode" => Self::VoiceCodec2Mode,
             "voice.amrnb_mode" => Self::VoiceAmrnbMode,
+            "voice.opus_bitrate_kbps" => Self::VoiceOpusBitrateKbps,
+            "voice.opus_bandwidth" => Self::VoiceOpusBandwidth,
             _ => return None,
         })
     }
@@ -79,6 +89,8 @@ impl SettingKey {
             SettingKey::VoiceCodec,
             SettingKey::VoiceCodec2Mode,
             SettingKey::VoiceAmrnbMode,
+            SettingKey::VoiceOpusBitrateKbps,
+            SettingKey::VoiceOpusBandwidth,
         ]
     }
 }
@@ -185,6 +197,42 @@ pub fn voice_codec_kind_from_id(s: &str) -> Option<VoiceCodecKind> {
     VoiceCodecKind::from_id(s)
 }
 
+/// Typed mirror of the `voice.opus_bandwidth` string id. Only the two
+/// modes useful for LoRa-voice are exposed; super-wide and full-band
+/// are deliberately omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpusBandwidthKind {
+    /// SILK 8 kHz operating mode (telephony quality, lowest airtime).
+    Narrow,
+    /// SILK 16 kHz operating mode (HD voice, default).
+    Wide,
+}
+
+impl OpusBandwidthKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Narrow => OPUS_BANDWIDTH_NARROW,
+            Self::Wide => OPUS_BANDWIDTH_WIDE,
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Some(match s {
+            OPUS_BANDWIDTH_NARROW => Self::Narrow,
+            OPUS_BANDWIDTH_WIDE => Self::Wide,
+            _ => return None,
+        })
+    }
+}
+
+pub fn opus_bandwidth_kind_to_id(k: OpusBandwidthKind) -> &'static str {
+    k.id()
+}
+
+pub fn opus_bandwidth_kind_from_id(s: &str) -> Option<OpusBandwidthKind> {
+    OpusBandwidthKind::from_id(s)
+}
+
 // ---------------------------------------------------------------------------
 // Settings API
 // ---------------------------------------------------------------------------
@@ -288,11 +336,20 @@ impl SettingsApi {
         self.inner.read().voice_amrnb_mode()
     }
 
+    pub fn voice_opus_bitrate_kbps(&self) -> u8 {
+        self.inner.read().voice_opus_bitrate_kbps()
+    }
+
+    pub fn voice_opus_bandwidth(&self) -> OpusBandwidthKind {
+        OpusBandwidthKind::from_id(self.inner.read().voice_opus_bandwidth())
+            .unwrap_or(OpusBandwidthKind::Wide)
+    }
+
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `(VoiceCodec, codec_param)` pair the voice protocol layer wants.
     pub fn voice_codec_for_protocol(&self) -> (VoiceCodec, u8) {
         match self.voice_codec() {
-            VoiceCodecKind::Opus => (VoiceCodec::Opus, 0),
+            VoiceCodecKind::Opus => (VoiceCodec::Opus, self.voice_opus_bitrate_kbps()),
             VoiceCodecKind::Codec2 => (VoiceCodec::Codec2, self.voice_codec2_mode()),
             VoiceCodecKind::AmrNb => (VoiceCodec::AmrNb, self.voice_amrnb_mode()),
         }
@@ -365,6 +422,23 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceAmrnbMode)
     }
 
+    pub fn set_voice_opus_bitrate_kbps(&self, kbps: u8) -> SettingsResult<()> {
+        if !(OPUS_BITRATE_KBPS_MIN..=OPUS_BITRATE_KBPS_MAX).contains(&kbps) {
+            return Err(SettingsError::Invalid {
+                key: SettingKey::VoiceOpusBitrateKbps.id(),
+                value: kbps.to_string(),
+                reason: format!("must be in {OPUS_BITRATE_KBPS_MIN}..={OPUS_BITRATE_KBPS_MAX}"),
+            });
+        }
+        self.inner.write().voice_opus_bitrate_kbps = Some(kbps);
+        self.persist_and_notify(SettingKey::VoiceOpusBitrateKbps)
+    }
+
+    pub fn set_voice_opus_bandwidth(&self, bw: OpusBandwidthKind) -> SettingsResult<()> {
+        self.inner.write().voice_opus_bandwidth = Some(bw.id().to_string());
+        self.persist_and_notify(SettingKey::VoiceOpusBandwidth)
+    }
+
     /// Clear a single field's override (revert to its default).
     pub fn reset(&self, key: SettingKey) -> SettingsResult<()> {
         {
@@ -376,6 +450,8 @@ impl SettingsApi {
                 SettingKey::VoiceCodec => g.voice_codec = None,
                 SettingKey::VoiceCodec2Mode => g.voice_codec2_mode = None,
                 SettingKey::VoiceAmrnbMode => g.voice_amrnb_mode = None,
+                SettingKey::VoiceOpusBitrateKbps => g.voice_opus_bitrate_kbps = None,
+                SettingKey::VoiceOpusBandwidth => g.voice_opus_bandwidth = None,
             }
         }
         self.persist_and_notify(key)
@@ -405,6 +481,8 @@ impl SettingsApi {
             SettingKey::VoiceCodec => self.voice_codec().id().to_string(),
             SettingKey::VoiceCodec2Mode => self.voice_codec2_mode().to_string(),
             SettingKey::VoiceAmrnbMode => self.voice_amrnb_mode().to_string(),
+            SettingKey::VoiceOpusBitrateKbps => self.voice_opus_bitrate_kbps().to_string(),
+            SettingKey::VoiceOpusBandwidth => self.voice_opus_bandwidth().id().to_string(),
         }
     }
 
@@ -457,6 +535,28 @@ impl SettingsApi {
                     });
                 }
                 self.set_voice_amrnb_mode(n as u8)
+            }
+            SettingKey::VoiceOpusBitrateKbps => {
+                let n = parse_u32(key, value)?;
+                if n > u32::from(u8::MAX) {
+                    return Err(SettingsError::Invalid {
+                        key: key.id(),
+                        value: value.to_string(),
+                        reason: "value out of u8 range".to_string(),
+                    });
+                }
+                self.set_voice_opus_bitrate_kbps(n as u8)
+            }
+            SettingKey::VoiceOpusBandwidth => {
+                let bw =
+                    OpusBandwidthKind::from_id(value).ok_or_else(|| SettingsError::Invalid {
+                        key: key.id(),
+                        value: value.to_string(),
+                        reason: format!(
+                            "expected one of {OPUS_BANDWIDTH_NARROW}, {OPUS_BANDWIDTH_WIDE}"
+                        ),
+                    })?;
+                self.set_voice_opus_bandwidth(bw)
             }
         }
     }
@@ -521,6 +621,23 @@ impl SettingsApi {
                     max: u32::from(AMRNB_MODE_1220),
                 },
                 DEFAULT_AMRNB_MODE.to_string(),
+            ),
+            SettingKey::VoiceOpusBitrateKbps => (
+                "Opus bitrate (kbps)",
+                "Opus encoder bitrate in kbps. Lower is more LoRa-friendly; 12 kbps fits a 30 s clip on every preset.",
+                SettingKind::IntRange {
+                    min: u32::from(OPUS_BITRATE_KBPS_MIN),
+                    max: u32::from(OPUS_BITRATE_KBPS_MAX),
+                },
+                DEFAULT_OPUS_BITRATE_KBPS.to_string(),
+            ),
+            SettingKey::VoiceOpusBandwidth => (
+                "Opus audio bandwidth",
+                "Forces the Opus operating mode. `narrow` = SILK 8 kHz (telephony), `wide` = SILK 16 kHz (HD voice). Sender-only — receiver auto-detects.",
+                SettingKind::Enum {
+                    variants: vec![OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE],
+                },
+                DEFAULT_OPUS_BANDWIDTH.to_string(),
             ),
         };
         SettingDescriptor {

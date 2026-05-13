@@ -12,10 +12,11 @@ the source of truth for these values.
 
 | Constant                | Value | Why                                                          |
 |-------------------------|------:|--------------------------------------------------------------|
-| `PROTOCOL_VERSION`      | `0x01` | Drop frames with any other first byte.                      |
-| `HEADER_SIZE`           | 12 B  | Fixed header: 1 + 1 + 4 + 1 + 1 + 1 + 1 + 1 + 1.            |
+| `PROTOCOL_VERSION`      | `0x02` | Drop frames with any other first byte.                      |
+| `HEADER_SIZE`           | 16 B  | 12 B logical header + 4 B trailing MAC tag.                 |
+| `HEADER_MAC_LEN`        | 4 B   | Truncated HMAC-SHA256 (keyed) or SHA-256 (unkeyed) over `header[0..12]`. |
 | `MAX_PACKET_SIZE`       | 231 B | Meshtastic LoRa MTU. All frames MUST fit.                   |
-| `MAX_BODY_SIZE`         | 219 B | `MAX_PACKET_SIZE − HEADER_SIZE`.                            |
+| `MAX_BODY_SIZE`         | 215 B | `MAX_PACKET_SIZE − HEADER_SIZE`.                            |
 | `MIN_CHUNK_SIZE`        | 16 B  | Per-frame overhead floor; below this, FEC + pacing waste airtime. |
 
 ## Message shape
@@ -24,14 +25,14 @@ the source of truth for these values.
 |---------------------------|-----------:|------------------------------------------------------------|
 | `MAX_CHUNKS_PER_MESSAGE`  | 255        | `total_data` is `u8`; index 0..=254.                       |
 | `MAX_PARITY_PER_MESSAGE`  | 128        | `reed-solomon-erasure` GF(2⁸) coder limit.                 |
-| `MAX_MESSAGE_BYTES`       | 55 845     | `MAX_CHUNKS_PER_MESSAGE × MAX_BODY_SIZE`.                  |
+| `MAX_MESSAGE_BYTES`       | 54 825     | `MAX_CHUNKS_PER_MESSAGE × MAX_BODY_SIZE`.                  |
 
 With encryption enabled, the effective body limit drops by
 `GCM_NONCE_LEN + GCM_TAG_LEN = 28 B`, so:
 
 ```
-chunk_size_max(encrypted) = 219 − 12 − 16 = 191 B
-max_audio(encrypted)       = 255 × 191    = 48 705 B
+chunk_size_max(encrypted) = 215 − 12 − 16 = 187 B
+max_audio(encrypted)       = 255 × 187    = 47 685 B
 ```
 
 ## Encryption
@@ -52,9 +53,18 @@ Key derivation: HKDF-SHA256, `salt = channel_psk`, `ikm = message_id_be ‖ from
 | `MAX_IN_PROGRESS_PER_SENDER`   | 4              | Stops one chatty peer from starving everyone else.           |
 | `BLACKLIST_TTL`                | 60 s           | How long a finalized message blocks late frames for itself.  |
 | `BLACKLIST_MAX`                | 100            | FIFO eviction once exceeded.                                 |
-| `NACK_MAX_ROUNDS`              | 3              | Per-message NACK budget before the receiver gives up.        |
+| `NACK_MAX_ROUNDS`              | 32             | Per-message NACK budget (consecutive rounds without progress; resets on every accepted shard) before the receiver gives up. |
 | `NACK_WINDOW_MS`               | 1500           | Quiet period after the last seen chunk before NACK'ing.      |
 | `MAX_VALIDATION_STRIKES` (impl)| 3              | Eviction trigger for chatty bad senders (post-template).     |
+
+## Sender resource bounds
+
+| Constant                            | Value | Why                                                                 |
+|-------------------------------------|------:|---------------------------------------------------------------------|
+| `MAX_RETRANSMITS_PER_MESSAGE`       | 32    | Per-message retransmit budget; matches receiver `NACK_MAX_ROUNDS`.  |
+| `DEFAULT_RETAIN_TTL`                | 600 s | How long `OutgoingVoiceRegistry` keeps frames for late NACKs.       |
+| `DEFAULT_LINGER` (`SendRequest`)    |  60 s | How long `VoiceSender` stays subscribed to NACKs after burst end.   |
+| Cooldown clamp                      | 1–30 s | Park window after each retransmit batch (`pacing × frames`).        |
 
 ## Sender pacing
 

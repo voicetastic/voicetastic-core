@@ -52,7 +52,7 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
   dominated by airtime + pacing, which on `LONG_SLOW` can exceed the
   duration of the recording itself.
 - Anything requiring guaranteed delivery. The protocol gives up after
-  `NACK_MAX_ROUNDS = 3` rounds.
+  `NACK_MAX_ROUNDS = 32` consecutive rounds without progress.
 - High-fidelity audio. The MTU + airtime budget caps usable bitrates to
   the 5–16 kbps range.
 
@@ -77,6 +77,6 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
 ```
 
 The voice protocol is one of many `PRIVATE_APP` tenants. The leading
-version byte (`0x01`) lets receivers triage frames before parsing.
+version byte (`0x02`) lets receivers triage frames before parsing.
 
 → Continue to [Frame Format](Frame-Format.md).

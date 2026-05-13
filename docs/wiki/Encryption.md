@@ -30,8 +30,12 @@ The voice envelope adds, on top:
 - ✅ Authenticity binding to `(channel_psk, message_id, from)` —
   replaying a frame on a different channel or with a spoofed sender id
   fails the GCM tag check.
-- ✅ Header tamper-detection: the entire 12-byte chunk header is
-  authenticated as AAD.
+- ✅ Header tamper-detection: the 12 logical header bytes are
+  authenticated as AAD by the body envelope when encryption is enabled,
+  and unconditionally by the 4-byte trailing header MAC (see
+  [Frame-Format](Frame-Format.md) and
+  [Header-MAC-Future-Work](Header-MAC-Future-Work.md)) — the MAC trailer
+  itself is **not** part of the AAD.
 
 It does **not** provide:
 
@@ -87,7 +91,8 @@ encrypted=1:    │  header  │ │ nonce  │ │   AES-256-GCM(plaintext)   �
 ```
 
 - **Nonce** — 96 bits (12 bytes) from the OS RNG, *prepended* to the body.
-- **AAD** — the **whole 12-byte frame header** (offset 0..12). Tamper any
+- **AAD** — the **12 logical header bytes** (offset 0..12, i.e. the
+  header *without* its 4-byte MAC trailer). Tamper any
   header byte and the tag verification fails.
 - **Tag** — 128 bits (16 bytes) appended after the ciphertext, per the
   AES-GCM standard.
@@ -118,7 +123,7 @@ When the `encrypted` bit is set, the receiver MUST:
    requires explicit rejection via
    [`VoiceError::BadFromForEncrypted`](../../crates/voicetastic-core/src/voice/error.rs).
 3. **Re-derive the key** per the formula above.
-4. **Verify the GCM tag** against the original 12-byte header bytes as
+4. **Verify the GCM tag** against the original 12 logical header bytes as
    AAD. Tag failure ⇒ silent drop with
    [`VoiceError::BadTag`](../../crates/voicetastic-core/src/voice/error.rs).
 

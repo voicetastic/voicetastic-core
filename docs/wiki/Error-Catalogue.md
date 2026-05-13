@@ -15,9 +15,9 @@ the builder returns them as `Result<EncodedMessage, VoiceError>`.
 
 | Variant                | Trigger                                                 | Handle                                  |
 |------------------------|---------------------------------------------------------|-----------------------------------------|
-| `TooShort`             | Frame shorter than `HEADER_SIZE = 12 B`.                | Drop. Probably a non-voice packet.      |
+| `TooShort`             | Frame shorter than `HEADER_SIZE = 16 B`.                | Drop. Probably a non-voice packet.      |
 | `TooLarge`             | Frame larger than `MAX_PACKET_SIZE = 231 B`.            | Drop; sender is broken.                 |
-| `BadVersion(b)`        | First byte ≠ `0x01`.                                    | Drop; future protocol version.          |
+| `BadVersion(b)`        | First byte ≠ `0x02`.                                    | Drop; future protocol version.          |
 | `ReservedFlagSet(b)`   | Low nibble of `type_flags` is non-zero.                 | Drop; sender is broken.                 |
 | `ReservedPacketType`   | `packet_type == 3`.                                     | Drop; reserved.                         |
 | `ZeroMessageId`        | `message_id == 0`.                                      | Drop; spec forbids zero.                |
@@ -55,6 +55,8 @@ entry, the entry is evicted and blacklisted to free its per-sender slot.
 | `EncryptedNack`               | NACK frame has the encryption bit set.                              | Drop; spec forbids.          |
 | `EncryptedNoPsk`              | Encrypted frame received but `AssemblerConfig.channel_psk` is `None`. | Configure PSK or drop.     |
 | `BadFromForEncrypted(s)`      | Encrypted frame's `from` is not strict `!hex8`.                     | Drop; potential spoof.       |
+| `BadMac`                      | Header MAC mismatch (corruption or forgery).                        | Drop silently.               |
+| `MacKeyMissing`               | Header advertises keyed MAC but receiver has no channel PSK.        | Drop; configure PSK.         |
 
 ## NACK errors
 

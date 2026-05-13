@@ -9,8 +9,8 @@ use voicetastic_core::ids::{node_id_to_num, node_num_to_id};
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
 use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
-    AssemblyEvent, ModemPreset as VoiceModemPreset, VoiceAssembler, VoiceDestination, VoiceMessage,
-    detect_version,
+    AssemblyEvent, ModemPreset as VoiceModemPreset, PROTOCOL_VERSION, VoiceAssembler,
+    VoiceDestination, VoiceMessage, detect_version,
 };
 
 use crate::state::{ChatEntry, Section, SharedState, VoicePayload};
@@ -49,7 +49,6 @@ pub fn spawn_watchers(
     shared: Arc<Mutex<SharedState>>,
     ctx: egui::Context,
     assembler: Arc<VoiceAssembler>,
-    outgoing: Arc<crate::outgoing::OutgoingVoiceRegistry>,
 ) {
     // Pairing-prompt forwarder (Linux only). Takes ownership of the
     // BlueZ Agent1 receiver and stuffs each prompt into `SharedState`
@@ -268,7 +267,7 @@ pub fn spawn_watchers(
                         if d.portnum != PRIVATE_APP as i32 {
                             continue;
                         }
-                        if detect_version(&d.payload) != Some(0x01) {
+                        if detect_version(&d.payload) != Some(PROTOCOL_VERSION) {
                             continue;
                         }
                         if q_tx.send(d).await.is_err() {
@@ -287,7 +286,6 @@ pub fn spawn_watchers(
         let c = ctx.clone();
         let assembler = Arc::clone(&assembler);
         let svc = svc.clone();
-        let outgoing = Arc::clone(&outgoing);
         let current_pacing = Arc::clone(&current_pacing);
         rt.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -377,100 +375,44 @@ pub fn spawn_watchers(
                                     );
                                 }
                                 AssemblyEvent::Rejected(e) => {
-                                    tracing::warn!(
-                                        from = %from_id,
-                                        ?e,
-                                        "voice: chunk rejected"
-                                    );
+                                    // `Blacklisted` is the expected tail
+                                    // event for chunks arriving after the
+                                    // message already completed (sender's
+                                    // FEC + retransmit budget keeps
+                                    // transmitting briefly past the last
+                                    // needed shard). Demote to debug so
+                                    // it doesn't spam WARN; everything
+                                    // else still warns.
+                                    use voicetastic_core::voice::VoiceError;
+                                    if matches!(e, VoiceError::Blacklisted) {
+                                        tracing::debug!(
+                                            from = %from_id,
+                                            "voice: late chunk after completion (blacklisted)"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            from = %from_id,
+                                            ?e,
+                                            "voice: chunk rejected"
+                                        );
+                                    }
                                 }
                                 AssemblyEvent::Nack(info) => {
-                                    // Selective retransmit: resend exactly
-                                    // the data chunks the receiver lists as
-                                    // missing. `take_retransmit` enforces
-                                    // TTL + budget caps + per-message
-                                    // cooldown (so overlapping NACK rounds
-                                    // don't pile re-enqueues onto the
-                                    // voice TX queue while the previous
-                                    // batch is still being paced out).
+                                    // Inbound NACKs targeting our own
+                                    // outgoing messages are serviced
+                                    // transparently by VoiceSender's
+                                    // internal NACK listener. The
+                                    // watcher only logs them here for
+                                    // visibility; retransmits, cooldown,
+                                    // TTL, and budget caps all live in
+                                    // core.
                                     tracing::debug!(
                                         from = %from_id,
                                         message_id = info.message_id,
                                         missing = info.missing.len(),
                                         give_up = info.give_up,
-                                        "voice: NACK received"
+                                        "voice: NACK received (handled by VoiceSender)"
                                     );
-                                    if info.give_up { continue; }
-                                    let pacing = s
-                                        .lock()
-                                        .lora
-                                        .as_ref()
-                                        .and_then(|l| {
-                                            VoiceModemPreset::from_proto(l.modem_preset)
-                                        })
-                                        .map(VoiceModemPreset::pacing)
-                                        .unwrap_or_else(VoiceModemPreset::fallback_pacing);
-                                    let retransmit = outgoing.take_retransmit(
-                                        info.message_id,
-                                        &info.missing,
-                                        pacing,
-                                    );
-                                    match retransmit.as_ref() {
-                                        Some(frames) => tracing::debug!(
-                                            message_id = info.message_id,
-                                            requested = info.missing.len(),
-                                            scheduled = frames.len(),
-                                            "voice: retransmit scheduled"
-                                        ),
-                                        None => tracing::debug!(
-                                            message_id = info.message_id,
-                                            requested = info.missing.len(),
-                                            "voice: retransmit skipped (TTL/budget/cooldown)"
-                                        ),
-                                    }
-                                    if let Some(frames) = retransmit {
-                                        let svc = svc.clone();
-                                        let outgoing = Arc::clone(&outgoing);
-                                        let dest_node = d.from;
-                                        let channel = d.channel;
-                                        let message_id = info.message_id;
-                                        tokio::spawn(async move {
-                                            // Serialise retransmits through the worker the
-                                            // same way the initial burst does: each call
-                                            // awaits the worker's actual `send_data`, so
-                                            // we never push the next retransmit frame
-                                            // until the previous one has left the
-                                            // mpsc. This caps the voice TX queue's
-                                            // contribution from a retransmit task at 1
-                                            // slot regardless of how many chunks the
-                                            // peer asked for.
-                                            //
-                                            // `mark_chunk_sent` clears the pending flag
-                                            // so a *later* NACK round can request the
-                                            // same chunk again if it's still missing,
-                                            // while the dedup in `take_retransmit`
-                                            // prevents two overlapping NACK rounds
-                                            // from re-enqueuing chunks still in flight.
-                                            for (idx, frame) in frames {
-                                                let r = svc
-                                                    .enqueue_voice_frame_with_id(
-                                                        frame,
-                                                        channel,
-                                                        Some(dest_node),
-                                                        false,
-                                                        pacing,
-                                                    )
-                                                    .await;
-                                                outgoing.mark_chunk_sent(message_id, idx);
-                                                if let Err(e) = r {
-                                                    tracing::warn!(
-                                                        ?e,
-                                                        "voice retransmit failed"
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        });
-                                    }
                                 }
                             }
                         }
@@ -499,8 +441,11 @@ fn apply_lora_to_assembler(
     let nack_window = (pacing * 4).max(Duration::from_millis(2_000));
     // In-place mutation so we don't stomp on `message_timeout` /
     // `completion_memory` set by `VoicetasticApp::apply_voice_settings`.
+    // Resync the round cap so the new (often larger) `nack_window`
+    // doesn't blow past the configured `message_timeout`.
     assembler.update_config(|cfg| {
         cfg.nack_window = nack_window;
+        cfg.sync_nack_cap_to_timeout();
     });
 }
 

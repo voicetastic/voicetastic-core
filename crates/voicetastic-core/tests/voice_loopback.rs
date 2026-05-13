@@ -36,6 +36,7 @@ fn cfg(chunk_size: usize, parity: u8, key: Option<EnvelopeKey>) -> BuildConfig {
         parity_count: parity,
         last_in_stream: true,
         encryption: key,
+        mac_key: None,
     }
 }
 
@@ -134,7 +135,7 @@ fn loopback_nack_retransmit_completes_message() {
     let OutboundNack { ref frame, .. } = out.nacks[0];
 
     // Parse the NACK as a receiver peer would.
-    let (hdr, body) = ChunkHeader::parse(frame).expect("NACK header must parse");
+    let (hdr, body) = ChunkHeader::parse(frame, None).expect("NACK header must parse");
     assert_eq!(hdr.packet_type, PacketType::Nack);
     let info: NackInfo = parse_nack_body(&hdr, body).expect("NACK body must parse");
     assert_eq!(info.message_id, 0xCAFE_BABE);

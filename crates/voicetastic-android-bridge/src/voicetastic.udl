@@ -55,6 +55,7 @@ dictionary NackConfig {
     u8 parity_count;
     sequence<u8> missing;
     boolean give_up;
+    sequence<u8>? channel_psk;
 };
 
 // -----------------------------------------------------------------------------
@@ -96,6 +97,8 @@ enum VoiceError {
     "PerSenderCap",
     "EncryptedNoPsk",
     "BadFromForEncrypted",
+    "BadMac",
+    "MacKeyMissing",
     "Rng",
 };
 
@@ -204,7 +207,7 @@ dictionary AssemblerConfig {
     u64 message_timeout_ms;
     boolean partial_play_on_timeout;
     bytes? channel_psk;
-    u8 max_nack_rounds;
+    u16 max_nack_rounds;
     u64 nack_window_ms;
     u64 completion_memory_ms;
 };
@@ -237,6 +240,144 @@ interface VoiceAssembler {
 };
 
 // -----------------------------------------------------------------------------
+// VoiceSender — transparent outbound voice pipeline
+// -----------------------------------------------------------------------------
+//
+// `VoiceSender` collapses build → register → burst → NACK → retransmit
+// → linger into a single call. Frontends just hand it a `SendRequestUdl`
+// and consume `SendStatus` events through a foreign-implemented
+// listener. The internal NACK listener handles retransmits transparently.
+
+/// Inputs to `VoiceSender.send`.
+///
+/// `broadcast = true` ignores `to_node`. `parity_count = 0` disables
+/// FEC (NACK still works). `chunk_size = 0` defers to `MAX_BODY_SIZE`.
+/// `linger_ms = 0` uses the default 60 s window. `pacing_ms = 0` reads
+/// the live modem preset off the bound `MeshService`.
+dictionary SendRequestUdl {
+    bytes audio;
+    VoiceCodec codec;
+    u8 codec_param;
+    u32 channel;
+    boolean broadcast;
+    u32 to_node;
+    u8 parity_count;
+    u32 chunk_size;
+    /// AES-GCM channel PSK; empty = plaintext bodies.
+    bytes channel_psk;
+    /// Required when `channel_psk` is non-empty; ignored otherwise.
+    u32 from_node_num;
+    u64 linger_ms;
+    u8 stream_seq;
+    boolean last_in_stream;
+    u64 pacing_ms;
+};
+
+/// Lifecycle event emitted by `VoiceSenderListener.on_status`. Exactly
+/// one of `Complete`, `GaveUp`, or `Failed` terminates the stream.
+[Enum]
+interface SendStatus {
+    Building(u32 message_id, u8 total_data, u8 parity_count);
+    Sending(u32 message_id, u32 sent, u32 total);
+    BurstComplete(u32 message_id, sequence<u32> packet_ids);
+    Retransmitting(u32 message_id, sequence<u8> chunks);
+    Complete(u32 message_id);
+    GaveUp(u32 message_id);
+    Failed(u32 message_id, string message);
+};
+
+/// Foreign-implemented listener for `VoiceSender.send`. Invoked from a
+/// Rust worker thread; implementations must be thread-safe. The
+/// listener is dropped after the terminal event.
+[Trait, WithForeign]
+interface VoiceSenderListener {
+    void on_status(SendStatus status);
+};
+
+/// Shared outbound voice pipeline. One instance per `MeshService`. Obtain
+/// via `MeshService.voice_sender`.
+interface VoiceSender {
+    /// Build + register + ship `req`. Returns the assigned `message_id`.
+    /// Status events fire on `listener` on a Rust worker thread; the
+    /// listener is dropped after the terminal `Complete` / `GaveUp` /
+    /// `Failed` event.
+    [Throws=VoiceError]
+    u32 send(SendRequestUdl req, VoiceSenderListener listener);
+
+    /// Override the retain TTL (milliseconds). Internally clamped to
+    /// whole-second precision with a 1 s floor. Wire to the same
+    /// setting that drives `AssemblerConfig.message_timeout_ms`.
+    void set_retain_ttl_ms(u64 ttl_ms);
+
+    /// Diagnostic: number of in-flight sends.
+    u32 len();
+    boolean is_empty();
+};
+
+// -----------------------------------------------------------------------------
+// Outgoing-voice retransmit registry (sender-side state machine)
+// -----------------------------------------------------------------------------
+
+/// One DATA chunk ready to be re-enqueued for retransmit.
+dictionary RetransmitChunk {
+    /// Original `chunk_index` from the message's header. Pass back to
+    /// `mark_chunk_sent` once the worker has actually transmitted the
+    /// frame so a future NACK can request it again.
+    u8 chunk_index;
+    /// Wire bytes (header + body), exactly as originally encoded.
+    bytes frame;
+};
+
+/// Sender-side cache that services NACK-driven selective retransmits.
+/// Keep one instance per `MeshService` and call `register` after every
+/// successful `build_message` so the registry can answer NACKs that
+/// arrive after the original burst.
+interface OutgoingVoiceRegistry {
+    constructor();
+
+    /// Override the retain TTL (milliseconds). Internally clamped to
+    /// whole-second precision with a 1 s floor. Wire this to the same
+    /// setting that drives `AssemblerConfig.message_timeout_ms`.
+    void set_retain_ttl_ms(u64 ttl_ms);
+
+    /// Stash the encoded frames of a freshly-built message so a later
+    /// NACK can be serviced. `to_node` is ignored when `broadcast` is
+    /// `true`.
+    void register(
+        u32 message_id,
+        EncodedMessage encoded,
+        u32 channel,
+        boolean broadcast,
+        u32 to_node
+    );
+
+    /// Look up an entry, bump its retransmit counter, and return the
+    /// frames to resend. Returns an empty sequence when the message id
+    /// is unknown, the TTL elapsed, the retransmit budget is exhausted,
+    /// or a previous retransmit batch is still draining (cooldown).
+    sequence<RetransmitChunk> take_retransmit(
+        u32 message_id,
+        sequence<u8> missing,
+        u64 pacing_ms
+    );
+
+    /// Mark a previously-pending chunk as actually transmitted by the
+    /// underlying worker, releasing it so a subsequent NACK can request
+    /// it again. No-op if the message has been GC'd or the chunk was
+    /// not pending.
+    void mark_chunk_sent(u32 message_id, u8 chunk_index);
+
+    /// Drop the entry for `message_id`. Call when the receiver signals
+    /// completion (positive ACK / give_up) or higher-layer
+    /// confirmation. Idempotent.
+    void remove(u32 message_id);
+
+    /// Number of in-flight outgoing messages currently retained.
+    u32 len();
+    boolean is_empty();
+};
+
+// -----------------------------------------------------------------------------
 // -----------------------------------------------------------------------------
 // Settings (client-side, persisted as TOML on the host)
 // -----------------------------------------------------------------------------
@@ -258,6 +399,8 @@ enum SettingKey {
     "VoiceCodec",
     "VoiceCodec2Mode",
     "VoiceAmrnbMode",
+    "VoiceOpusBitrateKbps",
+    "VoiceOpusBandwidth",
 };
 
 /// Typed mirror of the `voice.codec` value.
@@ -491,5 +634,10 @@ interface MeshService {
     void set_data_listener(MeshDataListener listener);
     void set_queue_listener(MeshQueueListener listener);
     void set_config_listener(MeshConfigListener listener);
+
+    /// Shared `VoiceSender` bound to this service. Cached; subsequent
+    /// calls return the same instance. Frontends should call this once
+    /// per service handle and reuse the result for every voice send.
+    VoiceSender voice_sender();
 };
 

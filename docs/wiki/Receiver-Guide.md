@@ -13,7 +13,7 @@ You'll be receiving Meshtastic `Data` packets. Filter:
 
 ```rust
 if data.portnum != PRIVATE_APP as i32 { return; }   // 256
-if detect_version(&data.payload) != Some(0x01) { return; }
+if detect_version(&data.payload) != Some(0x02) { return; }
 ```
 
 The first-byte version check lets future protocol revisions co-exist on
@@ -106,7 +106,7 @@ The assembler enforces all of these for you:
 | `MAX_MESSAGE_BYTES`                | 55 845      | Structurally bounded (`u8 × MAX_BODY_SIZE`).                                             |
 | `BLACKLIST_TTL`                    | 60 s        | After a message completes/times out, late frames for it are silently dropped.            |
 | `BLACKLIST_MAX`                    | 100         | Oldest entries evicted FIFO.                                                             |
-| `NACK_MAX_ROUNDS`                  | 3           | After 3 NACK rounds without completion, finalize-or-discard.                             |
+| `NACK_MAX_ROUNDS`                  | 32          | After 32 *consecutive* NACK rounds with no new chunks, finalize-or-discard. Resets on every accepted shard.                              |
 | `NACK_WINDOW_MS`                   | 1500        | Quiet period after the last seen chunk before emitting a NACK.                           |
 | `MAX_VALIDATION_STRIKES` (impl)    | 3           | After 3 post-template mismatches, the entry is evicted + blacklisted.                    |
 

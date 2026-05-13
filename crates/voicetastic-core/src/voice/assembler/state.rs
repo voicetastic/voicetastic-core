@@ -35,14 +35,18 @@ pub(super) struct AssemblyState {
     pub(super) last_chunk_at: Instant,
     pub(super) first_seen: chrono::DateTime<chrono::Utc>,
     /// Number of NACK rounds emitted *since the last accepted shard*. Reset
-    /// to 0 in the ingest path so a slowly trickling message doesn't burn
-    /// through the round budget. Used purely for the wire `round` field on
-    /// emitted NACKs; the hard give-up bound lives on `total_nack_rounds`.
-    pub(super) nack_rounds: u8,
-    /// Cumulative NACK rounds emitted across the lifetime of this message.
-    /// Never reset. Compared against `max_nack_rounds` to bound how long a
-    /// trickle-feeding sender can keep an assembly slot alive.
-    pub(super) total_nack_rounds: u8,
+    /// to 0 in the ingest path whenever real forward progress lands.
+    ///
+    /// Doubles as the wire-visible `round` field on emitted NACKs **and**
+    /// the hard give-up bound: once it reaches `max_nack_rounds` we stop
+    /// chasing the message and partial-finalize (or discard).
+    ///
+    /// Bounding on the consecutive count rather than a cumulative one is
+    /// deliberate: a long, slow-trickling message that actually services
+    /// every NACK round must not be killed off — only one that has gone
+    /// truly silent for `max_nack_rounds * nack_window` should give up.
+    /// `message_timeout` remains the absolute upper bound regardless.
+    pub(super) nack_rounds: u16,
     /// Count of post-template validation failures (codec / total_data /
     /// stream_seq mismatch). After [`super::config::MAX_VALIDATION_STRIKES`]
     /// the entry is evicted and blacklisted to keep a chatty bad sender
@@ -73,7 +77,6 @@ impl AssemblyState {
             last_chunk_at: Instant::now(),
             first_seen: chrono::Utc::now(),
             nack_rounds: 0,
-            total_nack_rounds: 0,
             validation_strikes: 0,
             to,
             channel,

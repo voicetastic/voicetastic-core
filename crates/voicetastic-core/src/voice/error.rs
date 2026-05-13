@@ -66,6 +66,10 @@ pub enum VoiceError {
     EncryptedNoPsk,
     #[error("`from` field {0:?} is not a valid !hex8 node id (required for encrypted frames)")]
     BadFromForEncrypted(String),
+    #[error("header MAC verification failed")]
+    BadMac,
+    #[error("frame advertises a keyed header MAC but no channel PSK is configured")]
+    MacKeyMissing,
     #[error("OS RNG unavailable: {0}")]
     Rng(String),
 }

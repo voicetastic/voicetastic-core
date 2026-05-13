@@ -10,7 +10,7 @@
 //! # Wire dispatch
 //!
 //! Receivers reading a frame from `PortNum::PRIVATE_APP` MUST drop any
-//! frame whose first byte is not [`PROTOCOL_VERSION`] (`0x01`). The
+//! frame whose first byte is not [`PROTOCOL_VERSION`] (`0x02`). The
 //! version byte exists so that future protocol revisions can coexist on
 //! the same port.
 //!
@@ -19,8 +19,9 @@
 //! - [`consts`] — protocol constants.
 //! - [`types`] — `PacketType`, `VoiceCodec`, `VoiceDestination`, `ModemPreset`.
 //! - [`error`] — `VoiceError` and the local `Result` alias.
-//! - [`header`] — `ChunkHeader` (parse/serialize the 12-byte frame header).
+//! - [`header`] — `ChunkHeader` (parse/serialize the 16-byte frame header).
 //! - [`crypto`] — `EnvelopeKey`, `derive_key`, `encrypt_body`, `decrypt_body`.
+//! - [`mac`] — 4-byte trailing header MAC (HMAC-SHA256 keyed / SHA-256 unkeyed).
 //! - [`builder`] — `BuildConfig`, `EncodedMessage`, `build_message`,
 //!   `random_message_id`.
 //! - [`nack`] — `build_nack`, `NackInfo`, `parse_nack_body`.
@@ -36,23 +37,30 @@ pub mod consts;
 pub mod crypto;
 pub mod error;
 pub mod header;
+pub mod mac;
 pub mod message;
 pub mod nack;
+pub mod outgoing;
+pub mod sender;
 pub mod types;
 
 pub use assembler::{AssemblerConfig, OutboundNack, TickOutput, VoiceAssembler};
 pub use builder::{BuildConfig, EncodedMessage, build_message, random_message_id};
 pub use consts::{
-    BLACKLIST_MAX, BLACKLIST_TTL, GCM_NONCE_LEN, GCM_TAG_LEN, HEADER_SIZE, MAX_BODY_SIZE,
-    MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_MESSAGE_BYTES,
-    MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS,
-    PROTOCOL_VERSION,
+    BLACKLIST_MAX, BLACKLIST_TTL, GCM_NONCE_LEN, GCM_TAG_LEN, HEADER_MAC_LEN, HEADER_SIZE,
+    MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER,
+    MAX_MESSAGE_BYTES, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS,
+    NACK_WINDOW_MS, PROTOCOL_VERSION,
 };
 pub use crypto::{EnvelopeKey, decrypt_body, derive_key, encrypt_body};
 pub use error::{Result, VoiceError};
 pub use header::ChunkHeader;
 pub use message::{AssemblyEvent, VoiceMessage};
 pub use nack::{NackInfo, build_nack, parse_nack_body};
+pub use outgoing::{
+    DEFAULT_RETAIN_TTL, MAX_RETRANSMITS_PER_MESSAGE, OutgoingVoice, OutgoingVoiceRegistry,
+};
+pub use sender::{DEFAULT_LINGER, SendHandle, SendRequest, SendStatus, VoiceSender};
 pub use types::{ModemPreset, PacketType, VoiceCodec, VoiceDestination};
 
 /// Returns the protocol version byte of a `PRIVATE_APP` payload.
@@ -82,6 +90,7 @@ mod tests {
             } else {
                 None
             },
+            mac_key: None,
         }
     }
 
@@ -249,11 +258,15 @@ mod tests {
     /// Spec §3.2: receivers MUST drop frames with an unknown codec.
     #[test]
     fn unknown_codec_is_rejected() {
-        // Build a valid frame, then poke the codec byte to an unknown value.
+        // Build a valid frame, then poke the codec byte to an unknown
+        // value and recompute the unkeyed header MAC so the frame survives
+        // the header integrity check and reaches codec validation.
         let audio = synthesize(64);
         let enc = build_message(&audio, &cfg(0, false)).unwrap();
         let mut frame = enc.frames[0].clone();
         frame[6] = 0xEE; // codec
+        let tag = super::mac::compute_tag(&frame[..HEADER_SIZE - HEADER_MAC_LEN], None);
+        frame[HEADER_SIZE - HEADER_MAC_LEN..HEADER_SIZE].copy_from_slice(&tag);
         let asm = assembler(false);
         let ev = asm.accept("!cc", VoiceDestination::Broadcast, 0, &frame);
         assert!(
@@ -448,9 +461,15 @@ mod tests {
         let asm = assembler(false);
         // Establish template with parity_count = 2.
         let _ = asm.accept("!cd", VoiceDestination::Broadcast, 0, &enc.frames[0]);
-        // Forge a follow-up DATA frame for chunk 1 with parity_count = 1.
-        let mut tampered = enc.frames[1].clone();
-        tampered[11] = 1; // parity_count byte
+        // Forge a properly-MACed follow-up DATA frame for chunk 1 with
+        // parity_count = 1. We can't just flip the raw byte any more —
+        // the header MAC would catch that as `BadMac` before any
+        // field-level validation runs. So parse, mutate, re-serialize.
+        let (mut hdr, body) = ChunkHeader::parse(&enc.frames[1], None).expect("frame 1 must parse");
+        hdr.parity_count = 1;
+        let mut tampered = Vec::with_capacity(HEADER_SIZE + body.len());
+        tampered.extend_from_slice(&hdr.serialize_with_mac(None));
+        tampered.extend_from_slice(body);
         let ev = asm.accept("!cd", VoiceDestination::Broadcast, 0, &tampered);
         assert!(
             matches!(
@@ -467,7 +486,7 @@ mod tests {
     fn nack_with_nonzero_chunk_index_is_rejected() {
         use super::types::PacketType;
         // Build a syntactically valid NACK header with chunk_index = 5.
-        let h = ChunkHeader {
+        let mut h = ChunkHeader {
             packet_type: PacketType::Nack,
             encrypted: false,
             last_in_stream: false,
@@ -478,9 +497,10 @@ mod tests {
             chunk_index: 5,
             total_data: 4,
             parity_count: 0,
+            mac_keyed: false,
         };
         let mut frame = vec![0u8; HEADER_SIZE + 4];
-        frame[..HEADER_SIZE].copy_from_slice(&h.serialize());
+        frame[..HEADER_SIZE].copy_from_slice(&h.serialize_with_mac(None));
         // Minimal NACK body (nack_version + flags + 1 bitmap byte).
         frame[HEADER_SIZE..].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]);
         let asm = assembler(false);

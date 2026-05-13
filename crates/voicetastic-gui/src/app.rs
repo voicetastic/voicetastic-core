@@ -6,9 +6,7 @@ use tokio::runtime::Runtime;
 
 use voicetastic_core::service::{ConnectionState, MeshService};
 use voicetastic_core::settings::{SettingKey, SettingsApi, SettingsListener};
-use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceCodec};
-
-use crate::outgoing::OutgoingVoiceRegistry;
+use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceCodec, VoiceSender};
 
 use crate::state::{SharedState, Tab};
 use crate::ui;
@@ -52,10 +50,11 @@ pub struct VoicetasticApp {
     /// listeners; UI widgets call its typed setters and never poke the
     /// underlying `AppSettings` directly.
     pub settings: Arc<SettingsApi>,
-    /// Registry of outgoing voice messages retained for NACK-driven
-    /// retransmit. Populated by the chat composer, consumed by the
-    /// inbound-data watcher.
-    pub outgoing_voice: Arc<OutgoingVoiceRegistry>,
+    /// Shared outbound voice pipeline. Owns the build → register →
+    /// burst → NACK-driven retransmit loop; the chat composer hands
+    /// it a `SendRequest` and subscribes to `SendStatus` events. One
+    /// instance per service handle.
+    pub voice_sender: Arc<VoiceSender>,
 }
 
 impl VoicetasticApp {
@@ -68,21 +67,32 @@ impl VoicetasticApp {
         // — multiple call sites using the spread will silently clobber each
         // other's field contributions. Use `VoiceAssembler::update_config`
         // for in-place mutation after construction.
-        let voice_assembler = Arc::new(VoiceAssembler::new(AssemblerConfig {
-            message_timeout: std::time::Duration::from_secs(
-                settings.reassembly_timeout_secs() as u64
-            ),
-            ..AssemblerConfig::default()
+        let voice_assembler = Arc::new(VoiceAssembler::new({
+            let mut cfg = AssemblerConfig {
+                message_timeout: std::time::Duration::from_secs(
+                    settings.reassembly_timeout_secs() as u64
+                ),
+                ..AssemblerConfig::default()
+            };
+            // Keep the consecutive-silence budget tied to
+            // `message_timeout` so the user's reassembly slider
+            // (10 s..=3600 s) is the real ceiling, not the static
+            // `NACK_MAX_ROUNDS` constant.
+            cfg.sync_nack_cap_to_timeout();
+            cfg
         }));
-        let outgoing_voice = OutgoingVoiceRegistry::new();
-        outgoing_voice.set_retain_ttl(std::time::Duration::from_secs(
+        // `VoiceSender` background tasks run on the GUI's tokio
+        // runtime; pass its handle explicitly so callers (UI thread,
+        // settings listener) don't need an entered runtime context.
+        let voice_sender = VoiceSender::new_on(service.clone(), rt.handle().clone());
+        voice_sender.set_retain_ttl(std::time::Duration::from_secs(
             settings.reassembly_timeout_secs() as u64,
         ));
         // Auto-apply voice-runtime-affecting settings whenever they change
         // anywhere (UI, CLI sharing the same file, future Android host).
         settings.subscribe(Arc::new(VoiceRuntimeListener {
             assembler: Arc::clone(&voice_assembler),
-            outgoing: Arc::clone(&outgoing_voice),
+            voice_sender: Arc::clone(&voice_sender),
             settings: Arc::clone(&settings),
         }));
         spawn_watchers(
@@ -91,7 +101,6 @@ impl VoicetasticApp {
             Arc::clone(&shared),
             cc.egui_ctx.clone(),
             Arc::clone(&voice_assembler),
-            Arc::clone(&outgoing_voice),
         );
 
         let device_addr = settings.last_device().unwrap_or_default();
@@ -110,7 +119,7 @@ impl VoicetasticApp {
             playback_source: None,
             chat_status: None,
             settings,
-            outgoing_voice,
+            voice_sender,
         }
     }
 
@@ -126,7 +135,7 @@ impl VoicetasticApp {
 /// CLI `settings set`, Android host) immediately reflects on the wire.
 struct VoiceRuntimeListener {
     assembler: Arc<VoiceAssembler>,
-    outgoing: Arc<crate::outgoing::OutgoingVoiceRegistry>,
+    voice_sender: Arc<VoiceSender>,
     settings: Arc<SettingsApi>,
 }
 
@@ -143,11 +152,14 @@ impl SettingsListener for VoiceRuntimeListener {
         // versa). See `VoiceAssembler::update_config` rustdoc.
         self.assembler.update_config(|cfg| {
             cfg.message_timeout = timeout;
+            // Keep the consecutive-silence budget aligned with the
+            // new timeout so the round cap doesn't trip first.
+            cfg.sync_nack_cap_to_timeout();
         });
         // Keep the sender-side retransmit registry's retention aligned
         // with the receiver's reassembly window so a NACK can never
         // arrive for a frame we've already forgotten.
-        self.outgoing.set_retain_ttl(timeout);
+        self.voice_sender.set_retain_ttl(timeout);
     }
 }
 

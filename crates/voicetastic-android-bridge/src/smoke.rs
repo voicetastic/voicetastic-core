@@ -87,6 +87,7 @@ mod tests {
             parity_count: 2,
             missing: vec![1, 4, 9],
             give_up: false,
+            channel_psk: None,
         });
         let asm = VoiceAssembler::new(AssemblerConfig {
             message_timeout_ms: 60_000,

@@ -12,9 +12,11 @@ use eframe::egui;
 use voicetastic_core::settings::{
     AMRNB_MODE_475, AMRNB_MODE_515, AMRNB_MODE_590, AMRNB_MODE_670, AMRNB_MODE_740, AMRNB_MODE_795,
     AMRNB_MODE_1020, AMRNB_MODE_1220, CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400,
-    CODEC2_MODE_1600, CODEC2_MODE_2400, CODEC2_MODE_3200, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
-    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS, REASSEMBLY_TIMEOUT_LOWER_SECS,
-    REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER, VoiceCodecKind,
+    CODEC2_MODE_1600, CODEC2_MODE_2400, CODEC2_MODE_3200, DEFAULT_OPUS_BANDWIDTH,
+    DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC,
+    DEFAULT_VOICE_MAX_SECS, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, OpusBandwidthKind,
+    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER,
+    VoiceCodecKind,
 };
 
 use crate::app::VoicetasticApp;
@@ -87,7 +89,7 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
             let current = app.settings.voice_codec();
             let mut next = current;
             let label = |k: VoiceCodecKind| match k {
-                VoiceCodecKind::Opus => "Opus (12 kbps wideband)",
+                VoiceCodecKind::Opus => "Opus (configurable bitrate & bandwidth)",
                 VoiceCodecKind::Codec2 => "Codec2 (1.2-3.2 kbps narrowband)",
                 VoiceCodecKind::AmrNb => "AMR-NB (4.75-12.2 kbps narrowband, default)",
             };
@@ -102,6 +104,67 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                 && let Err(e) = app.settings.set_voice_codec(next)
             {
                 warn("set voice_codec", e);
+            }
+
+            if app.settings.voice_codec() == VoiceCodecKind::Opus {
+                ui.add_space(4.0);
+                ui.label("Opus bitrate:");
+                let mut kbps = app.settings.voice_opus_bitrate_kbps();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Slider::new(
+                                &mut kbps,
+                                OPUS_BITRATE_KBPS_MIN..=OPUS_BITRATE_KBPS_MAX,
+                            )
+                            .suffix(" kbps")
+                            .clamping(egui::SliderClamping::Always),
+                        )
+                        .changed()
+                        && let Err(e) = app.settings.set_voice_opus_bitrate_kbps(kbps)
+                    {
+                        warn("set voice_opus_bitrate_kbps", e);
+                    }
+                    if ui.small_button("Reset").clicked()
+                        && let Err(e) = app.settings.reset(SettingKey::VoiceOpusBitrateKbps)
+                    {
+                        warn("reset voice_opus_bitrate_kbps", e);
+                    }
+                });
+                ui.weak(format!(
+                    "Default: {DEFAULT_OPUS_BITRATE_KBPS} kbps. Lower values save airtime; libopus picks the operating mode automatically below ~12 kbps."
+                ));
+
+                ui.add_space(4.0);
+                ui.label("Opus bandwidth:");
+                let current_bw = app.settings.voice_opus_bandwidth();
+                let mut next_bw = current_bw;
+                let bw_label = |b: OpusBandwidthKind| match b {
+                    OpusBandwidthKind::Narrow => "Narrowband (SILK 8 kHz, telephony)",
+                    OpusBandwidthKind::Wide => "Wideband (SILK 16 kHz, HD voice)",
+                };
+                egui::ComboBox::from_id_salt("voice_opus_bandwidth_select")
+                    .selected_text(bw_label(current_bw))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut next_bw,
+                            OpusBandwidthKind::Narrow,
+                            bw_label(OpusBandwidthKind::Narrow),
+                        );
+                        ui.selectable_value(
+                            &mut next_bw,
+                            OpusBandwidthKind::Wide,
+                            bw_label(OpusBandwidthKind::Wide),
+                        );
+                    });
+                if next_bw != current_bw
+                    && let Err(e) = app.settings.set_voice_opus_bandwidth(next_bw)
+                {
+                    warn("set voice_opus_bandwidth", e);
+                }
+                ui.weak(format!(
+                    "Default: {DEFAULT_OPUS_BANDWIDTH}. Sender-only — the receiver auto-detects per packet. Full-band / super-wide are intentionally not exposed (no benefit for LoRa voice)."
+                ));
             }
 
             if app.settings.voice_codec() == VoiceCodecKind::Codec2 {

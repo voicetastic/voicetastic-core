@@ -70,9 +70,23 @@ chunk-by-chunk retry.
 
 ### Round budget
 
-`NACK_MAX_ROUNDS = 3` per message. After the third NACK without
-completion, the receiver gives up and either emits a partial message
+`NACK_MAX_ROUNDS = 32` per message of **consecutive rounds without
+progress** — the counter is reset every time a new shard lands, so a
+sender that's still actively servicing every NACK round keeps the
+assembly slot alive indefinitely (capped only by `message_timeout`,
+default 600 s). After 32 NACK rounds in a row with zero new chunks the
+receiver gives up and either emits a partial message
 (`partial_play_on_timeout = true`, the default) or discards the work.
+At a `nack_window` of 1500 ms that's a ~48 s ceiling on a truly silent
+sender.
+
+> Earlier revisions used a *cumulative* counter that never reset. That
+> turned out to be indistinguishable from genuine silence on healthy
+> slow-trickle messages — a 67-chunk Long-Slow broadcast could rack up
+> 32 productive rounds long before delivery and surface a phantom
+> `partial: 47/51 chunks` line. The consecutive semantic preserves the
+> protection against a chatty bad sender (`message_timeout` is still
+> the absolute upper bound) without the false positive.
 
 ### Empty NACK = positive ACK
 
@@ -119,6 +133,41 @@ build_message(audio)                                       │
 
 ---
 
+## Sender-side state machine
+
+The sender side of NACK handling lives in
+[`OutgoingVoiceRegistry`](../../crates/voicetastic-core/src/voice/outgoing.rs)
+and is driven by [`VoiceSender`](../../crates/voicetastic-core/src/voice/sender.rs).
+[`VoiceSender::send`] registers an entry at burst start and the
+background NACK-listener task feeds inbound NACKs into
+`take_retransmit`, which enforces three caps:
+
+1. **Pending-chunk dedup.** Every DATA index is marked *pending* at
+   `register()` time. The burst loop calls `mark_chunk_sent(i)` per
+   frame as it leaves the worker. A NACK arriving while the initial
+   burst is still draining is filtered against `pending_chunks`, so
+   chunks already queued up are not re-enqueued.
+2. **Per-message cooldown.** After each retransmit batch, the entry is
+   parked for `pacing × frames.len()`, clamped to `[1 s, 30 s]`. The
+   30 s ceiling sits comfortably below the receiver's ~48 s NACK
+   budget so the sender always responds before the receiver gives up.
+   NACK rounds during cooldown are dropped; the receiver re-NACKs
+   after the next quiet window.
+3. **Per-message retransmit budget.** `MAX_RETRANSMITS_PER_MESSAGE = 32`
+   matches the receiver-side round cap. Beyond that, the sender drops
+   further NACKs.
+
+After the initial burst, the sender lingers for `SendRequest::linger`
+(default 60 s, see [`DEFAULT_LINGER`](../../crates/voicetastic-core/src/voice/sender.rs))
+before emitting `SendStatus::Complete` and releasing registry state.
+A stale NACK arriving after that point finds nothing to retransmit
+against.
+
+The absolute outer envelope is `OutgoingVoiceRegistry::set_retain_ttl`
+(default 600 s, matched to the receiver's `message_timeout`).
+
+---
+
 ## NACK trust model
 
 NACKs are deliberately **not** AES-GCM-enveloped. This keeps them small
@@ -137,12 +186,15 @@ spec. Mitigations available to senders:
 
 ## Tunable knobs
 
-| Setting                       | Default | Effect of increasing                       |
-|-------------------------------|---------|--------------------------------------------|
-| `parity_count` (sender)       | 10–50 % | Better loss tolerance, more airtime        |
-| `NACK_WINDOW_MS`              | 1500    | Fewer spurious NACKs on jittery links      |
-| `NACK_MAX_ROUNDS`             | 3       | Higher completion rate, longer worst-case  |
-| `message_timeout`             | 30 s    | Larger messages allowed, more state held   |
-| `partial_play_on_timeout`     | `true`  | Always emits something on timeout          |
+| Setting                            | Default | Effect of increasing                       |
+|------------------------------------|---------|--------------------------------------------|
+| `parity_count` (sender)            | 10–50 % | Better loss tolerance, more airtime        |
+| `NACK_WINDOW_MS`                   | 1500    | Fewer spurious NACKs on jittery links      |
+| `NACK_MAX_ROUNDS` (consecutive)    | 32      | Higher completion rate, longer worst-case  |
+| `MAX_RETRANSMITS_PER_MESSAGE`      | 32      | Sender-side counterpart to NACK budget     |
+| `AssemblerConfig::message_timeout` | 600 s   | Larger messages allowed, more state held   |
+| `OutgoingVoiceRegistry::retain_ttl`| 600 s   | Sender remembers frames longer             |
+| `SendRequest::linger`              | 60 s    | Sender stays subscribed to NACKs longer    |
+| `partial_play_on_timeout`          | `true`  | Always emits something on timeout          |
 
 → Continue to [Encryption](Encryption.md).

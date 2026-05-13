@@ -86,6 +86,10 @@ pub enum VoiceError {
     EncryptedNoPsk,
     #[error("`from` field is not a valid !hex8 node id (required for encrypted frames)")]
     BadFromForEncrypted,
+    #[error("header MAC mismatch")]
+    BadMac,
+    #[error("frame advertises keyed MAC but no channel PSK is configured")]
+    MacKeyMissing,
     #[error("OS RNG unavailable")]
     Rng,
 }
@@ -124,6 +128,8 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::PerSenderCap(_) => Self::PerSenderCap,
             v::VoiceError::EncryptedNoPsk => Self::EncryptedNoPsk,
             v::VoiceError::BadFromForEncrypted(_) => Self::BadFromForEncrypted,
+            v::VoiceError::BadMac => Self::BadMac,
+            v::VoiceError::MacKeyMissing => Self::MacKeyMissing,
             v::VoiceError::Rng(_) => Self::Rng,
         }
     }
@@ -227,6 +233,7 @@ pub fn build_message(audio: Vec<u8>, cfg: BuildConfig) -> Result<EncodedMessage,
         parity_count: cfg.parity_count,
         last_in_stream: cfg.last_in_stream,
         encryption,
+        mac_key: cfg.channel_psk.clone(),
     };
     Ok(v::build_message(&audio, &core_cfg)?.into())
 }
@@ -241,6 +248,7 @@ pub struct NackConfig {
     pub parity_count: u8,
     pub missing: Vec<u8>,
     pub give_up: bool,
+    pub channel_psk: Option<Vec<u8>>,
 }
 
 pub fn build_nack(cfg: NackConfig) -> Vec<u8> {
@@ -253,6 +261,7 @@ pub fn build_nack(cfg: NackConfig) -> Vec<u8> {
         cfg.parity_count,
         &cfg.missing,
         cfg.give_up,
+        cfg.channel_psk.as_deref(),
     )
 }
 
@@ -420,7 +429,7 @@ pub struct AssemblerConfig {
     pub message_timeout_ms: u64,
     pub partial_play_on_timeout: bool,
     pub channel_psk: Option<Vec<u8>>,
-    pub max_nack_rounds: u8,
+    pub max_nack_rounds: u16,
     pub nack_window_ms: u64,
     pub completion_memory_ms: u64,
 }
@@ -479,6 +488,312 @@ impl VoiceAssembler {
 }
 
 // -----------------------------------------------------------------------------
+// Outgoing-voice retransmit registry (sender-side state machine)
+// -----------------------------------------------------------------------------
+
+/// One DATA chunk to be re-enqueued for retransmit. Returned by
+/// [`OutgoingVoiceRegistry::take_retransmit`].
+#[derive(Debug)]
+pub struct RetransmitChunk {
+    pub chunk_index: u8,
+    pub frame: Vec<u8>,
+}
+
+/// Thin wrapper around [`v::OutgoingVoiceRegistry`]. Upstream is already
+/// `Send + Sync` and internally `Arc`-able, so UniFFI wraps this in
+/// `Arc<Self>` and the lock semantics carry through transparently.
+pub struct OutgoingVoiceRegistry(v::OutgoingVoiceRegistry);
+
+impl OutgoingVoiceRegistry {
+    pub fn new() -> Self {
+        Self(v::OutgoingVoiceRegistry::default())
+    }
+
+    pub fn set_retain_ttl_ms(&self, ttl_ms: u64) {
+        self.0.set_retain_ttl(Duration::from_millis(ttl_ms));
+    }
+
+    pub fn register(
+        &self,
+        message_id: u32,
+        encoded: EncodedMessage,
+        channel: u32,
+        broadcast: bool,
+        to_node: u32,
+    ) {
+        // Reconstruct a `v::EncodedMessage` from the UDL dict. We only
+        // need the three fields the registry reads — frames, total_data,
+        // parity_count — and `v::EncodedMessage` has no private fields.
+        let core = v::EncodedMessage {
+            frames: encoded.frames,
+            total_data: encoded.total_data,
+            parity_count: encoded.parity_count,
+        };
+        let dest = if broadcast { None } else { Some(to_node) };
+        self.0.register(message_id, &core, channel, dest);
+    }
+
+    pub fn take_retransmit(
+        &self,
+        message_id: u32,
+        missing: Vec<u8>,
+        pacing_ms: u64,
+    ) -> Vec<RetransmitChunk> {
+        // Empty Vec = "no plan" (TTL/budget/cooldown). UDL doesn't
+        // surface `Option<sequence<…>>` ergonomically, so we collapse
+        // `None` to an empty list; callers branch on `is_empty()`.
+        self.0
+            .take_retransmit(message_id, &missing, Duration::from_millis(pacing_ms))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(chunk_index, frame)| RetransmitChunk { chunk_index, frame })
+            .collect()
+    }
+
+    pub fn mark_chunk_sent(&self, message_id: u32, chunk_index: u8) {
+        self.0.mark_chunk_sent(message_id, chunk_index);
+    }
+
+    pub fn remove(&self, message_id: u32) {
+        self.0.remove(message_id);
+    }
+
+    pub fn len(&self) -> u32 {
+        // UDL has no `usize`; clamp to u32::MAX (in practice retransmit
+        // entries are bounded by per-message budget and TTL, so this is
+        // never reached).
+        self.0.len().min(u32::MAX as usize) as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl Default for OutgoingVoiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// VoiceSender (transparent outbound voice pipeline)
+// -----------------------------------------------------------------------------
+
+/// Inputs to [`VoiceSender::send`]. UDL counterpart of [`v::SendRequest`]
+/// with UniFFI-friendly type substitutions:
+///
+/// - `Option<u32> to` is split into `(broadcast, to_node)`.
+/// - `Option<Vec<u8>> channel_psk` is collapsed to an empty `Vec`.
+/// - `Option<Duration> linger` / `pacing` become `u64` ms with `0` = default.
+/// - `Option<usize> chunk_size` becomes `u32` with `0` = default.
+#[derive(Debug)]
+pub struct SendRequestUdl {
+    pub audio: Vec<u8>,
+    pub codec: VoiceCodec,
+    pub codec_param: u8,
+    pub channel: u32,
+    pub broadcast: bool,
+    pub to_node: u32,
+    pub parity_count: u8,
+    pub chunk_size: u32,
+    pub channel_psk: Vec<u8>,
+    pub from_node_num: u32,
+    pub linger_ms: u64,
+    pub stream_seq: u8,
+    pub last_in_stream: bool,
+    pub pacing_ms: u64,
+}
+
+/// Lifecycle event surfaced to Kotlin via [`VoiceSenderListener`].
+/// Mirrors [`v::SendStatus`] one-for-one; variants are flattened so the
+/// UDL `[Enum]` shape stays simple.
+#[derive(Debug)]
+pub enum SendStatus {
+    Building {
+        message_id: u32,
+        total_data: u8,
+        parity_count: u8,
+    },
+    Sending {
+        message_id: u32,
+        sent: u32,
+        total: u32,
+    },
+    BurstComplete {
+        message_id: u32,
+        packet_ids: Vec<u32>,
+    },
+    Retransmitting {
+        message_id: u32,
+        chunks: Vec<u8>,
+    },
+    Complete {
+        message_id: u32,
+    },
+    GaveUp {
+        message_id: u32,
+    },
+    Failed {
+        message_id: u32,
+        message: String,
+    },
+}
+
+impl From<v::SendStatus> for SendStatus {
+    fn from(s: v::SendStatus) -> Self {
+        match s {
+            v::SendStatus::Building {
+                message_id,
+                total_data,
+                parity_count,
+            } => Self::Building {
+                message_id,
+                total_data,
+                parity_count,
+            },
+            v::SendStatus::Sending {
+                message_id,
+                sent,
+                total,
+            } => Self::Sending {
+                message_id,
+                sent,
+                total,
+            },
+            v::SendStatus::BurstComplete {
+                message_id,
+                packet_ids,
+            } => Self::BurstComplete {
+                message_id,
+                packet_ids,
+            },
+            v::SendStatus::Retransmitting { message_id, chunks } => {
+                Self::Retransmitting { message_id, chunks }
+            }
+            v::SendStatus::Complete { message_id } => Self::Complete { message_id },
+            v::SendStatus::GaveUp { message_id } => Self::GaveUp { message_id },
+            v::SendStatus::Failed {
+                message_id,
+                message,
+            } => Self::Failed {
+                message_id,
+                message,
+            },
+        }
+    }
+}
+
+/// Foreign-implemented listener for status events. The bridge spawns a
+/// detached tokio task that pumps the broadcast receiver into this
+/// callback; the task self-terminates on the first terminal event.
+pub trait VoiceSenderListener: Send + Sync {
+    fn on_status(&self, status: SendStatus);
+}
+
+/// Thin Arc-wrapper around [`v::VoiceSender`]. UniFFI wraps this in
+/// `Arc<Self>`; we hold our own `Arc<v::VoiceSender>` so the inner
+/// background NACK-listener task keeps running as long as Kotlin
+/// retains the handle.
+pub struct VoiceSender {
+    inner: std::sync::Arc<v::VoiceSender>,
+}
+
+impl VoiceSender {
+    /// Construct bound to `svc`. Spawns the internal NACK listener
+    /// task on the bridge's static tokio runtime.
+    pub(crate) fn new(svc: voicetastic_core::service::MeshService) -> Self {
+        Self {
+            inner: v::VoiceSender::new_on(svc, crate::runtime::runtime().handle().clone()),
+        }
+    }
+
+    /// Build + register + ship `req`. Returns the assigned
+    /// `message_id` synchronously; status events fan out on `listener`
+    /// asynchronously.
+    pub fn send(
+        &self,
+        req: SendRequestUdl,
+        listener: std::sync::Arc<dyn VoiceSenderListener>,
+    ) -> Result<u32, VoiceError> {
+        let encryption = if req.channel_psk.is_empty() {
+            None
+        } else {
+            Some(v::derive_key(&req.channel_psk, 0, req.from_node_num))
+        };
+        let chunk_size = if req.chunk_size == 0 {
+            None
+        } else {
+            Some(req.chunk_size as usize)
+        };
+        let linger = if req.linger_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(req.linger_ms))
+        };
+        let pacing = if req.pacing_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(req.pacing_ms))
+        };
+        let core_req = v::SendRequest {
+            audio: req.audio,
+            codec: req.codec.into(),
+            codec_param: req.codec_param,
+            channel: req.channel,
+            to: if req.broadcast {
+                None
+            } else {
+                Some(req.to_node)
+            },
+            parity_count: req.parity_count,
+            chunk_size,
+            encryption,
+            linger,
+            stream_seq: req.stream_seq,
+            last_in_stream: req.last_in_stream,
+            pacing,
+            mac_key: if req.channel_psk.is_empty() {
+                None
+            } else {
+                Some(req.channel_psk.clone())
+            },
+        };
+        let handle = self.inner.send(core_req)?;
+        let message_id = handle.message_id;
+        let mut rx = handle.subscribe();
+        crate::runtime::runtime().spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(s) => {
+                        let terminal = s.is_terminal();
+                        listener.on_status(s.into());
+                        if terminal {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        Ok(message_id)
+    }
+
+    pub fn set_retain_ttl_ms(&self, ttl_ms: u64) {
+        self.inner.set_retain_ttl(Duration::from_millis(ttl_ms));
+    }
+
+    pub fn len(&self) -> u32 {
+        self.inner.len().min(u32::MAX as usize) as u32
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Settings facade
 // -----------------------------------------------------------------------------
 
@@ -510,6 +825,8 @@ pub enum SettingKey {
     VoiceCodec,
     VoiceCodec2Mode,
     VoiceAmrnbMode,
+    VoiceOpusBitrateKbps,
+    VoiceOpusBandwidth,
 }
 
 impl From<SettingKey> for s::SettingKey {
@@ -521,6 +838,8 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceCodec => Self::VoiceCodec,
             SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
             SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
+            SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
+            SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
         }
     }
 }
@@ -534,6 +853,8 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceCodec => Self::VoiceCodec,
             s::SettingKey::VoiceCodec2Mode => Self::VoiceCodec2Mode,
             s::SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
+            s::SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
+            s::SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
         }
     }
 }
