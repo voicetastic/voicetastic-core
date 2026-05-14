@@ -124,7 +124,8 @@ impl ModemPreset {
         match self {
             Self::ShortTurbo | Self::ShortFast => MAX_BODY_SIZE, // 219
             Self::ShortSlow | Self::MediumFast => 160,
-            Self::MediumSlow | Self::LongFast => 96,
+            Self::MediumSlow => 96,
+            Self::LongFast => 128,
             Self::LongModerate | Self::LongSlow | Self::VeryLongSlow => 48,
         }
     }

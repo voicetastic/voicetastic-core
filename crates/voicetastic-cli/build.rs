@@ -10,9 +10,11 @@
 use std::process::Command;
 
 fn main() {
-    // Re-run when the git HEAD or tag set changes, or when the override env
-    // var changes. `cargo:rerun-if-changed` paths that don't exist are
-    // silently ignored, which is the behaviour we want in source tarballs.
+    // Re-run when this build script itself changes, and when the git HEAD
+    // or tag set changes, or when the override env var changes.
+    // `cargo:rerun-if-changed` paths that don't exist are silently ignored,
+    // which is the behaviour we want in source tarballs.
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/refs/tags");
     println!("cargo:rerun-if-changed=../../.git/packed-refs");

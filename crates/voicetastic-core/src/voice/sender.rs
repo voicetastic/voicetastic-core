@@ -49,30 +49,32 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
 use crate::ports::PRIVATE_APP;
 use crate::service::MeshService;
 use crate::voice::builder::{BuildConfig, build_message, random_message_id};
 use crate::voice::consts::MAX_BODY_SIZE;
-use crate::voice::crypto::EnvelopeKey;
+use crate::voice::crypto::{EnvelopeKey, derive_key};
 use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
 use crate::voice::outgoing::OutgoingVoiceRegistry;
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
-/// Default linger window after the initial burst. The receiver-side
-/// assembler will keep firing NACK rounds for up to its `message_timeout`
-/// (default 10 min on `AssemblerConfig::default`); we don't need to
-/// match that exactly — most retransmit rounds complete in seconds. 60 s
-/// is a sensible upper bound for typical LoRa traffic.
-pub const DEFAULT_LINGER: Duration = Duration::from_secs(60);
+/// Default linger window after the initial burst. Matches the
+/// receiver-side `AssemblerConfig::message_timeout` default (10 min)
+/// so the sender stays alive to service NACK rounds for as long as the
+/// receiver is willing to try. The previous value of 60 s was too short
+/// for slow modem presets: on LongFast (900 ms pacing) a 155-frame burst
+/// alone takes ~140 s, leaving only a 60 s window for potentially dozens
+/// of NACK rounds, each subject to a multi-second retransmit cooldown.
+pub const DEFAULT_LINGER: Duration = Duration::from_secs(600);
 
 /// Inputs to [`VoiceSender::send`]. All defaults are sensible; the only
 /// always-required fields are [`Self::audio`] and [`Self::codec`].
@@ -117,6 +119,18 @@ pub struct SendRequest {
     /// (integrity only). Should match the receiver's
     /// [`crate::voice::AssemblerConfig::channel_psk`].
     pub mac_key: Option<Vec<u8>>,
+    /// When set alongside [`mac_key`] the envelope encryption key is
+    /// derived *after* the per-message `message_id` has been assigned.
+    /// This is the correct path for callers (e.g. Android bridge) that
+    /// do not know the `message_id` before calling [`Self::send`].
+    ///
+    /// If [`Self::encryption`] is `Some` it takes precedence and this
+    /// field is ignored.
+    pub channel_psk: Option<Vec<u8>>,
+    /// Sender's node number, used alongside [`channel_psk`] for
+    /// per-message envelope key derivation. Ignored when
+    /// [`Self::encryption`] is set.
+    pub from_node_num: u32,
 }
 
 impl Default for SendRequest {
@@ -135,6 +149,8 @@ impl Default for SendRequest {
             last_in_stream: true,
             pacing: None,
             mac_key: None,
+            channel_psk: None,
+            from_node_num: 0,
         }
     }
 }
@@ -257,6 +273,10 @@ pub struct VoiceSender {
     /// spawned through this so callers (UI threads, foreign FFI
     /// callbacks) don't need an entered runtime context.
     rt: Handle,
+    /// Limits concurrent retransmit tasks spawned from the NACK listener
+    /// to prevent unbounded task growth when many messages are NACK'd
+    /// simultaneously.
+    retransmit_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl VoiceSender {
@@ -280,6 +300,7 @@ impl VoiceSender {
             registry: Arc::new(OutgoingVoiceRegistry::default()),
             active: Mutex::new(HashMap::new()),
             rt: rt.clone(),
+            retransmit_permits: Arc::new(Semaphore::new(16)),
         });
         let weak = Arc::downgrade(&sender);
         let rx = svc.subscribe_data();
@@ -297,6 +318,19 @@ impl VoiceSender {
     /// background burst surface as `SendStatus::Failed`.
     pub fn send(self: &Arc<Self>, req: SendRequest) -> Result<SendHandle, VoiceError> {
         let message_id = random_message_id()?;
+
+        // Deferred envelope key derivation: if the caller provided a
+        // channel PSK (but no pre-derived key) we derive it here with
+        // the freshly-assigned message_id.  Pre-derived encryption
+        // takes precedence.
+        let encryption = match (req.encryption.clone(), &req.channel_psk) {
+            (Some(k), _) => Some(k),
+            (None, Some(psk)) if !psk.is_empty() => {
+                Some(derive_key(psk, message_id, req.from_node_num)?)
+            }
+            _ => None,
+        };
+
         let chunk_size = req.chunk_size.unwrap_or(MAX_BODY_SIZE);
         let cfg = BuildConfig {
             message_id,
@@ -306,7 +340,7 @@ impl VoiceSender {
             chunk_size,
             parity_count: req.parity_count,
             last_in_stream: req.last_in_stream,
-            encryption: req.encryption.clone(),
+            encryption,
             mac_key: req.mac_key.clone(),
         };
         let encoded = build_message(&req.audio, &cfg)?;
@@ -569,24 +603,34 @@ async fn nack_listener_task(
         // retransmits is always the *originator's* perspective: if we
         // unicast originally, we still unicast on retransmit; if we
         // broadcast, we still broadcast.
+        let permits = Arc::clone(&sender.retransmit_permits);
         let svc = sender.svc.clone();
         let registry = Arc::clone(&sender.registry);
         let message_id = nack.message_id;
         let channel = _channel;
         let want_ack = to.is_some();
-        // Bound retransmit batches by an Instant computed *now* so a
-        // long batch doesn't accidentally outlive a fresh send for
-        // the same message_id (which would be impossible right now —
-        // we cleanup before reuse — but cheap insurance).
-        let _started_at = Instant::now();
         tokio::spawn(async move {
-            for (idx, frame) in plan {
+            let _permit = match permits.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!(message_id, "retransmit semaphore closed");
+                    return;
+                }
+            };
+            for batch_idx in 0..plan.len() {
+                let (idx, frame) = &plan[batch_idx];
                 let r = svc
-                    .enqueue_voice_frame_with_id(frame, channel, to, want_ack, pacing)
+                    .enqueue_voice_frame_with_id(frame.clone(), channel, to, want_ack, pacing)
                     .await;
-                registry.mark_chunk_sent(message_id, idx);
+                registry.mark_chunk_sent(message_id, *idx);
                 if let Err(e) = r {
                     warn!(message_id, idx, ?e, "voice retransmit enqueue failed");
+                    // Clear pending for the un-sent tail of this batch so
+                    // a subsequent NACK round can retry them. Without this
+                    // the chunks stay stuck in `pending_chunks` forever.
+                    for (idx, _) in &plan[(batch_idx + 1)..] {
+                        registry.mark_chunk_sent(message_id, *idx);
+                    }
                     break;
                 }
             }

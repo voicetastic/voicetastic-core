@@ -164,7 +164,7 @@ impl MeshService {
             return;
         };
         let portnum = data.portnum;
-        let payload = data.payload.clone();
+        let mut payload = data.payload.clone();
         // Admin responses (e.g. get_owner_response) come back as a packet on
         // ADMIN_APP. Decode them so the settings UI sees the latest values.
         if portnum == PortNum::AdminApp as i32
@@ -201,7 +201,7 @@ impl MeshService {
                 );
                 return;
             }
-            match String::from_utf8(payload.clone()) {
+            match String::from_utf8(payload) {
                 Ok(text) => {
                     let from_id = node_num_to_id(pkt.from);
                     let _ = self.inner.incoming_text_tx.send(IncomingText {
@@ -219,10 +219,10 @@ impl MeshService {
                 Err(e) => {
                     warn!(
                         from = pkt.from,
-                        len = payload.len(),
-                        ?e,
+                        len = e.as_bytes().len(),
                         "malformed UTF-8 on TextMessageApp; falling through to data fan-out"
                     );
+                    payload = e.into_bytes();
                 }
             }
         }

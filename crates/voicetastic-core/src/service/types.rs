@@ -58,8 +58,8 @@ pub fn node_long_name(node: &NodeInfo) -> Option<&str> {
     node.user.as_ref().map(|u: &User| u.long_name.as_str())
 }
 
-pub(super) fn rand_u32() -> u32 {
+pub(super) fn rand_u32() -> Result<u32, crate::Error> {
     let mut buf = [0u8; 4];
-    getrandom::fill(&mut buf).expect("OS RNG");
-    u32::from_ne_bytes(buf)
+    getrandom::fill(&mut buf).map_err(|e| crate::Error::Other(e.to_string()))?;
+    Ok(u32::from_ne_bytes(buf))
 }

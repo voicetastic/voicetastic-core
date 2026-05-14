@@ -50,7 +50,6 @@ static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
 /// Safe to call from any thread (including a JNI call-in). The first call
 /// pays the runtime-startup cost (~1 ms on a Pixel-class device); every
 /// subsequent call is a single `OnceCell` load.
-#[allow(dead_code)] // wired in PR 1 when MeshService lands.
 pub(crate) fn runtime() -> &'static Runtime {
     &RUNTIME
 }

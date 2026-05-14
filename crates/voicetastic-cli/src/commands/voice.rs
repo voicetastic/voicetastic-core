@@ -122,8 +122,16 @@ pub async fn send(
     Ok(())
 }
 
-pub async fn listen(device: &str, out_dir: &Path, _format: &str) -> Result<()> {
-    tokio::fs::create_dir_all(out_dir).await.ok();
+pub async fn listen(device: &str, out_dir: &Path, format: &str) -> Result<()> {
+    if format != "amr" {
+        warn!(
+            "--format {} is not yet implemented; output uses the incoming codec's native extension",
+            format
+        );
+    }
+    tokio::fs::create_dir_all(out_dir)
+        .await
+        .with_context(|| format!("creating output directory {}", out_dir.display()))?;
     // Canonicalize once so symlinks / `..` segments in the user-provided path
     // are resolved up front. Subsequent writes are validated against this
     // base to prevent any future filename change from escaping it.

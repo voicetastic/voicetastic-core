@@ -598,16 +598,16 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         .map(VoiceModemPreset::recommended_chunk_size)
         .unwrap_or(MAX_BODY_SIZE);
 
-    // Scale FEC parity to message size. Real LoRa broadcast links
-    // routinely show 30–45 % per-chunk loss, so a fixed 8 parity shards
-    // can only ever heal short messages. For longer clips we add ~50 %
-    // parity (clamped to the protocol max of 128) so FEC alone closes
-    // most gaps and the NACK + retransmit loop only has to mop up.
+    // Scale FEC parity to message size. At 50 % per-chunk loss on
+    // LongFast, half of (total_data + parity) shards arrive — RS needs
+    // at least total_data.  Setting parity ≈ total_data (up to the
+    // protocol max of 128) guarantees Reed-Solomon recovery at up to
+    // 50 % loss so the NACK + retransmit path only has to cover the
+    // (rare) tail beyond the RS correction capacity.
     let total_data = clip.payload.len().div_ceil(chunk_size).max(1);
     let parity_count = {
-        let target = total_data.div_ceil(2).max(8);
         let cap = MAX_PARITY_PER_MESSAGE.min(255usize.saturating_sub(total_data));
-        target.min(cap).min(u8::MAX as usize) as u8
+        cap.min(u8::MAX as usize) as u8
     };
 
     // Hand the whole pipeline (build → register → burst → NACK →

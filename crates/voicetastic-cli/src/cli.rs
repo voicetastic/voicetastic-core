@@ -132,7 +132,7 @@ pub enum DeviceCmd {
     Reboot {
         /// Seconds until reboot.
         #[arg(long, default_value_t = 5)]
-        secs: i32,
+        secs: u32,
     },
     /// Factory-reset the device's configuration (preserves BLE bonds).
     FactoryReset {

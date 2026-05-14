@@ -18,7 +18,7 @@ use crate::transport::Transport;
 
 impl MeshService {
     pub(super) async fn send_want_config(&self) -> Result<()> {
-        let nonce: u32 = rand_u32();
+        let nonce: u32 = rand_u32()?;
         debug!(nonce, "sending want_config_id");
         self.send_to_radio(to_radio::PayloadVariant::WantConfigId(nonce))
             .await

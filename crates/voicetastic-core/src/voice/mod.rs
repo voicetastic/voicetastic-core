@@ -196,7 +196,7 @@ mod tests {
         });
         // Sender used the test BuildConfig key directly; rebuild encrypted
         // frames with the receiver-derivable key for an end-to-end test.
-        let real_key = derive_key(b"unit-test-psk", c.message_id, 0x12345678);
+        let real_key = derive_key(b"unit-test-psk", c.message_id, 0x12345678).unwrap();
         let mut c2 = c.clone();
         c2.encryption = Some(real_key);
         let enc2 = build_message(&audio, &c2).unwrap();
@@ -306,7 +306,7 @@ mod tests {
     fn encrypted_frame_with_bad_from_is_rejected() {
         let audio = synthesize(64);
         let mut c = cfg(0, true);
-        c.encryption = Some(derive_key(b"psk", c.message_id, 0));
+        c.encryption = Some(derive_key(b"psk", c.message_id, 0).unwrap());
         let enc = build_message(&audio, &c).unwrap();
         let asm = VoiceAssembler::new(AssemblerConfig {
             channel_psk: Some(b"psk".to_vec()),
@@ -333,7 +333,7 @@ mod tests {
     fn encrypted_frame_without_psk_is_rejected() {
         let audio = synthesize(64);
         let mut c = cfg(0, true);
-        c.encryption = Some(derive_key(b"psk", c.message_id, 0x12345678));
+        c.encryption = Some(derive_key(b"psk", c.message_id, 0x12345678).unwrap());
         let enc = build_message(&audio, &c).unwrap();
         let asm = VoiceAssembler::new(AssemblerConfig {
             channel_psk: None,

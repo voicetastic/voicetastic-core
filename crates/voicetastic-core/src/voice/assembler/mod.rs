@@ -132,10 +132,15 @@ impl VoiceAssembler {
         channel: u32,
         bytes: &[u8],
     ) -> Result<AssemblyEvent> {
-        // Header MAC + envelope decrypt share the channel PSK. Snapshot
-        // it once so both paths see a consistent view if the caller
-        // reconfigures mid-frame.
-        let psk_snapshot = self.cfg.lock().channel_psk.clone();
+        // Snapshot all config values once before locking `inner` so we never
+        // re-acquire `self.cfg` while `inner` is held, and both paths see a
+        // consistent view across the frame.
+        let cfg_guard = self.cfg.lock();
+        let psk_snapshot = cfg_guard.channel_psk.clone();
+        let completion_memory = cfg_guard.completion_memory;
+        let supported_codecs = cfg_guard.supported_codecs.clone();
+        drop(cfg_guard);
+
         let (header, body) = ChunkHeader::parse(bytes, psk_snapshot.as_deref())?;
 
         // NACK frames bypass assembly.
@@ -147,7 +152,6 @@ impl VoiceAssembler {
         let mut inner = self.inner.lock();
         let now = Instant::now();
 
-        let completion_memory = self.cfg.lock().completion_memory;
         prune_blacklist(&mut inner.blacklist, now, completion_memory);
         if inner.blacklist.iter().any(|(k, _)| *k == key) {
             return Err(VoiceError::Blacklisted);
@@ -164,7 +168,7 @@ impl VoiceAssembler {
         }
         // Reject codecs the receiver explicitly doesn't support, so we don't
         // waste a per-sender slot reassembling a message we can't play back.
-        if let Some(allow) = &self.cfg.lock().supported_codecs
+        if let Some(allow) = supported_codecs
             && !allow.contains(&header.codec)
         {
             return Err(VoiceError::UnsupportedCodec(header.codec));
@@ -229,7 +233,9 @@ impl VoiceAssembler {
         state.nack_rounds = 0;
 
         // Try FEC recovery if we now have enough shards.
-        let _ = state.try_fec_recover();
+        if let Err(e) = state.try_fec_recover() {
+            warn!(?e, message_id = ?header.message_id, "FEC recovery failed");
+        }
 
         if state.received_data == state.header_template.total_data {
             // Invariant: we just held a `&mut state` borrowed from `in_progress`
@@ -281,15 +287,15 @@ impl VoiceAssembler {
         // Spec §7: encrypted frames MUST carry a valid !hex8 `from`.
         let from_node = Self::parse_from_node_num(from)
             .ok_or_else(|| VoiceError::BadFromForEncrypted(from.to_string()))?;
-        let derived = derive_key(&psk, header.message_id, from_node);
+        let derived = derive_key(&psk, header.message_id, from_node)?;
         decrypt_body(&derived, &bytes[..HEADER_SIZE], body)
     }
 
     /// Drive timeouts and NACK emission. Call periodically (~100 ms cadence).
     pub fn tick(&self) -> TickOutput {
+        let cfg = self.cfg.lock().clone();
         let mut inner = self.inner.lock();
         let now = Instant::now();
-        let cfg = self.cfg.lock().clone();
         prune_blacklist(&mut inner.blacklist, now, cfg.completion_memory);
 
         let mut finalized_msgs = Vec::new();

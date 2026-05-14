@@ -220,10 +220,10 @@ pub fn detect_version(payload: Vec<u8>) -> Option<u8> {
 }
 
 pub fn build_message(audio: Vec<u8>, cfg: BuildConfig) -> Result<EncodedMessage, VoiceError> {
-    let encryption = cfg
-        .channel_psk
-        .as_ref()
-        .map(|psk| v::derive_key(psk, cfg.message_id, cfg.from_node_num));
+    let encryption = match cfg.channel_psk.as_ref() {
+        Some(psk) => Some(v::derive_key(psk, cfg.message_id, cfg.from_node_num)?),
+        None => None,
+    };
     let core_cfg = v::BuildConfig {
         message_id: cfg.message_id,
         stream_seq: cfg.stream_seq,
@@ -716,11 +716,6 @@ impl VoiceSender {
         req: SendRequestUdl,
         listener: std::sync::Arc<dyn VoiceSenderListener>,
     ) -> Result<u32, VoiceError> {
-        let encryption = if req.channel_psk.is_empty() {
-            None
-        } else {
-            Some(v::derive_key(&req.channel_psk, 0, req.from_node_num))
-        };
         let chunk_size = if req.chunk_size == 0 {
             None
         } else {
@@ -736,6 +731,11 @@ impl VoiceSender {
         } else {
             Some(Duration::from_millis(req.pacing_ms))
         };
+        let channel_psk = if req.channel_psk.is_empty() {
+            None
+        } else {
+            Some(req.channel_psk.clone())
+        };
         let core_req = v::SendRequest {
             audio: req.audio,
             codec: req.codec.into(),
@@ -748,7 +748,9 @@ impl VoiceSender {
             },
             parity_count: req.parity_count,
             chunk_size,
-            encryption,
+            encryption: None,
+            channel_psk,
+            from_node_num: req.from_node_num,
             linger,
             stream_seq: req.stream_seq,
             last_in_stream: req.last_in_stream,

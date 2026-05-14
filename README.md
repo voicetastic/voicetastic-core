@@ -12,6 +12,7 @@ with the Android app for AMR-NB.
 | `voicetastic-core` | Shared library: BLE + serial transport, Meshtastic protobuf codec, voice chunker/assembler, `MeshService` façade |
 | `voicetastic-cli` | CLI (`clap`): `scan`, `text send/listen`, `voice send/listen`, `device reboot/factory-reset` |
 | `voicetastic-gui` | GUI (`eframe`/`egui`): three-tab app (Devices, Chat, Settings) |
+| `voicetastic-android-bridge` | UniFFI bindings exposing core functionality to the Android app |
 
 ## Documentation
 
@@ -103,15 +104,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ## Voice Protocol
 
-Voice messages are captured live from the microphone, encoded, and chunked into
-≤ 200-byte Meshtastic data packets sent over `PortNum::PRIVATE_APP` with a 4-byte
-header (`msgId · chunkIndex · totalChunks · codecParam`). Three codecs are supported:
+Voice messages are captured live from the microphone, encoded, and protected with
+FEC (Reed-Solomon), then chunked into ≤ 215-byte Meshtastic data packets sent
+over `PortNum::PRIVATE_APP` with a **16-byte v2 header** (protocol version `0x02`),
+see [`VOICE_PROTOCOL.md`](VOICE_PROTOCOL.md). Four codecs are supported:
 
-| Codec  | Wire id | Rate    | Bitrates                          | Notes                                  |
-|--------|---------|---------|-----------------------------------|----------------------------------------|
-| AMR-NB | `1`     | 8 kHz   | 4.75 – 12.2 kbps (8 modes)        | Default. Wire-compatible with Android. |
-| Codec2 | `3`     | 8 kHz   | 1.2 – 3.2 kbps (6 modes)          | Most LoRa-friendly bitrates.           |
-| Opus   | `2`     | 48 kHz  | 12 kbps VoIP                      | Wideband; larger payloads.             |
+| Codec    | Wire id | Rate    | Bitrates                          | Notes                                  |
+|----------|---------|---------|-----------------------------------|----------------------------------------|
+| AMR-NB   | `1`     | 8 kHz   | 4.75 – 12.2 kbps (8 modes)        | Default. Wire-compatible with Android. |
+| PCM_S16LE | `2`    | 48 kHz  | 768 kbps                          | Raw PCM; not recommended for LoRa.     |
+| Opus     | `3`     | 48 kHz  | 6 – 64 kbps (configurable)        | Wideband; larger payloads.             |
+| Codec2   | `4`     | 8 kHz   | 1.2 – 3.2 kbps (6 modes)          | Most LoRa-friendly bitrates.           |
 
 The codec used to encode a message is advertised in its header, so peers always
 decode using the correct codec regardless of their own outgoing-codec setting.

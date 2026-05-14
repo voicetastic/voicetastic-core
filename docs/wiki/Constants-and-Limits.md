@@ -53,7 +53,7 @@ Key derivation: HKDF-SHA256, `salt = channel_psk`, `ikm = message_id_be ‖ from
 | `MAX_IN_PROGRESS_PER_SENDER`   | 4              | Stops one chatty peer from starving everyone else.           |
 | `BLACKLIST_TTL`                | 60 s           | How long a finalized message blocks late frames for itself.  |
 | `BLACKLIST_MAX`                | 100            | FIFO eviction once exceeded.                                 |
-| `NACK_MAX_ROUNDS`              | 32             | Per-message NACK budget (consecutive rounds without progress; resets on every accepted shard) before the receiver gives up. |
+| `NACK_MAX_ROUNDS`              | 400            | Per-message NACK budget (consecutive rounds without progress; resets on every accepted shard) before the receiver gives up. |
 | `NACK_WINDOW_MS`               | 1500           | Quiet period after the last seen chunk before NACK'ing.      |
 | `MAX_VALIDATION_STRIKES` (impl)| 3              | Eviction trigger for chatty bad senders (post-template).     |
 
@@ -61,9 +61,9 @@ Key derivation: HKDF-SHA256, `salt = channel_psk`, `ikm = message_id_be ‖ from
 
 | Constant                            | Value | Why                                                                 |
 |-------------------------------------|------:|---------------------------------------------------------------------|
-| `MAX_RETRANSMITS_PER_MESSAGE`       | 32    | Per-message retransmit budget; matches receiver `NACK_MAX_ROUNDS`.  |
-| `DEFAULT_RETAIN_TTL`                | 600 s | How long `OutgoingVoiceRegistry` keeps frames for late NACKs.       |
-| `DEFAULT_LINGER` (`SendRequest`)    |  60 s | How long `VoiceSender` stays subscribed to NACKs after burst end.   |
+| `MAX_RETRANSMITS_PER_MESSAGE`       | 2_400 | Per-message retransmit budget; matches widened receiver `NACK_MAX_ROUNDS`.  |
+| `DEFAULT_RETAIN_TTL`                | 1200 s | How long `OutgoingVoiceRegistry` keeps frames for late NACKs (burst + linger safety margin). |
+| `DEFAULT_LINGER` (`SendRequest`)    | 600 s | How long `VoiceSender` stays subscribed to NACKs after burst end.   |
 | Cooldown clamp                      | 1–30 s | Park window after each retransmit batch (`pacing × frames`).        |
 
 ## Sender pacing
@@ -85,19 +85,21 @@ Adaptive per modem preset (`Config.LoRaConfig.modem_preset`):
 |---------------------------------------|-------------:|
 | Short-range (high SNR margin)         |          219 |
 | Medium-range                          |          160 |
-| Long-range                            |           96 |
+| Long-range (LongFast)                 |          128 |
+| Long-moderate (MediumSlow)           |           96 |
 | Very long-range (worst loss profile)  |           48 |
 
 ## Recommended `parity_count`
 
-Expressed as a percentage of `total_data`:
+Severe loss (>40 %) requires nearly 1:1 parity for Reed–Solomon to close
+without relying on NACK retransmit rounds:
 
-| Mesh profile                          | `parity_count` |
-|---------------------------------------|---------------:|
-| Short / quiet                         |           10 % |
-| Medium / mixed                        |           20 % |
-| Long / lossy                          |           33 % |
-| Broadcast (no NACK feedback channel)  |           50 % |
+| Mesh profile                          | `parity_count`       |
+|---------------------------------------|---------------------:|
+| Short / quiet                         |               10 %   |
+| Medium / mixed                        |               20 %   |
+| Long / lossy                          |               33 %   |
+| High-loss (>40 %) / broadcast         | 100 % (up to 128)    |
 
 ## Capacity reference
 
@@ -108,6 +110,7 @@ For quick sanity-checking message budgets:
 | 219          | OPUS @ 16 kbps          | 55 845 B      | ~28 s            |
 | 191          | OPUS @ 16 kbps (encrypted) | 48 705 B   | ~24 s            |
 | 160          | AMR-NB @ MR795 (7.95 kbps) | 40 800 B   | ~41 s            |
+| 128          | AMR-NB @ MR795          | 32 640 B      | ~33 s            |
 | 96           | AMR-NB @ MR795          | 24 480 B      | ~25 s            |
 | 48           | AMR-NB @ MR795          | 12 240 B      | ~12 s            |
 

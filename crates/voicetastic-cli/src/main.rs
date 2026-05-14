@@ -5,6 +5,8 @@ mod commands;
 mod connect;
 mod util;
 
+use std::io::Write;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -65,7 +67,23 @@ async fn main() -> Result<()> {
             SettingsCmd::List => commands::settings::list(),
             SettingsCmd::Get { key } => commands::settings::get(&key),
             SettingsCmd::Set { key, value } => commands::settings::set(&key, &value),
-            SettingsCmd::Reset { key } => commands::settings::reset(key.as_deref()),
+            SettingsCmd::Reset { key } => {
+                if key.is_none() {
+                    eprint!("WARNING: this will reset ALL settings to defaults. Continue? [y/N] ");
+                    std::io::stderr().flush().ok();
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).is_ok()
+                        && line.trim().eq_ignore_ascii_case("y")
+                    {
+                        commands::settings::reset(None)?;
+                    } else {
+                        eprintln!("aborted");
+                    }
+                } else {
+                    commands::settings::reset(key.as_deref())?;
+                }
+                Ok(())
+            }
         },
     }
 }

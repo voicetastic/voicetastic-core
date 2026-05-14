@@ -134,7 +134,14 @@ impl MeshService {
             // Meshtastic firmware uses packet id for flood-routing
             // deduplication; tiny sequential ids would clash with
             // recently-seen packets, so seed from the OS RNG.
-            next_packet_id: Mutex::new(types::rand_u32().max(1)),
+            next_packet_id: Mutex::new(
+                types::rand_u32()
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "OS RNG failed, using fallback packet id seed");
+                        1
+                    })
+                    .max(1),
+            ),
             voice_tx: voice_tx_send,
             queue_status_tx,
             lora_tx,

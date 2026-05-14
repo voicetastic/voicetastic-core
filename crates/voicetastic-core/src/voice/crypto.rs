@@ -32,23 +32,24 @@ impl EnvelopeKey {
 ///
 /// The HKDF `info` string is preserved across protocol revisions for
 /// forward-compat with already-shipped derivers; do not change it.
-pub fn derive_key(channel_psk: &[u8], message_id: u32, from_node_num: u32) -> EnvelopeKey {
+///
+/// Returns [`VoiceError::Rng`] if the OS RNG is unavailable.
+pub fn derive_key(channel_psk: &[u8], message_id: u32, from_node_num: u32) -> Result<EnvelopeKey> {
     let mut ikm = [0u8; 8];
     ikm[..4].copy_from_slice(&message_id.to_be_bytes());
     ikm[4..].copy_from_slice(&from_node_num.to_be_bytes());
     let hk = Hkdf::<Sha256>::new(Some(channel_psk), &ikm);
     let mut out = [0u8; 32];
     hk.expand(b"voicetastic/v2", &mut out)
-        .expect("HKDF SHA-256 32 B is always valid");
-    EnvelopeKey(out)
+        .map_err(|_| VoiceError::Rng("HKDF expand failed".into()))?;
+    Ok(EnvelopeKey(out))
 }
 
 /// Encrypt `plaintext` under `key` with random nonce, binding the 12-byte
 /// `header_aad`. Returns `nonce || ciphertext || tag`.
 ///
 /// Fails with [`VoiceError::Rng`] if the OS RNG is unreachable (sandboxed /
-/// seccomp'd hosts, /dev/urandom not mounted, …). The AES-GCM encryption
-/// step itself is infallible for valid inputs.
+/// seccomp'd hosts, /dev/urandom not mounted, …).
 pub fn encrypt_body(key: &EnvelopeKey, header_aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let aes_key = Key::<Aes256Gcm>::from_slice(&key.0);
     let cipher = Aes256Gcm::new(aes_key);
@@ -63,7 +64,7 @@ pub fn encrypt_body(key: &EnvelopeKey, header_aad: &[u8], plaintext: &[u8]) -> R
                 aad: header_aad,
             },
         )
-        .expect("AES-GCM encrypt cannot fail with valid inputs");
+        .map_err(|e| VoiceError::Rng(e.to_string()))?;
     let mut out = Vec::with_capacity(GCM_NONCE_LEN + ct.len());
     out.extend_from_slice(&nonce_bytes);
     out.extend_from_slice(&ct);
@@ -96,7 +97,7 @@ mod tests {
 
     #[test]
     fn encryption_envelope_roundtrip() {
-        let key = derive_key(b"psk", 0xDEADBEEF, 0x12345678);
+        let key = derive_key(b"psk", 0xDEADBEEF, 0x12345678).unwrap();
         let header = [0u8; HEADER_SIZE];
         let pt = b"some plaintext";
         let ct = encrypt_body(&key, &header, pt).unwrap();

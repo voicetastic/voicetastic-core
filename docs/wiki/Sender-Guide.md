@@ -143,7 +143,7 @@ work regardless of caller thread.
 `VoiceSender::set_retain_ttl(Duration)` controls how long the internal
 `OutgoingVoiceRegistry` keeps frames after the linger window. Wire
 this to the same setting that drives the receiver's
-`AssemblerConfig::message_timeout` (default 600 s) so a NACK never
+`AssemblerConfig::message_timeout` (default 900 s) so a NACK never
 arrives for a frame the sender has already forgotten.
 
 The [Reliability page](Reliability-FEC-and-NACK.md#sender-side-state-machine)

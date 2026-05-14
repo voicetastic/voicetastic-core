@@ -106,7 +106,7 @@ The assembler enforces all of these for you:
 | `MAX_MESSAGE_BYTES`                | 55 845      | Structurally bounded (`u8 × MAX_BODY_SIZE`).                                             |
 | `BLACKLIST_TTL`                    | 60 s        | After a message completes/times out, late frames for it are silently dropped.            |
 | `BLACKLIST_MAX`                    | 100         | Oldest entries evicted FIFO.                                                             |
-| `NACK_MAX_ROUNDS`                  | 32          | After 32 *consecutive* NACK rounds with no new chunks, finalize-or-discard. Resets on every accepted shard.                              |
+| `NACK_MAX_ROUNDS`                  | 400         | After 400 *consecutive* NACK rounds with no new chunks, finalize-or-discard. Resets on every accepted shard.                              |
 | `NACK_WINDOW_MS`                   | 1500        | Quiet period after the last seen chunk before emitting a NACK.                           |
 | `MAX_VALIDATION_STRIKES` (impl)    | 3           | After 3 post-template mismatches, the entry is evicted + blacklisted.                    |
 
@@ -116,7 +116,7 @@ The assembler enforces all of these for you:
 
 The assembler returns `AssemblyEvent::Rejected(VoiceError::*)` for:
 
-- `version != 1`
+- `version != 0x02` (protocol version 2)
 - `packet_type == 3` (reserved)
 - `total_data == 0`
 - `chunk_index >= total_data` (DATA) or `>= parity_count` (PARITY)

@@ -185,15 +185,15 @@ parity_count = 1
 frames       = 2 DATA + 1 PARITY = 3 frames
 ```
 
-| Frame | Header (hex)                       | Body              |
-|-------|------------------------------------|-------------------|
-| 0     | `01 00 dd cc bb aa 00 05 07 00 02 01` | 160 B AMR data    |
-| 1     | `01 00 dd cc bb aa 00 05 07 01 02 01` | 40 B AMR data (last, trimmed) |
-| 2     | `01 40 dd cc bb aa 00 05 07 00 02 01` | 160 B RS parity   |
+| Frame | Header (hex)                                   | Body              |
+|-------|------------------------------------------------|-------------------|
+| 0     | `02 00 dd cc bb aa 00 05 07 00 02 01 ab cd ef 34` | 160 B AMR data    |
+| 1     | `02 00 dd cc bb aa 00 05 07 01 02 01 12 34 56 78` | 40 B AMR data (last, trimmed) |
+| 2     | `02 40 dd cc bb aa 00 05 07 00 02 01 9a bc de f0` | 160 B RS parity   |
 
 Header field decode (frame 0):
 
-- `01` — version
+- `02` — version (protocol v2, wire byte `0x02`)
 - `00` — `type_flags`: DATA, plaintext, not last_in_stream
 - `dd cc bb aa` — message_id (BE) = `0xddccbbaa`
 - `00` — codec = AMR_NB
@@ -202,5 +202,6 @@ Header field decode (frame 0):
 - `00` — chunk_index = 0
 - `02` — total_data = 2
 - `01` — parity_count = 1
+- `ab cd ef 34` — 4-byte header MAC (truncated HMAC-SHA256 or SHA-256)
 
 → Continue to [Reliability — FEC and NACK](Reliability-FEC-and-NACK.md).

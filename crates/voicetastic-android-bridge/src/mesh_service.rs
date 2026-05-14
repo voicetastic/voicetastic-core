@@ -507,10 +507,10 @@ impl MeshService {
         dest: Option<u32>,
         pacing_ms: u64,
     ) -> Result<Vec<u32>, MeshServiceError> {
-        let encryption = cfg
-            .channel_psk
-            .as_ref()
-            .map(|psk| v::derive_key(psk, cfg.message_id, cfg.from_node_num));
+        let encryption = match cfg.channel_psk.as_ref() {
+            Some(psk) => Some(v::derive_key(psk, cfg.message_id, cfg.from_node_num)?),
+            None => None,
+        };
         let core_cfg = v::BuildConfig {
             message_id: cfg.message_id,
             stream_seq: cfg.stream_seq,

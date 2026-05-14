@@ -9,7 +9,7 @@ lives in [`crates/voicetastic-core/src/voice/`](crates/voicetastic-core/src/voic
 For an implementer-friendly companion (byte walkthroughs, diagrams,
 sender/receiver recipes), see the [voice protocol wiki](docs/wiki/Home.md).
 
-**Protocol version: 1**
+**Protocol version: 2 (wire byte `0x02`)**
 
 ---
 
@@ -509,7 +509,7 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
 A receiver MUST reject (silently drop) a frame when **any** of the
 following hold:
 
-- `version != 1`
+- `version != 0x02` (protocol version 2)
 - `packet_type == 3` (reserved)
 - `total_data == 0`
 - `chunk_index >= total_data` for `DATA` frames
@@ -611,7 +611,7 @@ pub const MAX_IN_PROGRESS_GLOBAL: usize = 64;
 pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
 pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 pub const BLACKLIST_MAX: usize = 100;
-pub const NACK_MAX_ROUNDS: u8 = 32;
+pub const NACK_MAX_ROUNDS: u16 = 400;
 pub const NACK_WINDOW_MS: u64 = 1500;
 pub const GCM_NONCE_LEN: usize = 12;
 pub const GCM_TAG_LEN: usize = 16;

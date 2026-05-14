@@ -344,6 +344,12 @@ impl EncState {
                         let n = n as usize;
                         if n == *bytes_per_frame {
                             payload.extend_from_slice(&serial[..n]);
+                        } else {
+                            tracing::warn!(
+                                n,
+                                expected = *bytes_per_frame,
+                                "AMR-NB final frame size mismatch; dropping frame",
+                            );
                         }
                     }
                 }

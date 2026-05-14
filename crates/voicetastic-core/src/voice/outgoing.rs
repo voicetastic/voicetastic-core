@@ -45,10 +45,12 @@ use parking_lot::Mutex;
 
 use super::builder::EncodedMessage;
 
-/// Default retain TTL when the app hasn't applied settings yet. Matches
-/// the assembler's `message_timeout` default so a NACK never arrives
-/// for an entry we've already forgotten.
-pub const DEFAULT_RETAIN_TTL: Duration = Duration::from_secs(600);
+/// Default retain TTL when the app hasn't applied settings yet. Must
+/// cover the full sender lifetime: `max_burst_duration + linger`.
+/// On LongFast (155 chunks × 900 ms ≈ 140 s) with the default linger of
+/// 600 s the total is 740 s. LongSlow at 155 chunks × 1800 ms ≈ 279 s
+/// plus 600 s linger gives 879 s. 1200 s comfortably exceeds both.
+pub const DEFAULT_RETAIN_TTL: Duration = Duration::from_secs(1200);
 /// Maximum number of NACK rounds we'll honour per outgoing message.
 /// Sized to cover the receiver's worst-case `NACK_MAX_ROUNDS` budget at
 /// the top of the configurable reassembly-timeout range

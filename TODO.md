@@ -72,10 +72,10 @@ Ordered roughly by user impact / payoff.
   (`request_id` ↔ `ack`). `tracing-subscriber` is already a dep; just needs
   `#[instrument]` on service methods.
 
-- [ ] **CI pipeline**
-  No `.github/workflows` or `.gitlab-ci.yml` today. Linux-only matrix that
-  runs `fmt --check`, `clippy -D warnings`, `test --workspace`, and a
-  release build. Catches submodule-init regressions and toolchain breaks.
+- [x] **CI pipeline**
+  Both GitLab CI (`.gitlab-ci.yml`) and GitHub Actions (`.github/workflows/ci.yml`) are
+  set up. Linux matrix that runs `fmt --check`, `clippy -D warnings`, `test --workspace`,
+  and a release build. Catches submodule-init regressions and toolchain breaks.
 
 - [ ] **Fuzz inbound decode path**
   `cargo-fuzz` target on `FromRadio::decode` + `MeshService::handle_from_radio`.

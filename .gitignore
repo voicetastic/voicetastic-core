@@ -5,6 +5,7 @@ Cargo.lock.bak
 .idea/
 *.swp
 .DS_Store
-.github/
 .cargo/
 target-android/
+.github/copilot-instructions.md
+.github/hooks/

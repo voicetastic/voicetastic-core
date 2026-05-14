@@ -286,7 +286,6 @@ pub fn spawn_watchers(
         let c = ctx.clone();
         let assembler = Arc::clone(&assembler);
         let svc = svc.clone();
-        let current_pacing = Arc::clone(&current_pacing);
         rt.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -312,30 +311,28 @@ pub fn spawn_watchers(
                                 round = nack.round,
                                 "voice: emitting NACK"
                             );
-                            // Route the NACK through the voice TX queue
-                            // (rather than `send_data` directly) so it
-                            // shares the firmware-driven backpressure +
-                            // pacing the data frames already use. A long
-                            // run of missed chunks otherwise produces a
-                            // NACK barrage that overflows the radio's
-                            // outbound queue just as badly as the data
-                            // burst itself.
+                            // Send the NACK via `send_data` directly (not
+                            // through the voice TX queue) so it bypasses
+                            // any queue congestion from an ongoing
+                            // outbound voice burst. With a NACK window
+                            // of several seconds the emission rate is
+                            // < 1 NACK/s — far too low to overwhelm the
+                            // firmware's TX queue.
                             let svc_nack = svc.clone();
                             let channel = nack.channel;
                             let frame = nack.frame;
-                            let pacing = *current_pacing.lock();
                             tokio::spawn(async move {
                                 if let Err(e) = svc_nack
-                                    .enqueue_voice_frame(
+                                    .send_data(
+                                        PRIVATE_APP as i32,
                                         frame,
                                         channel,
                                         Some(to_node),
                                         false,
-                                        pacing,
                                     )
                                     .await
                                 {
-                                    tracing::warn!(?e, "failed to enqueue voice NACK");
+                                    tracing::warn!(?e, "failed to send voice NACK");
                                 }
                             });
                         }
@@ -551,22 +548,4 @@ fn upsert_inbound_voice_progress(
     }
     drop(st);
     c.request_repaint();
-}
-
-/// Best-effort 20 ms-frame estimate for an Opus stream produced by
-/// `audio::Recorder` (length-prefixed packets, one packet per 20 ms).
-#[allow(dead_code)]
-fn estimate_opus_duration_ms(stream: &[u8]) -> u32 {
-    let mut i = 0;
-    let mut packets: u32 = 0;
-    while i + 2 <= stream.len() {
-        let len = u16::from_be_bytes([stream[i], stream[i + 1]]) as usize;
-        i += 2;
-        if i + len > stream.len() {
-            break;
-        }
-        i += len;
-        packets += 1;
-    }
-    packets * 20
 }

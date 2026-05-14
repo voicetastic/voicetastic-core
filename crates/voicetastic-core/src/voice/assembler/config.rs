@@ -50,11 +50,12 @@ pub struct AssemblerConfig {
 impl Default for AssemblerConfig {
     fn default() -> Self {
         Self {
-            // 10 minutes: voice messages may stretch over many seconds on
-            // slow modem presets and tolerate long quiet gaps while NACK
-            // rounds chase missing chunks. The previous 30 s default was
-            // too aggressive for real LoRa links.
-            message_timeout: Duration::from_secs(600),
+            // 15 minutes: on lossy LongFast the effective throughput can
+            // drop to ~1 frame every 3 s (CSMA + firmware queue drain),
+            // so a burst of 250 frames (data + max parity) takes ~750 s
+            // on the wire. The previous 600 s expired mid-burst on links
+            // with >40 % loss.
+            message_timeout: Duration::from_secs(900),
             partial_play_on_timeout: true,
             channel_psk: None,
             // Allow many NACK rounds: with a 1.5 s window that's ~3 min of
@@ -93,10 +94,10 @@ mod tests {
 
     #[test]
     fn sync_nack_cap_default() {
-        // Default 600 s timeout / 1500 ms window = 400 rounds.
+        // Default 900 s timeout / 1500 ms window = 600 rounds.
         let mut cfg = AssemblerConfig::default();
         cfg.sync_nack_cap_to_timeout();
-        assert_eq!(cfg.max_nack_rounds, 400);
+        assert_eq!(cfg.max_nack_rounds, 600);
     }
 
     #[test]

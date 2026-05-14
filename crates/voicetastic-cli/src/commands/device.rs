@@ -46,10 +46,10 @@ pub async fn info(device: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn reboot(device: &str, secs: i32) -> Result<()> {
+pub async fn reboot(device: &str, secs: u32) -> Result<()> {
     let svc = MeshService::new().await?;
     connect(&svc, device).await?;
-    let id = svc.reboot(secs).await?;
+    let id = svc.reboot(secs as i32).await?;
     println!("reboot scheduled in {secs}s (admin id={id})");
     let _ = svc.disconnect().await;
     Ok(())

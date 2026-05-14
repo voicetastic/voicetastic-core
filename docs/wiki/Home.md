@@ -8,7 +8,7 @@ The normative wire-format spec lives in
 implementer-friendly companion: it explains the *why*, walks through frames
 byte-by-byte, and provides recipes for senders and receivers.
 
-> **Protocol version: 1** • **Reference impl:**
+> **Protocol version: 2 (wire byte `0x02`)** • **Reference impl:**
 > [`crates/voicetastic-core/src/voice/`](../../crates/voicetastic-core/src/voice/)
 
 ---

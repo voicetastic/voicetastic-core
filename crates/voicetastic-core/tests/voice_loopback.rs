@@ -163,7 +163,7 @@ fn loopback_nack_retransmit_completes_message() {
 fn loopback_encrypted_message_roundtrip() {
     let psk = b"unit-test-channel-psk";
     let audio = synth(64 * 4);
-    let key = derive_key(psk, 0xCAFE_BABE, FROM_NODE);
+    let key = derive_key(psk, 0xCAFE_BABE, FROM_NODE).unwrap();
     let enc = build_message(&audio, &cfg(64, 0, Some(key))).unwrap();
     let asm = VoiceAssembler::new(AssemblerConfig {
         channel_psk: Some(psk.to_vec()),

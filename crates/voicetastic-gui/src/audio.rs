@@ -238,8 +238,6 @@ mod imp {
             codec_param: u8,
             opus_bw: OpusBandwidth,
         ) -> Result<Self, AudioError> {
-            let _ = Encoder::new(codec_id, codec_param, opus_bw)?;
-
             let max = Duration::from_secs(max_secs.max(1) as u64);
             let stop = Arc::new(AtomicBool::new(false));
             let stop_thread = Arc::clone(&stop);
@@ -325,6 +323,9 @@ mod imp {
                             for frame in out.chunks_mut(channels) {
                                 let idx = cur.fetch_add(1, Ordering::Relaxed);
                                 let s = pcm.get(idx).copied().unwrap_or(0.0);
+                                // Use the private `from_sample_` which is the
+                                // only API available in the `dasp_sample` re-export
+                                // that cpal 0.16 re-exports as `cpal::FromSample`.
                                 let v: $T = <$T as cpal::FromSample<f32>>::from_sample_(s);
                                 for ch in frame {
                                     *ch = v;

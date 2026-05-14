@@ -24,7 +24,7 @@
 | **MTU**                    | Maximum Transmission Unit. Meshtastic LoRa MTU = 231 bytes (= `MAX_PACKET_SIZE`).                                                                 |
 | **NACK frame**             | Negative ACK with bitmap of missing DATA chunk indices. See [Frame Format](Frame-Format.md#nack-frames).                                          |
 | **`nack_window_ms`**       | Quiet period (default 1500 ms) after the last seen chunk before the receiver issues a NACK round.                                                  |
-| **`nack_rounds`**          | Per-message counter of consecutive NACK rounds without progress; reset whenever a new shard lands, capped at `NACK_MAX_ROUNDS = 32`.            |
+| **`nack_rounds`**          | Per-message counter of consecutive NACK rounds without progress; reset whenever a new shard lands, capped at `NACK_MAX_ROUNDS = 400`.            |
 | **PARITY frame**           | A frame whose body is a Reed-Solomon parity shard. Always `chunk_size` bytes.                                                                     |
 | **`packet_type`**          | Top 2 bits of `type_flags`: 0 = DATA, 1 = PARITY, 2 = NACK, 3 reserved.                                                                           |
 | **`parity_count`**         | Number of FEC parity shards in a message. 0 disables FEC; max 128.                                                                                |

@@ -564,24 +564,23 @@ impl Connection {
     pub async fn disconnect(&self) -> Result<()> {
         let _ = self.shutdown.send(true);
         // Best-effort unsubscribe; ignore errors (already gone, etc.).
-        let _ = self
-            .peripheral
-            .unsubscribe(&self.from_radio_notify_char())
-            .await;
+        if let Some(ch) = self.get_fromnum_char() {
+            let _ = self.peripheral.unsubscribe(&ch).await;
+        } else {
+            tracing::warn!("FROMNUM not found in GATT DB; cannot unsubscribe");
+        }
         Ok(())
     }
 
     /// FROMNUM characteristic handle, looked up on demand so we don't have
     /// to store it on the struct just for unsubscribe.
-    #[allow(clippy::wrong_self_convention)]
-    fn from_radio_notify_char(&self) -> btleplug::api::Characteristic {
+    fn get_fromnum_char(&self) -> Option<btleplug::api::Characteristic> {
         // Cheap: peripheral.characteristics() returns from the cached GATT
         // DB populated during open().
         self.peripheral
             .characteristics()
             .into_iter()
             .find(|c| c.uuid == FROMNUM_UUID)
-            .unwrap_or_else(|| self.from_radio.clone())
     }
 }
 

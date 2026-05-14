@@ -38,12 +38,19 @@ pub(crate) const MAC_KEYED_FLAG: u8 = 0x08;
 /// SHA-256 truncated. The caller is responsible for setting the
 /// [`MAC_KEYED_FLAG`] bit in the flags byte before computing — flipping
 /// it after the fact would invalidate the tag.
+///
+/// # Panics
+/// HMAC init with an empty key will panic (HMAC-SHA256 requires at least
+/// 1 byte). Callers MUST ensure `key` is `None` or `Some(&[u8])` with
+/// non-zero length.
 pub(crate) fn compute_tag(header_no_mac: &[u8], key: Option<&[u8]>) -> [u8; HEADER_MAC_LEN] {
     let mut out = [0u8; HEADER_MAC_LEN];
     match key {
         Some(k) => {
+            // SAFETY: HMAC-SHA256 accepts any key length >= 1 byte. The
+            // channel PSK is always at least 1 byte or `None`.
             let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(k)
-                .expect("HMAC-SHA256 accepts any key length");
+                .expect("HMAC-SHA256 accepts any non-empty key");
             mac.update(header_no_mac);
             out.copy_from_slice(&mac.finalize().into_bytes()[..HEADER_MAC_LEN]);
         }
