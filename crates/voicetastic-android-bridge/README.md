@@ -2,6 +2,31 @@
 UniFFI scenario that exposes [`voicetastic-core`](../voicetastic-core)'s
 voice protocol (`build_message`, `VoiceAssembler`, `build_nack`,
 `random_message_id`, `detect_version`) to Kotlin/Android.
+
+## Architecture: codec responsibility
+
+Audio **encode/decode is handled by Android** (`android.media.MediaCodec`), not
+by Rust. The bridge only passes codec info as opaque identifying metadata:
+
+```
+Android mic → MediaCodec (opus/amr-nb) → encoded bytes
+  → build_message(audio=bytes, BuildConfig { codec, codec_param, … })
+  → wire frames → mesh
+```
+
+The voice protocol engine (`voicetastic-core::voice`) is **codec-free**: it
+never touches PCM samples. This keeps the bridge narrow (no PCM marshalling
+across FFI), avoids cross-compiling C codec libraries for Android NDK, and
+lets Android use its **HW-accelerated** media codecs for better power and
+CPU efficiency.
+
+Supported codecs on Android:
+| Codec  | MediaCodec support | Notes                              |
+|--------|--------------------|------------------------------------|
+| AMR-NB | Encode + decode    | Required codec, available API 1+   |
+| Opus   | Decode API 21+, encode API 29+ | Full support on API 29+ |
+| Codec2 | ❌ Not supported    | Niche amateur-radio codec, no platform decoder |
+
 ## Scope
 Two surfaces:
 

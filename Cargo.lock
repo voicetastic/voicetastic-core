@@ -4281,10 +4281,12 @@ dependencies = [
  "async-trait",
  "btleplug",
  "chrono",
+ "codec2",
  "futures",
  "getrandom 0.4.2",
  "hkdf",
  "hmac",
+ "opus",
  "parking_lot 0.12.5",
  "prost",
  "prost-build",
@@ -4304,11 +4306,9 @@ dependencies = [
 name = "voicetastic-gui"
 version = "0.0.0-git"
 dependencies = [
- "codec2",
  "cpal",
  "eframe",
  "egui",
- "opus",
  "parking_lot 0.12.5",
  "thiserror 2.0.18",
  "tokio",

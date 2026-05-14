@@ -1,5 +1,3 @@
-#![deny(unsafe_code)]
-
 //! Shared core for the Voicetastic desktop client.
 //!
 //! Wire-compatible with the upstream Android app: same Meshtastic GATT UUIDs,
@@ -26,6 +24,8 @@ pub mod proto;
 pub mod settings;
 pub mod transport;
 pub mod voice;
+
+pub mod codec;
 
 #[cfg(feature = "ble-btleplug")]
 pub mod ble;

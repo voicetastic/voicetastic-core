@@ -1,0 +1,218 @@
+//! Codec encode/decode for Opus, Codec2, and AMR-NB.
+//!
+//! The actual codec implementations are gated behind the `codecs` Cargo feature
+//! (`opus` and `codec2` crates, plus raw FFI to `libopencore-amrnb`). Without
+//! the feature, the public API surface (constants, [`OpusBandwidth`],
+//! [`RecordedClip`], [`payload_duration_ms`], [`is_available`]) is still
+//! available; calling [`Encoder::new`] or [`decode`] returns
+//! [`CodecError::FeatureDisabled`].
+//!
+//! # Wire formats
+//!
+//! Per-codec serialisation of [`RecordedClip::payload`]:
+//!
+//! - **Opus** (`VoiceCodec::Opus`, `codec_param = bitrate_kbps`): a sequence
+//!   of length-prefixed packets:
+//!
+//!   ```text
+//!   [u16 BE length][opus packet bytes] [u16 BE length][opus packet bytes] ...
+//!   ```
+//!
+//!   Each packet covers 20 ms of mono audio at 48 kHz, encoded with
+//!   `Application::Voip`.
+//!
+//! - **Codec2** (`VoiceCodec::Codec2`, `codec_param = mode in 0..=5`):
+//!   raw concatenated packed frames of the mode's fixed size
+//!   (`bits_per_frame / 8`, rounded up). 8 kHz mono internally.
+//!
+//! - **AMR-NB** (`VoiceCodec::AmrNb`, `codec_param = mode in 0..=7`):
+//!   concatenated IF1 storage-format frames. Each frame is a 1-byte
+//!   ToC header (encoding the mode in bits 3..6) followed by the
+//!   mode-specific number of speech bytes, for totals (incl. ToC) of
+//!   13/14/16/18/20/21/27/32 bytes per 20 ms frame. 8 kHz mono internally.
+//!   The actual encode/decode work goes through `libopencore-amrnb` over
+//!   raw FFI.
+
+mod error;
+mod resampler;
+
+pub use error::CodecError;
+pub use resampler::Resampler;
+
+use crate::voice::VoiceCodec;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Sample rate used for both capture and playback for the Opus path, and
+/// the rate the playback pipeline expects after [`decode`].
+#[allow(dead_code)]
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+/// Mono frame size (samples) corresponding to a 20 ms Opus packet at 48 kHz.
+#[allow(dead_code)]
+pub const FRAME_SAMPLES: usize = 960;
+/// Sample rate Codec2 operates on (all modes).
+#[allow(dead_code)]
+pub const CODEC2_SAMPLE_RATE_HZ: u32 = 8_000;
+/// Sample rate AMR-NB operates on (all modes).
+#[allow(dead_code)]
+pub const AMRNB_SAMPLE_RATE_HZ: u32 = 8_000;
+/// Samples per AMR-NB frame (20 ms @ 8 kHz mono).
+#[allow(dead_code)]
+pub const AMRNB_SAMPLES_PER_FRAME: usize = 160;
+/// Default Opus bitrate, in bps. Used as fallback when `codec_param == 0`.
+#[allow(dead_code)]
+pub const OPUS_BITRATE: i32 = 12_000;
+
+// ---------------------------------------------------------------------------
+// OpusBandwidth
+// ---------------------------------------------------------------------------
+
+/// Sender-side Opus bandwidth selector. Receivers don't need this — the Opus
+/// bitstream self-describes per packet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpusBandwidth {
+    /// SILK 8 kHz — telephony-grade voice, lowest airtime.
+    Narrow,
+    /// SILK 16 kHz — HD voice, default.
+    #[default]
+    Wide,
+}
+
+// ---------------------------------------------------------------------------
+// RecordedClip
+// ---------------------------------------------------------------------------
+
+/// A finished recording, ready to feed to the voice protocol.
+#[derive(Debug, Clone)]
+pub struct RecordedClip {
+    /// Encoded codec payload — see module docs for per-codec layout.
+    pub payload: Vec<u8>,
+    /// Codec identifier matching `voice::VoiceCodec`.
+    pub codec: VoiceCodec,
+    /// Codec-specific parameter byte (e.g. Codec2 mode index).
+    pub codec_param: u8,
+    /// Wall-clock duration of the original audio.
+    pub duration: std::time::Duration,
+}
+
+// ---------------------------------------------------------------------------
+// Feature check
+// ---------------------------------------------------------------------------
+
+/// `true` when the library was built with `--features codecs`.
+pub const fn is_available() -> bool {
+    cfg!(feature = "codecs")
+}
+
+// ---------------------------------------------------------------------------
+// payload_duration_ms
+// ---------------------------------------------------------------------------
+
+/// Codec2 samples per encoded frame for each mode index `0..=5`.
+const CODEC2_SAMPLES_PER_FRAME: [usize; 6] = [160, 160, 320, 320, 320, 320];
+/// Packed bytes per Codec2 frame for each mode index `0..=5`.
+const CODEC2_BYTES_PER_FRAME: [usize; 6] = [8, 6, 8, 7, 7, 6];
+
+fn codec2_frame_sizes(mode: u8) -> Option<(usize, usize)> {
+    let i = mode as usize;
+    if i < CODEC2_SAMPLES_PER_FRAME.len() {
+        Some((CODEC2_SAMPLES_PER_FRAME[i], CODEC2_BYTES_PER_FRAME[i]))
+    } else {
+        None
+    }
+}
+
+/// Total bytes (ToC + speech) per AMR-NB frame for each mode index `0..=7`.
+const AMRNB_BYTES_PER_FRAME_LOOKUP: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
+
+/// Best-effort estimate of the wall-clock duration of an encoded payload,
+/// in milliseconds. Returns 0 for unknown codec parameters.
+pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -> u32 {
+    match codec {
+        VoiceCodec::Opus => {
+            let mut i = 0;
+            let mut packets: u32 = 0;
+            while i + 2 <= payload.len() {
+                let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
+                i += 2;
+                if i + len > payload.len() {
+                    break;
+                }
+                i += len;
+                packets += 1;
+            }
+            packets * 20
+        }
+        VoiceCodec::Codec2 => {
+            let Some((samples, bytes)) = codec2_frame_sizes(codec_param) else {
+                return 0;
+            };
+            let frames = (payload.len() / bytes) as u32;
+            frames * (samples as u32) / 8
+        }
+        VoiceCodec::AmrNb => {
+            let mut i = 0;
+            let mut frames: u32 = 0;
+            while i < payload.len() {
+                let mode = ((payload[i] >> 3) & 0x0F) as usize;
+                let Some(&size) = AMRNB_BYTES_PER_FRAME_LOOKUP.get(mode) else {
+                    break;
+                };
+                if i + size > payload.len() {
+                    break;
+                }
+                i += size;
+                frames += 1;
+            }
+            frames * 20
+        }
+        _ => 0,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Feature-gated implementation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "codecs")]
+mod imp;
+#[cfg(feature = "codecs")]
+pub use imp::{Encoder, decode};
+
+#[cfg(not(feature = "codecs"))]
+mod disabled {
+    use super::*;
+
+    pub struct Encoder;
+
+    impl Encoder {
+        pub fn new(
+            _codec_id: VoiceCodec,
+            _codec_param: u8,
+            _opus_bw: OpusBandwidth,
+        ) -> Result<Self, CodecError> {
+            Err(CodecError::FeatureDisabled)
+        }
+
+        pub fn push(&mut self, _src: &[f32]) -> Result<(), CodecError> {
+            Err(CodecError::FeatureDisabled)
+        }
+
+        pub fn finish(self) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError::FeatureDisabled)
+        }
+    }
+
+    pub fn decode(
+        _payload: &[u8],
+        _codec_id: VoiceCodec,
+        _codec_param: u8,
+    ) -> Result<Vec<i16>, CodecError> {
+        Err(CodecError::FeatureDisabled)
+    }
+}
+#[cfg(not(feature = "codecs"))]
+pub use disabled::{Encoder, decode};

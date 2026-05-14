@@ -1,6 +1,6 @@
 # Voicetastic Desktop
 
-Linux desktop companion for [Voicetastic](https://github.com/nicogig/Voicetastic) (Android).
+Linux desktop companion for [Voicetastic](https://git.cha-sam.re/acarteron/voicetastic) (Android).
 Communicates with Meshtastic radios over BLE or USB serial, providing text
 messaging and live voice message exchange (AMR-NB / Codec2 / Opus) — wire-compatible
 with the Android app for AMR-NB.

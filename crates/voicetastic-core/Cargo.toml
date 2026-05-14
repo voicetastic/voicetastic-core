@@ -31,6 +31,10 @@ btleplug = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 tokio-serial = { workspace = true, optional = true }
 
+# Optional codec support
+opus = { workspace = true, optional = true }
+codec2 = { workspace = true, optional = true }
+
 # Linux-only DBus client for the in-process BlueZ pairing agent. Always
 # compiled on Linux (no opt-in needed); the `pairing` module is also gated
 # on `feature = "ble-btleplug"` so a serial-only Linux build does not pull
@@ -46,6 +50,9 @@ default = ["ble-btleplug", "serial-tokio"]
 ble-btleplug = ["dep:btleplug", "dep:uuid"]
 # USB-serial transport via `tokio-serial` (Unix termios / Win32 COM ports).
 serial-tokio = ["dep:tokio-serial"]
+# Codec encode/decode for Opus, Codec2, and AMR-NB. Enabled by GUI's `audio`
+# feature; not enabled by default so headless/embedded consumers stay lean.
+codecs = ["dep:opus", "dep:codec2"]
 
 [build-dependencies]
 prost-build = { workspace = true }
