@@ -216,6 +216,16 @@ impl OutgoingVoiceRegistry {
         self.inner.lock().remove(&message_id);
     }
 
+    /// Prune entries that have exceeded the TTL. Called opportunistically
+    /// by background tasks to keep memory usage low without waiting for
+    /// the next `register()` call (which is the other GC trigger).
+    pub fn prune_expired(&self) {
+        let ttl = self.retain_ttl();
+        let now = Instant::now();
+        let mut map = self.inner.lock();
+        map.retain(|_, entry| now.duration_since(entry.registered_at) < ttl);
+    }
+
     /// Number of DATA chunks for a registered message, or `None` if
     /// the entry has been GC'd. Used by [`crate::voice::VoiceSender`]
     /// to bound the per-data-chunk `mark_chunk_sent` calls during the

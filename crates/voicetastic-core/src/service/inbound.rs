@@ -113,6 +113,14 @@ impl MeshService {
                 let _ = self.inner.metadata_tx.send(Some(meta));
             }
             from_radio::PayloadVariant::ConfigCompleteId(nonce) => {
+                let lora = self.inner.lora_tx.borrow().is_some();
+                let device = self.inner.device_tx.borrow().is_some();
+                if !lora || !device {
+                    warn!(
+                        nonce,
+                        lora, device, "config_complete received with incomplete config burst"
+                    );
+                }
                 info!(nonce, "config_complete");
                 self.set_state(ConnectionState::Ready);
                 let _ = self.inner.config_complete_tx.send(nonce);

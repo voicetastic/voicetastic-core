@@ -196,7 +196,7 @@ spec. Mitigations available to senders:
 | `NACK_WINDOW_MS`                   | 1500    | Fewer spurious NACKs on jittery links      |
 | `NACK_MAX_ROUNDS` (consecutive)    | 400     | Higher completion rate, longer worst-case  |
 | `MAX_RETRANSMITS_PER_MESSAGE`      | 2_400   | Sender-side counterpart to NACK budget     |
-| `AssemblerConfig::message_timeout` | 900 s   | Larger messages allowed, more state held   |
+| `AssemblerConfig::message_timeout` | 1200 s  | Larger messages allowed, more state held   |
 | `OutgoingVoiceRegistry::retain_ttl`| 600 s   | Sender remembers frames longer             |
 | `SendRequest::linger`              | 60 s    | Sender stays subscribed to NACKs longer    |
 | `partial_play_on_timeout`          | `true`  | Always emits something on timeout          |

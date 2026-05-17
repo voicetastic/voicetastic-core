@@ -19,7 +19,7 @@ pub mod data;
 
 pub use api::{
     OpusBandwidthKind, SettingDescriptor, SettingKey, SettingKind, SettingsApi, SettingsError,
-    SettingsListener, SettingsResult, VoiceCodecKind, opus_bandwidth_kind_from_id,
+    SettingsListener, SettingsResult, VoiceCodecKind, VoiceCodecParam, opus_bandwidth_kind_from_id,
     opus_bandwidth_kind_to_id, voice_codec_kind_from_id, voice_codec_kind_to_id,
 };
 pub use data::{

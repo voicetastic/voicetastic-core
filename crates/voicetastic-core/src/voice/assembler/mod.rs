@@ -84,9 +84,12 @@ impl VoiceAssembler {
     }
 
     /// Hot-replace the assembler config. New values take effect on the next
-    /// `tick` and on the next accepted frame.
-    pub fn set_config(&self, cfg: AssemblerConfig) {
+    /// `tick` and on the next accepted frame. Returns error if the config
+    /// violates invariants (e.g. `dead_sender_timeout >= message_timeout`).
+    pub fn set_config(&self, cfg: AssemblerConfig) -> std::result::Result<(), String> {
+        cfg.validate()?;
         *self.cfg.lock() = cfg;
+        Ok(())
     }
 
     /// Atomically mutate the assembler config in place.
@@ -95,10 +98,16 @@ impl VoiceAssembler {
     /// changing. Using `set_config` with `AssemblerConfig { foo: …,
     /// ..Default::default() }` from multiple call sites is racy — each
     /// site clobbers the other's contribution by resetting every field
-    /// it doesn't explicitly mention.
-    pub fn update_config<F: FnOnce(&mut AssemblerConfig)>(&self, f: F) {
+    /// it doesn't explicitly mention. Returns error if the resulting config
+    /// violates invariants.
+    pub fn update_config<F: FnOnce(&mut AssemblerConfig)>(
+        &self,
+        f: F,
+    ) -> std::result::Result<(), String> {
         let mut cfg = self.cfg.lock();
         f(&mut cfg);
+        cfg.validate()?;
+        Ok(())
     }
 
     /// Strict parse of a Meshtastic `"!aabbccdd"` id.
@@ -175,7 +184,8 @@ impl VoiceAssembler {
         }
 
         // Decrypt body if needed (uses original header bytes as AAD).
-        let plain_body = self.decrypt_if_needed(from, &header, bytes, body)?;
+        let plain_body =
+            self.decrypt_if_needed(from, &header, bytes, body, psk_snapshot.as_deref())?;
 
         // Establish or look up the per-message slot.
         let initial_chunk_size = derive_initial_chunk_size(&header, &plain_body)?;
@@ -215,6 +225,7 @@ impl VoiceAssembler {
         }
         state.encrypted_seen = state.encrypted_seen || header.encrypted;
         state.last_chunk_at = now;
+        state.last_data_at = now;
 
         let ingest_event = match header.packet_type {
             PacketType::Data => ingest_data(state, &header, plain_body)?,
@@ -273,21 +284,16 @@ impl VoiceAssembler {
         header: &ChunkHeader,
         bytes: &[u8],
         body: &[u8],
+        psk: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         if !header.encrypted {
             return Ok(body.to_vec());
         }
-        let psk = {
-            let cfg = self.cfg.lock();
-            cfg.channel_psk
-                .as_ref()
-                .ok_or(VoiceError::EncryptedNoPsk)?
-                .clone()
-        };
+        let psk = psk.ok_or(VoiceError::EncryptedNoPsk)?;
         // Spec §7: encrypted frames MUST carry a valid !hex8 `from`.
         let from_node = Self::parse_from_node_num(from)
             .ok_or_else(|| VoiceError::BadFromForEncrypted(from.to_string()))?;
-        let derived = derive_key(&psk, header.message_id, from_node)?;
+        let derived = derive_key(psk, header.message_id, from_node)?;
         decrypt_body(&derived, &bytes[..HEADER_SIZE], body)
     }
 
@@ -337,8 +343,21 @@ impl VoiceAssembler {
                 continue;
             }
 
+            // Dead-sender detection: if no real data (data/parity chunk)
+            // arrived for the configured window, the sender is truly gone.
+            // Suppress further NACKs and let the hard timeout finalize the
+            // message naturally.
+            if now.duration_since(state.last_data_at) >= cfg.dead_sender_timeout {
+                continue;
+            }
+
             // Quiet-period exceeded ⇒ emit a NACK round.
-            if elapsed_quiet >= nack_window
+            // Exponential backoff: each successive round doubles the
+            // effective quiet window so a dead sender doesn't trigger
+            // NACK storms (capped at 32× the base window).
+            let backoff = 1u32 << state.nack_rounds.min(5);
+            let effective_window = nack_window.saturating_mul(backoff);
+            if elapsed_quiet >= effective_window
                 && state.received_data < state.header_template.total_data
             {
                 let missing = state.missing_data_indices();
@@ -363,7 +382,15 @@ impl VoiceAssembler {
                     round: state.nack_rounds.saturating_add(1),
                 });
                 state.nack_rounds = state.nack_rounds.saturating_add(1);
-                state.last_chunk_at = now;
+                // Advance the quiet timer by the effective window so the
+                // next NACK must wait the full backoff-multiplied window.
+                // Without this, one long `elapsed_quiet` (~seconds after
+                // the burst ends) would trigger every NACK round in quick
+                // succession as the backoff cap is reached.
+                state.last_chunk_at = state
+                    .last_chunk_at
+                    .checked_add(effective_window)
+                    .unwrap_or(now);
             }
         }
 
@@ -670,11 +697,17 @@ mod tests {
         let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
 
         // Two consecutive NACK rounds with no progress.
-        for _ in 0..2 {
+        // Each round must set last_chunk_at far enough back to meet the
+        // exponential-backoff-multiplied effective window (2^round ×
+        // base window), otherwise the backoff check would suppress the
+        // NACK until the window is actually exceeded.
+        for round in 0..2 {
+            let backoff = 1u32 << round.min(5);
+            let ago = Duration::from_millis(NACK_WINDOW_MS * backoff as u64 + 100);
             {
                 let mut inner = asm.inner.lock();
                 for (_, st) in inner.in_progress.iter_mut() {
-                    st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS + 100);
+                    st.last_chunk_at = Instant::now() - ago;
                 }
             }
             let _ = asm.tick();

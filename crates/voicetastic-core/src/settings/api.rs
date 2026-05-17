@@ -27,6 +27,18 @@ use super::data::{
 };
 
 // ---------------------------------------------------------------------------
+// Codec parameter type
+// ---------------------------------------------------------------------------
+
+/// Voice codec paired with its numeric parameter. Ensures codec and param are
+/// always consistent (one lock acquisition, no mismatch risk).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceCodecParam {
+    pub codec: VoiceCodec,
+    pub param: u8,
+}
+
+// ---------------------------------------------------------------------------
 // Field key
 // ---------------------------------------------------------------------------
 
@@ -346,12 +358,21 @@ impl SettingsApi {
     }
 
     /// Convenience: resolve `voice.codec` + per-codec mode to the
-    /// `(VoiceCodec, codec_param)` pair the voice protocol layer wants.
-    pub fn voice_codec_for_protocol(&self) -> (VoiceCodec, u8) {
+    /// `VoiceCodecParam` the voice protocol layer wants.
+    pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
         match self.voice_codec() {
-            VoiceCodecKind::Opus => (VoiceCodec::Opus, self.voice_opus_bitrate_kbps()),
-            VoiceCodecKind::Codec2 => (VoiceCodec::Codec2, self.voice_codec2_mode()),
-            VoiceCodecKind::AmrNb => (VoiceCodec::AmrNb, self.voice_amrnb_mode()),
+            VoiceCodecKind::Opus => VoiceCodecParam {
+                codec: VoiceCodec::Opus,
+                param: self.voice_opus_bitrate_kbps(),
+            },
+            VoiceCodecKind::Codec2 => VoiceCodecParam {
+                codec: VoiceCodec::Codec2,
+                param: self.voice_codec2_mode(),
+            },
+            VoiceCodecKind::AmrNb => VoiceCodecParam {
+                codec: VoiceCodec::AmrNb,
+                param: self.voice_amrnb_mode(),
+            },
         }
     }
 

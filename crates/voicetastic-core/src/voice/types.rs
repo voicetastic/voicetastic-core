@@ -125,7 +125,11 @@ impl ModemPreset {
             Self::ShortTurbo | Self::ShortFast => MAX_BODY_SIZE, // 219
             Self::ShortSlow | Self::MediumFast => 160,
             Self::MediumSlow => 96,
-            Self::LongFast => 128,
+            // 199 = MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN, the
+            // largest body that fits in a single encrypted LoRa packet.
+            // Larger chunks → fewer frames → faster burst → more time
+            // for NACK recovery before message_timeout.
+            Self::LongFast => MAX_BODY_SIZE - 12 - 4,
             Self::LongModerate | Self::LongSlow | Self::VeryLongSlow => 48,
         }
     }

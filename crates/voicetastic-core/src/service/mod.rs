@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Maximum time we wait for the device to finish its config burst (i.e. for
 /// `ConnectionState` to leave `Configuring`). If the radio never sends
@@ -43,6 +43,13 @@ use crate::serial::SerialConnection;
 use crate::transport::Transport;
 
 pub use types::{ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_long_name};
+
+/// Configuration for serial port auto-reconnection.
+#[derive(Debug, Clone)]
+struct SerialReconnectConfig {
+    path: String,
+    baud: u32,
+}
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]
@@ -89,6 +96,17 @@ struct Inner {
     pub(super) channels_tx: watch::Sender<Vec<Channel>>,
     pub(super) owner_tx: watch::Sender<Option<User>>,
     pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
+    /// Configuration for serial port auto-reconnection. Set by
+    /// [`MeshService::connect_by_serial_baud`]; `None` = reconnect is not
+    /// configured (e.g. BLE connection). Used by the silence-probe task to
+    /// auto-reconnect when it detects a dead read path.
+    pub(super) reconnect_config: Mutex<Option<SerialReconnectConfig>>,
+    /// Notified when the silence probe triggers a reconnect. A dedicated
+    /// watcher task (spawned once in [`MeshService::new`]) consumes this
+    /// and calls [`MeshService::connect_by_serial_baud`] so the reconnect
+    /// doesn't create a `tokio::spawn` recursion through
+    /// [`connect_with_transport`].
+    pub(super) reconnect_request: Arc<Notify>,
 }
 
 impl MeshService {
@@ -119,6 +137,7 @@ impl MeshService {
         // wrap Inner in an Arc, then hand the worker a Weak<Inner> so
         // it can shut down cleanly when the last MeshService clone drops.
         let (voice_tx_send, voice_tx_recv) = tokio::sync::mpsc::channel(voice_tx::QUEUE_CAPACITY);
+        let reconnect_request = Arc::new(Notify::new());
         let inner = Arc::new(Inner {
             #[cfg(feature = "ble-btleplug")]
             ble: tokio::sync::OnceCell::new(),
@@ -154,7 +173,49 @@ impl MeshService {
             channels_tx,
             owner_tx,
             metadata_tx,
+            reconnect_config: Mutex::new(None),
+            reconnect_request: reconnect_request.clone(),
         });
+        // Auto-reconnect watcher: waits for a notification from
+        // [`try_reconnect_serial`] (fired after the silence probe gives up),
+        // then sleeps 5 s and opens a fresh serial connection. This lives in
+        // a dedicated top-level task rather than being called directly from
+        // the reader task inside [`connect_with_transport`], which would
+        // create a recursive async type chain that the compiler can't prove
+        // `Send` (the inner `tokio::spawn` in [`connect_with_transport`]
+        // would transitively reference itself through the reconnect path).
+        {
+            let weak = Arc::downgrade(&inner);
+            tokio::spawn(async move {
+                loop {
+                    reconnect_request.notified().await;
+                    let inner = match weak.upgrade() {
+                        Some(i) => i,
+                        None => return,
+                    };
+                    // Give the old transport's reader task time to fully
+                    // shut down (drain + close inbound mpsc channel) so we
+                    // don't race on the serial port.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let cfg = inner.reconnect_config.lock().await.clone();
+                    // Re-check after sleep: user may have manually
+                    // reconnected or disconnected while we waited.
+                    if inner.transport.lock().await.is_some() || cfg.is_none() {
+                        continue;
+                    }
+                    let Some(SerialReconnectConfig { path, baud }) = cfg else {
+                        continue;
+                    };
+                    let svc = MeshService { inner };
+                    #[cfg(feature = "serial-tokio")]
+                    if let Err(e) = svc.connect_by_serial_baud(&path, baud).await {
+                        warn!(?e, "auto-reconnect failed");
+                    }
+                    #[cfg(not(feature = "serial-tokio"))]
+                    let _ = (path, baud);
+                }
+            });
+        }
         voice_tx::spawn_worker(Arc::downgrade(&inner), voice_tx_recv);
         Ok(Self { inner })
     }
@@ -288,14 +349,64 @@ impl MeshService {
         let svc = self.clone();
         let mut inbound = inbound;
         tokio::spawn(async move {
-            while let Some(payload) = inbound.recv().await {
-                if let Err(e) = svc.handle_from_radio(&payload).await {
-                    warn!(?e, "from_radio handler failed");
+            // Probe the device every 60 s of complete silence to verify
+            // the read path is still alive. Without this, a serial port
+            // whose inbound endpoint stalls (USB buffer overflow, partial
+            // frame, …) would leave the read task parked in `read_byte`
+            // forever — the app could still write commands but would
+            // never see responses or received messages.
+            //
+            // `send_want_config()` can succeed even when the read path
+            // is dead (writes still go through), so we track how many
+            // probes have been sent without any inbound data arriving
+            // between them. After 2 consecutive silent probes (~180 s:
+            // 3 ticks × 60 s because the ≥ check is *before* incrementing)
+            // we assume the read path is gone and force a disconnect.
+            let mut probe_interval = tokio::time::interval(Duration::from_secs(60));
+            probe_interval.reset();
+            let mut silent_probes: u32 = 0;
+            loop {
+                tokio::select! {
+                    biased;
+                    payload = inbound.recv() => {
+                        let Some(payload) = payload else { break };
+                        silent_probes = 0;
+                        // Data arrived — reset the silence timer so
+                        // the next probe doesn't fire for another 60 s.
+                        probe_interval.reset();
+                        if let Err(e) = svc.handle_from_radio(&payload).await {
+                            warn!(?e, "from_radio handler failed");
+                        }
+                    }
+                    _ = probe_interval.tick() => {
+                        // No inbound data for 60 s — probe the device.
+                        if silent_probes >= 2 {
+                            warn!("inbound: no data for ~180 s despite probes, disconnecting");
+                            break;
+                        }
+                        silent_probes += 1;
+                        debug!(
+                            silent_probes,
+                            "inbound probe: no data, sending WantConfigId",
+                        );
+                        if let Err(e) = svc.send_want_config().await {
+                            warn!(?e, "inbound probe send failed, disconnecting");
+                            break;
+                        }
+                        // Probe sent successfully. If the device responds,
+                        // `inbound.recv()` will fire before the next tick
+                        // and reset silent_probes. If not, the next tick
+                        // will see silent_probes >= 2 and disconnect.
+                    }
                 }
             }
             svc.set_state(ConnectionState::Disconnected);
             let mut slot = svc.inner.transport.lock().await;
             *slot = None;
+            drop(slot);
+            // Auto-reconnect so the user doesn't have to manually
+            // reconnect after a USB CDC ACM endpoint stall.
+            svc.try_reconnect_serial().await;
         });
 
         if !settle_delay.is_zero() {
@@ -356,6 +467,12 @@ impl MeshService {
     #[cfg(feature = "serial-tokio")]
     pub async fn connect_by_serial_baud(&self, path: &str, baud: u32) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
+        // Remember the path so the silence-probe task can auto-reconnect
+        // when the read path stalls (USB CDC ACM endpoint stall, …).
+        *self.inner.reconnect_config.lock().await = Some(SerialReconnectConfig {
+            path: path.to_string(),
+            baud,
+        });
         let serial = Arc::new(SerialConnection::open(path, baud).await?);
         let inbound = serial.subscribe_inbound().await?;
         // Serial port is fully ready after `open` — no settle delay needed.
@@ -363,7 +480,20 @@ impl MeshService {
             .await
     }
 
+    /// Notify the watcher to auto-reconnect after the silence probe gives up.
+    /// No-op on non-serial transports (no reconnect_config).
+    async fn try_reconnect_serial(&self) {
+        if self.inner.reconnect_config.lock().await.is_none() {
+            return;
+        }
+        self.inner.reconnect_request.notify_one();
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
+        // Clear the reconnect config so the watcher doesn't auto-reconnect
+        // after a user-initiated disconnect. The silence-probe path also
+        // calls disconnect, but it calls try_reconnect_serial separately.
+        *self.inner.reconnect_config.lock().await = None;
         let transport = {
             let mut slot = self.inner.transport.lock().await;
             slot.take()

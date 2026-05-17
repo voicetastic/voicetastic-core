@@ -448,6 +448,7 @@ impl From<AssemblerConfig> for v::AssemblerConfig {
             // setting). `None` keeps the legacy behaviour: accept any
             // known codec, defer codec-mismatch errors to playback.
             supported_codecs: None,
+            dead_sender_timeout: v::consts::DEAD_SENDER_TIMEOUT,
         }
     }
 }
@@ -463,7 +464,7 @@ impl VoiceAssembler {
     }
 
     pub fn set_config(&self, cfg: AssemblerConfig) {
-        self.0.set_config(cfg.into());
+        let _ = self.0.set_config(cfg.into());
     }
 
     pub fn accept(

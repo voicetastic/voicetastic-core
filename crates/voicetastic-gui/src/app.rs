@@ -3,10 +3,11 @@ use std::sync::Arc;
 use eframe::egui;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
+use tracing::error;
 
 use voicetastic_core::service::{ConnectionState, MeshService};
 use voicetastic_core::settings::{SettingKey, SettingsApi, SettingsListener};
-use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceCodec, VoiceSender};
+use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceSender};
 
 use crate::state::{SharedState, Tab};
 use crate::ui;
@@ -123,9 +124,9 @@ impl VoicetasticApp {
         }
     }
 
-    /// Resolve the outgoing-codec settings to a `(VoiceCodec, codec_param)`
-    /// pair suitable for [`Recorder::start`] and the voice protocol header.
-    pub fn outgoing_voice_codec(&self) -> (VoiceCodec, u8) {
+    /// Resolve the outgoing-codec settings to a [`VoiceCodecParam`]
+    /// suitable for [`Recorder::start`] and the voice protocol header.
+    pub fn outgoing_voice_codec(&self) -> voicetastic_core::settings::VoiceCodecParam {
         self.settings.voice_codec_for_protocol()
     }
 }
@@ -150,12 +151,14 @@ impl SettingsListener for VoiceRuntimeListener {
         // here, because [`watchers::apply_lora_to_assembler`] writes the
         // preset-derived `nack_window` and would clobber it (and vice
         // versa). See `VoiceAssembler::update_config` rustdoc.
-        self.assembler.update_config(|cfg| {
+        if let Err(e) = self.assembler.update_config(|cfg| {
             cfg.message_timeout = timeout;
             // Keep the consecutive-silence budget aligned with the
             // new timeout so the round cap doesn't trip first.
             cfg.sync_nack_cap_to_timeout();
-        });
+        }) {
+            error!("Failed to update assembler config: {}", e);
+        }
         // Keep the sender-side retransmit registry's retention aligned
         // with the receiver's reassembly window so a NACK can never
         // arrive for a frame we've already forgotten.

@@ -39,6 +39,11 @@ pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
 pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 /// Recently-completed blacklist max entries.
 pub const BLACKLIST_MAX: usize = 100;
+/// If no real data (data/parity chunks) arrive within this window the
+/// sender is presumed dead and NACKs are suppressed until the message
+/// timeout fires.
+pub const DEAD_SENDER_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Maximum NACK rounds per message before the receiver gives up. Each
 /// round fires after [`NACK_WINDOW_MS`] of silence, so this also bounds
 /// how long a stalled message survives. Sized so the consecutive-silence

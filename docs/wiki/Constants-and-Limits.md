@@ -85,7 +85,7 @@ Adaptive per modem preset (`Config.LoRaConfig.modem_preset`):
 |---------------------------------------|-------------:|
 | Short-range (high SNR margin)         |          219 |
 | Medium-range                          |          160 |
-| Long-range (LongFast)                 |          128 |
+| Long-range (LongFast)                 |          199 |
 | Long-moderate (MediumSlow)           |           96 |
 | Very long-range (worst loss profile)  |           48 |
 

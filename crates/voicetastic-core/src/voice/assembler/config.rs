@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use super::super::consts::{BLACKLIST_TTL, NACK_MAX_ROUNDS, NACK_WINDOW_MS};
+use super::super::consts::{DEAD_SENDER_TIMEOUT, NACK_MAX_ROUNDS, NACK_WINDOW_MS};
 use super::super::types::VoiceCodec;
 
 /// After this many post-template validation failures (codec / total_data /
@@ -33,6 +33,11 @@ pub struct AssemblerConfig {
     /// by tens of seconds on slow presets) doesn't resurrect a phantom
     /// partial reassembly.
     pub completion_memory: Duration,
+    /// If no real data (data/parity chunk) arrives within this window
+    /// the sender is presumed dead and NACKs are suppressed until the
+    /// hard `message_timeout` fires. Prevents a long tail of sparse
+    /// cap-multiplied NACKs after the sender has dropped off the mesh.
+    pub dead_sender_timeout: Duration,
     /// Codecs the local stack can actually decode. Frames whose header
     /// advertises a codec outside this set are rejected with
     /// [`super::super::error::VoiceError::UnsupportedCodec`] before any
@@ -49,13 +54,14 @@ pub struct AssemblerConfig {
 
 impl Default for AssemblerConfig {
     fn default() -> Self {
+        // 15 minutes: at ~3 s/frame on LongFast with max chunk_size 199,
+        // even worst-case 250-frame bursts leave ~50 s margin. Raised to
+        // 1200 s (20 min) so a LongFast voice message that sits at the
+        // firmware queue full (bp_ms ≈ 2-3.6 s) can complete its initial
+        // burst and still service several NACK recovery rounds.
+        let message_timeout = Duration::from_secs(1200);
         Self {
-            // 15 minutes: on lossy LongFast the effective throughput can
-            // drop to ~1 frame every 3 s (CSMA + firmware queue drain),
-            // so a burst of 250 frames (data + max parity) takes ~750 s
-            // on the wire. The previous 600 s expired mid-burst on links
-            // with >40 % loss.
-            message_timeout: Duration::from_secs(900),
+            message_timeout,
             partial_play_on_timeout: true,
             channel_psk: None,
             // Allow many NACK rounds: with a 1.5 s window that's ~3 min of
@@ -63,7 +69,12 @@ impl Default for AssemblerConfig {
             // is the real ceiling.
             max_nack_rounds: NACK_MAX_ROUNDS,
             nack_window: Duration::from_millis(NACK_WINDOW_MS),
-            completion_memory: BLACKLIST_TTL,
+            dead_sender_timeout: DEAD_SENDER_TIMEOUT,
+            // completion_memory must be >= message_timeout so that late
+            // chunks from the sender's retain_ttl don't create a fresh
+            // assembly entry (and NACK storm) for an already-finalized
+            // message while the sender still has chunks in flight.
+            completion_memory: message_timeout,
             supported_codecs: None,
         }
     }
@@ -85,6 +96,32 @@ impl AssemblerConfig {
         let timeout_ms = self.message_timeout.as_millis() as u64;
         let derived = timeout_ms.div_ceil(window_ms).min(u64::from(u16::MAX)) as u16;
         self.max_nack_rounds = derived;
+        // completion_memory must outlive message_timeout so the blacklist
+        // stays armed until the sender's firmware queue fully drains (the
+        // sender's retain_ttl is tied to message_timeout). Without this, a
+        // late chunk arriving after the blacklist expires would resurrect
+        // the assembly slot and restart the NACK storm.
+        self.completion_memory = self.completion_memory.max(self.message_timeout);
+    }
+
+    /// Validate config invariants. Returns `Ok(())` if valid, else a descriptive error.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.message_timeout.is_zero() {
+            return Err("message_timeout must be > 0".to_string());
+        }
+        if self.dead_sender_timeout.is_zero() {
+            return Err("dead_sender_timeout must be > 0".to_string());
+        }
+        if self.dead_sender_timeout >= self.message_timeout {
+            return Err(format!(
+                "dead_sender_timeout ({:?}) must be < message_timeout ({:?})",
+                self.dead_sender_timeout, self.message_timeout
+            ));
+        }
+        if self.nack_window.is_zero() {
+            return Err("nack_window must be > 0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -94,10 +131,10 @@ mod tests {
 
     #[test]
     fn sync_nack_cap_default() {
-        // Default 900 s timeout / 1500 ms window = 600 rounds.
+        // Default 1200 s timeout / 1500 ms window = 800 rounds.
         let mut cfg = AssemblerConfig::default();
         cfg.sync_nack_cap_to_timeout();
-        assert_eq!(cfg.max_nack_rounds, 600);
+        assert_eq!(cfg.max_nack_rounds, 800);
     }
 
     #[test]

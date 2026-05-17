@@ -16,6 +16,9 @@ path = "src/main.rs"
 # default so the voice-message UI in the Chat tab works out of the box.
 # Disable with `--no-default-features` for builds where libopus / ALSA aren't
 # available (e.g. headless CI).
+#
+# Note: The "audio" feature depends on "voicetastic-core/codecs". Any changes
+# to the codec feature list in voicetastic-core should be reflected here.
 default = ["audio"]
 audio = ["dep:cpal", "voicetastic-core/codecs"]
 

@@ -4,6 +4,7 @@ use std::time::Duration;
 use eframe::egui;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
+use tracing::warn;
 
 use voicetastic_core::ids::{node_id_to_num, node_num_to_id};
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
@@ -440,10 +441,12 @@ fn apply_lora_to_assembler(
     // `completion_memory` set by `VoicetasticApp::apply_voice_settings`.
     // Resync the round cap so the new (often larger) `nack_window`
     // doesn't blow past the configured `message_timeout`.
-    assembler.update_config(|cfg| {
+    if let Err(e) = assembler.update_config(|cfg| {
         cfg.nack_window = nack_window;
         cfg.sync_nack_cap_to_timeout();
-    });
+    }) {
+        warn!("Failed to update assembler nack_window: {}", e);
+    }
 }
 
 fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceMessage) {

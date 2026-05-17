@@ -18,7 +18,7 @@ pub const VOICE_MAX_SECS_UPPER: u32 = 120;
 /// Default per-message reassembly timeout, in seconds. Matches the core
 /// `AssemblerConfig` default and is exposed in the GUI so users can extend
 /// it on slow modem presets where a single voice message may take minutes.
-pub const DEFAULT_REASSEMBLY_TIMEOUT_SECS: u32 = 900;
+pub const DEFAULT_REASSEMBLY_TIMEOUT_SECS: u32 = 1200;
 /// Lower bound for the configurable reassembly timeout (10 s).
 pub const REASSEMBLY_TIMEOUT_LOWER_SECS: u32 = 10;
 /// Upper bound for the configurable reassembly timeout (1 hour).

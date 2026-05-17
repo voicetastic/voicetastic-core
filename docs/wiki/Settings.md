@@ -70,8 +70,8 @@ the cap is reached.
 | | |
 |---|---|
 | **Kind** | integer |
-| **Range** | `30..=900` |
-| **Default** | `300` |
+| **Range** | `10..=3600` |
+| **Default** | `1200` |
 
 How long the receiver waits for missing chunks of an in-flight voice message
 before emitting a partial. Long values help on slow LoRa presets (where a

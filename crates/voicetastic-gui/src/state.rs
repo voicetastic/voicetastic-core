@@ -128,6 +128,36 @@ pub struct SharedState {
     pub pending_pairing: Option<PendingPairing>,
 }
 
+impl Clone for SharedState {
+    fn clone(&self) -> Self {
+        #[allow(clippy::needless_update)]
+        Self {
+            conn_state: self.conn_state,
+            my_info: self.my_info.clone(),
+            nodes: self.nodes.clone(),
+            chat_log: self.chat_log.clone(),
+            scan_results: self.scan_results.clone(),
+            scanning: self.scanning,
+            status_msg: self.status_msg.clone(),
+            lora: self.lora.clone(),
+            device: self.device.clone(),
+            position: self.position,
+            power: self.power,
+            network: self.network.clone(),
+            display: self.display,
+            bluetooth: self.bluetooth,
+            channels: self.channels.clone(),
+            owner: self.owner.clone(),
+            metadata: self.metadata.clone(),
+            dirty: self.dirty.clone(),
+            config_status: self.config_status.clone(),
+            fixed_pos_edit: self.fixed_pos_edit.clone(),
+            #[cfg(target_os = "linux")]
+            pending_pairing: None,
+        }
+    }
+}
+
 /// A pairing prompt routed from `org.bluez.Agent1` to the GUI modal.
 /// `reply` is consumed when the user clicks OK / Cancel; the dialog
 /// MUST always either send a reply or drop the slot (drop is treated

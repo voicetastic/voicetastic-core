@@ -20,6 +20,10 @@ use tokio::sync::{Mutex, mpsc, watch};
 use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, warn};
 
+use std::time::Duration;
+
+use tokio::time::sleep;
+
 use crate::error::{Error, Result};
 
 /// Magic bytes that begin every serial-framed packet.
@@ -29,6 +33,12 @@ const START2: u8 = 0xc3;
 const MAX_PAYLOAD: usize = 512;
 /// Default baud rate for Meshtastic USB-serial devices.
 pub const DEFAULT_BAUD: u32 = 115_200;
+
+/// If a serial write (header + payload + flush) takes longer than this,
+/// something is wrong with the device (crashed, USB disconnected, …).
+/// The timeout prevents hanging the writer mutex forever, which would
+/// stall all traffic (voice, text, NACKs) through the same port.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Heuristic: returns `true` if `device` looks like a serial port path
 /// rather than a BLE address. Linux paths begin with `/`, Windows ports
@@ -88,6 +98,11 @@ impl SerialConnection {
     }
 
     /// Write a `ToRadio` protobuf payload, wrapped in the 4-byte serial header.
+    ///
+    /// The underlying write + flush is bounded by [`WRITE_TIMEOUT`] so the
+    /// writer mutex cannot be held indefinitely when the device stops
+    /// draining its USB serial buffer (e.g. firmware crash or disconnect).
+    /// The caller sees [`Error::WriteTimeout`] and should retry or reconnect.
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_PAYLOAD {
             return Err(Error::Other(format!(
@@ -98,9 +113,16 @@ impl SerialConnection {
         let len = bytes.len() as u16;
         let header = [START1, START2, (len >> 8) as u8, (len & 0xFF) as u8];
         let mut w = self.writer.lock().await;
-        w.write_all(&header).await?;
-        w.write_all(bytes).await?;
-        w.flush().await?;
+        tokio::time::timeout(WRITE_TIMEOUT, async {
+            w.write_all(&header).await?;
+            w.write_all(bytes).await?;
+            w.flush().await
+        })
+        .await
+        .map_err(|_| {
+            debug!(len = bytes.len(), "serial write timed out");
+            Error::WriteTimeout
+        })??;
         debug!(len = bytes.len(), "serial write_to_radio");
         Ok(())
     }
@@ -122,20 +144,40 @@ impl SerialConnection {
 
         tokio::spawn(async move {
             let mut reader = reader;
+            let mut read_errors: u32 = 0;
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    result = read_frame(&mut reader) => {
+                    result = tokio::time::timeout(
+                        Duration::from_secs(60),
+                        read_frame(&mut reader),
+                    ) => {
                         match result {
-                            Ok(Some(payload)) => {
+                            Ok(Ok(Some(payload))) => {
+                                read_errors = 0;
                                 if tx.send(payload).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(None) => break, // EOF
-                            Err(e) => {
-                                warn!(?e, "serial read error");
-                                break;
+                            Ok(Ok(None)) => break, // EOF
+                            Ok(Err(e)) => {
+                                read_errors += 1;
+                                if read_errors >= 5 {
+                                    warn!(count = read_errors, ?e, "serial read: too many consecutive errors, giving up");
+                                    break;
+                                }
+                                warn!(count = read_errors, ?e, "serial read error, retrying");
+                                sleep(Duration::from_millis(250 * u64::from(read_errors.min(10)))).await;
+                            }
+                            Err(_elapsed) => {
+                                // No complete frame arrived within 60 s.
+                                // The firmware should never go this long
+                                // without sending *something* (QueueStatus,
+                                // NodeInfo, …). Re-arm the frame scanner
+                                // without counting toward the retry limit
+                                // so the read task keeps trying instead of
+                                // parking in `read_byte` forever.
+                                debug!("serial read frame: 60 s timeout, rescanning");
                             }
                         }
                     }
@@ -170,10 +212,23 @@ impl crate::Transport for SerialConnection {
     }
 }
 
+/// Maximum time we wait between bytes of a frame once START1 has been
+/// matched. The scanning phase (looking for START1) has no timeout and
+/// can wait forever; only the per-frame byte reads after START1 are
+/// bounded. This prevents a partial serial frame (e.g. a bare `0x94` in
+/// the firmware's debug console output) from stalling the reader task
+/// indefinitely.
+const FRAME_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Read one deframed protobuf payload from the serial stream.
 ///
 /// Scans for the `START1 START2` magic, reads the 2-byte big-endian length,
 /// then reads exactly that many bytes.  Returns `Ok(None)` on EOF.
+///
+/// The scanning phase (looking for START1) is unbounded — we can afford to
+/// wait forever for any byte. Once START1 is matched, subsequent byte reads
+/// are bounded by [`FRAME_BYTE_TIMEOUT`] so a partial or corrupted frame
+/// cannot hang the reader permanently.
 async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -187,8 +242,15 @@ where
         if b != START1 {
             continue; // debug console output — skip
         }
-        let b2 = match read_byte(reader).await {
-            Ok(b) => b,
+        // START1 matched — subsequent bytes must arrive within the timeout.
+        let b2 = match read_byte_timeout(reader, FRAME_BYTE_TIMEOUT).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                // Timeout waiting for START2 — the 0x94 was probably a
+                // stray debug byte. Resume scanning for a real frame.
+                debug!("serial: timeout waiting for START2 after START1, rescanning");
+                continue;
+            }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e),
         };
@@ -196,19 +258,43 @@ where
             continue; // false positive on START1
         }
         // Read length (big-endian u16)
-        let msb = read_byte(reader).await?;
-        let lsb = read_byte(reader).await?;
+        let msb = match read_byte_timeout(reader, FRAME_BYTE_TIMEOUT).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                debug!("serial: timeout reading length MSB after START2, rescanning");
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let lsb = match read_byte_timeout(reader, FRAME_BYTE_TIMEOUT).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                debug!("serial: timeout reading length LSB, rescanning");
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e),
+        };
         let len = ((msb as usize) << 8) | (lsb as usize);
         if len == 0 || len > MAX_PAYLOAD {
             warn!(len, "serial: invalid payload length, re-syncing");
             continue;
         }
         let mut payload = vec![0u8; len];
-        reader.read_exact(&mut payload).await?;
-        return Ok(Some(payload));
+        match tokio::time::timeout(FRAME_BYTE_TIMEOUT, reader.read_exact(&mut payload)).await {
+            Ok(Ok(_n)) => return Ok(Some(payload)),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                debug!(len, "serial: timeout reading payload, rescanning");
+                continue;
+            }
+        }
     }
 }
 
+/// Read a single byte with no timeout (waits indefinitely).
 async fn read_byte<R>(reader: &mut R) -> std::io::Result<u8>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -216,6 +302,21 @@ where
     let mut buf = [0u8; 1];
     reader.read_exact(&mut buf).await?;
     Ok(buf[0])
+}
+
+/// Read a single byte, returning `Ok(None)` if no byte arrives within
+/// `timeout`. `Err` is propagated for non-timeout I/O errors including
+/// EOF (`UnexpectedEof`).
+async fn read_byte_timeout<R>(reader: &mut R, timeout: Duration) -> std::io::Result<Option<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = [0u8; 1];
+    match tokio::time::timeout(timeout, reader.read_exact(&mut buf)).await {
+        Ok(Ok(_n)) => Ok(Some(buf[0])),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -301,13 +402,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_payload_is_unexpected_eof() {
-        // Header advertises 10 bytes but only 3 follow.
+    async fn truncated_payload_is_eof() {
+        // Header advertises 10 bytes but only 3 follow → stream ended
+        // mid-frame, reported as `Ok(None)` (EOF).
         let mut data = vec![START1, START2, 0x00, 0x0a];
         data.extend_from_slice(b"abc");
         let mut buf: &[u8] = &data;
-        let err = read_frame(&mut buf).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(read_frame(&mut buf).await.unwrap().is_none());
     }
 
     #[tokio::test]

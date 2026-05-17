@@ -485,6 +485,8 @@ impl VoiceSender {
             let _ = status_tx.send(SendStatus::Complete { message_id });
             self.cleanup(message_id);
         }
+        // Prune expired outgoing entries to keep memory usage low.
+        self.registry.prune_expired();
     }
 
     /// Drop the per-message state on terminal status.

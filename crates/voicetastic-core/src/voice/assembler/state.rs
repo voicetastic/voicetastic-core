@@ -33,6 +33,9 @@ pub(super) struct AssemblyState {
     pub(super) received_parity: u8,
     pub(super) started_at: Instant,
     pub(super) last_chunk_at: Instant,
+    /// Last time a real data or parity chunk arrived (never advanced by
+    /// NACK emission). Drives dead-sender detection in `tick()`.
+    pub(super) last_data_at: Instant,
     pub(super) first_seen: chrono::DateTime<chrono::Utc>,
     /// Number of NACK rounds emitted *since the last accepted shard*. Reset
     /// to 0 in the ingest path whenever real forward progress lands.
@@ -75,6 +78,7 @@ impl AssemblyState {
             received_parity: 0,
             started_at: Instant::now(),
             last_chunk_at: Instant::now(),
+            last_data_at: Instant::now(),
             first_seen: chrono::Utc::now(),
             nack_rounds: 0,
             validation_strikes: 0,

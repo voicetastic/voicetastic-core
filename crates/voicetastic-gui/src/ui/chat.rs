@@ -442,7 +442,10 @@ fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> Vo
         if !enabled {
             resp.on_hover_text("Rebuild with `--features audio` to enable voice messages.");
         } else if resp.clicked() {
-            let (codec, codec_param) = app.outgoing_voice_codec();
+            let voicetastic_core::settings::VoiceCodecParam {
+                codec,
+                param: codec_param,
+            } = app.outgoing_voice_codec();
             let opus_bw = match app.settings.voice_opus_bandwidth() {
                 voicetastic_core::settings::OpusBandwidthKind::Narrow => {
                     audio::OpusBandwidth::Narrow
