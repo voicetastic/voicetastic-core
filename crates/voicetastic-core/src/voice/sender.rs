@@ -258,15 +258,6 @@ struct ActiveSend {
     /// per-sender because callers can in principle target multiple
     /// channels (each with its own PSK) from one [`VoiceSender`].
     mac_key: Option<Vec<u8>>,
-    /// Count of currently-executing retransmit tasks for this message.
-    /// Capped at 2 to prevent unbounded task spawning during NACK storms.
-    pending_retransmit_tasks: u8,
-    /// Missing chunk indices from the last NACK for thrashing detection.
-    /// If the same chunks are NACKed repeatedly, the receiver is stuck.
-    last_missing_set: Vec<u8>,
-    /// Count of consecutive NACKs requesting identical missing chunks.
-    /// If this reaches 3, we give up on the message as unrecoverable.
-    identical_nack_count: u8,
 }
 
 /// Shared outbound voice pipeline. One instance per [`MeshtasticService`].
@@ -382,9 +373,6 @@ impl VoiceSender {
                 channel: req.channel,
                 to: req.to,
                 mac_key: req.mac_key.clone(),
-                pending_retransmit_tasks: 0,
-                last_missing_set: Vec::new(),
-                identical_nack_count: 0,
             },
         );
 
@@ -606,73 +594,48 @@ async fn nack_listener_task(
             continue;
         }
 
-        // P1a: Give up if message is unrecoverable (excessive loss + multiple retransmits)
-        let loss_ratio = nack.missing.len() as f32 / nack.total_data as f32;
-        let missing_count = nack.missing.len();
-        let retransmit_count = sender
-            .registry
-            .retransmit_count(nack.message_id)
-            .unwrap_or(0);
-        // Give up if: high loss ratio AND many retransmits, OR excessive absolute loss
-        let should_give_up = (loss_ratio > 0.8 && retransmit_count >= 5) || missing_count > 50;
-        if should_give_up {
-            warn!(
-                message_id = nack.message_id,
-                missing_count,
-                loss_pct = (loss_ratio * 100.0) as u32,
-                retransmits = retransmit_count,
-                "message unrecoverable: excessive loss, giving up"
-            );
-            let _ = status_tx.send(SendStatus::GaveUp {
-                message_id: nack.message_id,
-            });
-            sender.cleanup(nack.message_id);
-            continue;
-        }
-
-        // P2: Detect if receiver is stuck (same chunks NACKed 20+ times).
-        // Threshold is conservative to allow recovery on very slow RF links where
-        // identical NACKs can occur for extended periods during long cooldowns.
-        // 20 rounds ≈ 30 seconds at 1.5s/round.
-        {
-            let mut map = sender.active.lock();
-            if let Some(entry) = map.get_mut(&nack.message_id) {
-                if entry.last_missing_set == nack.missing {
-                    entry.identical_nack_count += 1;
-                    if entry.identical_nack_count >= 20 {
-                        warn!(
-                            message_id = nack.message_id,
-                            missing_count = nack.missing.len(),
-                            identical_rounds = entry.identical_nack_count,
-                            "receiver stuck (10x identical NACKs), giving up"
-                        );
-                        drop(map);
-                        let _ = status_tx.send(SendStatus::GaveUp {
-                            message_id: nack.message_id,
-                        });
-                        sender.cleanup(nack.message_id);
-                        continue;
-                    }
-                } else {
-                    entry.last_missing_set = nack.missing.clone();
-                    entry.identical_nack_count = 1;
-                }
-            }
-        }
-
         let pacing = sender.current_pacing();
         let plan = match sender
             .registry
             .take_retransmit(nack.message_id, &nack.missing, pacing)
         {
             Ok(p) => p,
+            Err(RetransmitSkipReason::CooldownActive) => {
+                // Cooldown gates the request: stash the missing list and
+                // schedule a wake-up task to retry once the previous
+                // batch has cleared the radio. Without this, a NACK
+                // arriving early in a cooldown is silently dropped and
+                // the receiver has to wait an extra round-trip (often a
+                // full backoff window) before the same chunks get
+                // serviced.
+                let deferred = sender
+                    .registry
+                    .defer_nack(nack.message_id, nack.missing.clone());
+                debug!(
+                    message_id = nack.message_id,
+                    requested = nack.missing.len(),
+                    deferred = deferred.is_some(),
+                    "voice: retransmit deferred (cooldown active)"
+                );
+                if let Some(deadline) = deferred {
+                    spawn_deferred_retransmit(
+                        Arc::downgrade(&sender),
+                        nack.message_id,
+                        _channel,
+                        to,
+                        status_tx.clone(),
+                        deadline,
+                    );
+                }
+                continue;
+            }
             Err(reason) => {
                 // Log skip reason at appropriate level for diagnostics
                 let msg = match reason {
                     RetransmitSkipReason::TtlExpired => "message expired",
                     RetransmitSkipReason::BudgetExhausted => "max retransmits exceeded",
-                    RetransmitSkipReason::CooldownActive => "previous batch still in flight",
                     RetransmitSkipReason::AllChunksPending => "all chunks already pending",
+                    RetransmitSkipReason::CooldownActive => unreachable!("handled above"),
                 };
                 debug!(
                     message_id = nack.message_id,
@@ -692,22 +655,6 @@ async fn nack_listener_task(
                 "voice: no frames to retransmit (all pending)"
             );
             continue;
-        }
-
-        // P1b: Rate-limit concurrent retransmits to prevent task explosion
-        {
-            let mut map = sender.active.lock();
-            if let Some(entry) = map.get_mut(&nack.message_id) {
-                if entry.pending_retransmit_tasks >= 2 {
-                    debug!(
-                        message_id = nack.message_id,
-                        pending_tasks = entry.pending_retransmit_tasks,
-                        "retransmit already in-flight, skipping NACK round"
-                    );
-                    continue;
-                }
-                entry.pending_retransmit_tasks += 1;
-            }
         }
 
         let scheduled: Vec<u8> = plan.iter().map(|(idx, _)| *idx).collect();
@@ -733,8 +680,6 @@ async fn nack_listener_task(
         let registry = Arc::clone(&sender.registry);
         let message_id = nack.message_id;
         let channel = _channel;
-        let want_ack = to.is_some();
-        let weak_sender = weak.clone();
         tokio::spawn(async move {
             let _permit = match permits.acquire_owned().await {
                 Ok(p) => p,
@@ -743,36 +688,123 @@ async fn nack_listener_task(
                     return;
                 }
             };
-            for batch_idx in 0..plan.len() {
-                let (idx, frame) = &plan[batch_idx];
-                let r = svc
-                    .enqueue_voice_frame_with_id(frame.clone(), channel, to, want_ack, pacing)
-                    .await;
-                if let Err(e) = r {
-                    warn!(message_id, idx, ?e, "voice retransmit enqueue failed");
-                    // Mark the failed chunk as sent so it can be retried on the next NACK.
-                    // Without this, failed chunks stay stuck in `pending_chunks` forever.
-                    registry.mark_chunk_sent(message_id, *idx);
-                    // Also clear pending for the un-sent tail of this batch so
-                    // a subsequent NACK round can retry them.
-                    for (idx, _) in &plan[(batch_idx + 1)..] {
-                        registry.mark_chunk_sent(message_id, *idx);
-                    }
-                    break;
-                }
-                // P0: Only mark sent after successful enqueue (was bug: marked before check)
-                registry.mark_chunk_sent(message_id, *idx);
-            }
-            // Decrement pending retransmit task count when done
-            if let Some(sender) = weak_sender.upgrade() {
-                let mut map = sender.active.lock();
-                if let Some(entry) = map.get_mut(&message_id) {
-                    entry.pending_retransmit_tasks =
-                        entry.pending_retransmit_tasks.saturating_sub(1);
-                }
-            }
+            dispatch_retransmit_batch(&svc, &registry, plan, message_id, channel, to, pacing).await;
         });
     }
+}
+
+/// Push one retransmit batch through the paced TX worker, clearing
+/// `pending_chunks` per-frame so later NACK rounds can request any
+/// chunks the radio fails to enqueue.
+async fn dispatch_retransmit_batch(
+    svc: &MeshtasticService,
+    registry: &OutgoingVoiceRegistry,
+    plan: Vec<(u8, Vec<u8>)>,
+    message_id: u32,
+    channel: u32,
+    to: Option<u32>,
+    pacing: Duration,
+) {
+    let want_ack = to.is_some();
+    for batch_idx in 0..plan.len() {
+        let (idx, frame) = &plan[batch_idx];
+        let r = svc
+            .enqueue_voice_frame_with_id(frame.clone(), channel, to, want_ack, pacing)
+            .await;
+        if let Err(e) = r {
+            warn!(message_id, idx, ?e, "voice retransmit enqueue failed");
+            // Mark the failed chunk as sent so it can be retried on the next NACK.
+            // Without this, failed chunks stay stuck in `pending_chunks` forever.
+            registry.mark_chunk_sent(message_id, *idx);
+            // Also clear pending for the un-sent tail of this batch so
+            // a subsequent NACK round can retry them.
+            for (idx, _) in &plan[(batch_idx + 1)..] {
+                registry.mark_chunk_sent(message_id, *idx);
+            }
+            break;
+        }
+        // P0: Only mark sent after successful enqueue (was bug: marked before check)
+        registry.mark_chunk_sent(message_id, *idx);
+    }
+}
+
+/// Schedule a one-shot task that fires at `deadline` (the message's
+/// `cooldown_until`) and processes the deferred missing list stashed by
+/// [`OutgoingVoiceRegistry::defer_nack`]. Idempotent at the registry
+/// level: a second `defer_nack` during the same cooldown updates the
+/// stashed list but does not spawn a duplicate task.
+fn spawn_deferred_retransmit(
+    weak: Weak<VoiceSender>,
+    message_id: u32,
+    channel: u32,
+    to: Option<u32>,
+    status_tx: broadcast::Sender<SendStatus>,
+    deadline: std::time::Instant,
+) {
+    tokio::spawn(async move {
+        // Sleep just past the deadline so `take_retransmit` sees
+        // cooldown as elapsed. A small grace absorbs scheduler jitter
+        // and any clock skew between `Instant::now()` calls.
+        let now = std::time::Instant::now();
+        let wait = deadline
+            .checked_duration_since(now)
+            .unwrap_or_default()
+            .saturating_add(Duration::from_millis(10));
+        tokio::time::sleep(wait).await;
+
+        let Some(sender) = weak.upgrade() else { return };
+        let Some(missing) = sender.registry.take_deferred(message_id) else {
+            return;
+        };
+
+        let pacing = sender.current_pacing();
+        let plan = match sender
+            .registry
+            .take_retransmit(message_id, &missing, pacing)
+        {
+            Ok(p) if !p.is_empty() => p,
+            Ok(_) => return,
+            Err(reason) => {
+                debug!(
+                    message_id,
+                    requested = missing.len(),
+                    reason = ?reason,
+                    "voice: deferred retransmit skipped after wake-up"
+                );
+                return;
+            }
+        };
+
+        let scheduled: Vec<u8> = plan.iter().map(|(idx, _)| *idx).collect();
+        info!(
+            message_id,
+            requested = missing.len(),
+            scheduled = scheduled.len(),
+            "voice: retransmitting (deferred)"
+        );
+        let _ = status_tx.send(SendStatus::Retransmitting {
+            message_id,
+            chunks: scheduled,
+        });
+
+        let _permit = match sender.retransmit_permits.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(message_id, "retransmit semaphore closed");
+                return;
+            }
+        };
+        dispatch_retransmit_batch(
+            &sender.svc,
+            &sender.registry,
+            plan,
+            message_id,
+            channel,
+            to,
+            pacing,
+        )
+        .await;
+    });
 }
 
 #[cfg(test)]

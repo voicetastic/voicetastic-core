@@ -183,3 +183,164 @@ pub(super) struct AssemblerInner {
     pub(super) per_sender: HashMap<Arc<str>, usize>,
     pub(super) blacklist: Vec<(SenderKey, Instant)>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::voice::types::VoiceDestination;
+
+    fn sample_header() -> ChunkHeader {
+        ChunkHeader {
+            packet_type: crate::voice::types::PacketType::Data,
+            encrypted: false,
+            last_in_stream: false,
+            message_id: 12345,
+            codec: crate::voice::types::VoiceCodec::AmrNb,
+            codec_param: 5,
+            stream_seq: 0,
+            chunk_index: 0,
+            total_data: 3,
+            parity_count: 0,
+            mac_keyed: false,
+        }
+    }
+
+    #[test]
+    fn assembly_state_new() {
+        let header = sample_header();
+        let state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        assert_eq!(state.header_template, header);
+        assert_eq!(state.chunk_size, Some(64));
+        assert_eq!(state.data_shards.len(), 3);
+        assert_eq!(state.parity_shards.len(), 0);
+        assert_eq!(state.received_data, 0);
+        assert_eq!(state.received_parity, 0);
+        assert_eq!(state.nack_rounds, 0);
+        assert_eq!(state.validation_strikes, 0);
+    }
+
+    #[test]
+    fn assembly_state_with_parity() {
+        let mut header = sample_header();
+        header.parity_count = 2;
+        let state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        assert_eq!(state.parity_shards.len(), 2);
+    }
+
+    #[test]
+    fn missing_data_indices_all() {
+        let header = sample_header();
+        let state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        let missing = state.missing_data_indices();
+        assert_eq!(missing, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn missing_data_indices_partial() {
+        let header = sample_header();
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        state.data_shards[0] = Some(vec![1, 2, 3]);
+        state.data_shards[2] = Some(vec![4, 5, 6]);
+
+        let missing = state.missing_data_indices();
+        assert_eq!(missing, vec![1]);
+    }
+
+    #[test]
+    fn missing_data_indices_none() {
+        let header = sample_header();
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        state.data_shards[0] = Some(vec![1, 2, 3]);
+        state.data_shards[1] = Some(vec![4, 5, 6]);
+        state.data_shards[2] = Some(vec![7, 8, 9]);
+
+        let missing = state.missing_data_indices();
+        assert_eq!(missing, vec![]);
+    }
+
+    #[test]
+    fn try_fec_recover_no_parity() {
+        let header = sample_header();
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        let result = state.try_fec_recover();
+        assert!(result.is_ok());
+        assert_eq!(state.recovered_via_fec, 0);
+    }
+
+    #[test]
+    fn try_fec_recover_no_chunk_size() {
+        let mut header = sample_header();
+        header.parity_count = 1;
+        let mut state = AssemblyState::new(header, None, VoiceDestination::Broadcast, 0);
+
+        let result = state.try_fec_recover();
+        assert!(result.is_ok());
+        assert_eq!(state.recovered_via_fec, 0);
+    }
+
+    #[test]
+    fn try_fec_recover_insufficient_shards() {
+        let mut header = sample_header();
+        header.parity_count = 2;
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        state.data_shards[0] = Some(vec![1u8; 64]);
+        state.received_data = 1;
+
+        let result = state.try_fec_recover();
+        assert!(result.is_ok());
+        assert_eq!(state.recovered_via_fec, 0);
+    }
+
+    #[test]
+    fn try_fec_recover_final_chunk_unknown_length() {
+        let mut header = sample_header();
+        header.parity_count = 2;
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        state.data_shards[0] = Some(vec![1u8; 64]);
+        state.data_shards[1] = Some(vec![2u8; 64]);
+        state.data_shards[2] = None;
+        state.parity_shards[0] = Some(vec![3u8; 64]);
+        state.parity_shards[1] = Some(vec![4u8; 64]);
+        state.received_data = 2;
+        state.received_parity = 2;
+        state.last_data_len = None;
+
+        let result = state.try_fec_recover();
+        assert!(result.is_ok());
+        assert_eq!(
+            state.recovered_via_fec, 0,
+            "should not recover when final chunk length unknown"
+        );
+    }
+
+    #[test]
+    fn try_fec_recover_succeeds() {
+        let mut header = sample_header();
+        header.total_data = 2;
+        header.parity_count = 1;
+        let mut state = AssemblyState::new(header, Some(64), VoiceDestination::Broadcast, 0);
+
+        state.data_shards[0] = Some(vec![1u8; 64]);
+        state.data_shards[1] = None;
+        state.parity_shards[0] = Some(vec![2u8; 64]);
+        state.received_data = 1;
+        state.received_parity = 1;
+        state.last_data_len = Some(32);
+
+        let result = state.try_fec_recover();
+        assert!(result.is_ok());
+        assert_eq!(state.recovered_via_fec, 1, "should recover 1 chunk");
+        assert!(
+            state.data_shards[1].is_some(),
+            "should recover missing shard"
+        );
+    }
+}

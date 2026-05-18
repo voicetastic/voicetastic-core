@@ -55,7 +55,8 @@ pub const DEAD_SENDER_TIMEOUT: Duration = Duration::from_secs(120);
 /// presets where inter-chunk gaps can routinely exceed a few seconds.
 pub const NACK_MAX_ROUNDS: u16 = 400;
 /// Quiet-period after the last seen chunk before issuing a NACK.
-pub const NACK_WINDOW_MS: u64 = 1500;
+/// Receiver uses 3× exponential backoff: 3s, 9s, 27s, 81s, 243s cap.
+pub const NACK_WINDOW_MS: u64 = 3000;
 /// AES-GCM nonce length (96 bits per RFC 5288).
 pub const GCM_NONCE_LEN: usize = 12;
 /// AES-GCM authentication tag length (128 bits).

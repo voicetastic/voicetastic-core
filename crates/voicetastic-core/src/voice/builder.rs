@@ -179,3 +179,207 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
         parity_count,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> BuildConfig {
+        BuildConfig {
+            message_id: 12345,
+            stream_seq: 0,
+            codec: VoiceCodec::AmrNb,
+            codec_param: 5,
+            chunk_size: 64,
+            parity_count: 0,
+            last_in_stream: true,
+            encryption: None,
+            mac_key: None,
+        }
+    }
+
+    #[test]
+    fn random_message_id_never_zero() {
+        for _ in 0..100 {
+            let id = random_message_id().expect("RNG should work");
+            assert_ne!(id, 0, "message_id should never be zero");
+        }
+    }
+
+    #[test]
+    fn build_single_chunk_no_fec() {
+        let audio = vec![42u8; 32];
+        let cfg = base_config();
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        assert_eq!(msg.total_data, 1);
+        assert_eq!(msg.parity_count, 0);
+        assert_eq!(msg.frames.len(), 1);
+    }
+
+    #[test]
+    fn build_multiple_chunks_no_fec() {
+        let audio = vec![42u8; 200];
+        let cfg = base_config();
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        assert_eq!(msg.total_data, 4);
+        assert_eq!(msg.parity_count, 0);
+        assert_eq!(msg.frames.len(), 4);
+    }
+
+    #[test]
+    fn build_with_parity() {
+        let audio = vec![42u8; 128];
+        let mut cfg = base_config();
+        cfg.parity_count = 2;
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        assert_eq!(msg.total_data, 2);
+        assert_eq!(msg.parity_count, 2);
+        assert_eq!(msg.frames.len(), 4);
+    }
+
+    #[test]
+    fn error_chunk_too_small() {
+        let audio = vec![42u8; 32];
+        let mut cfg = base_config();
+        cfg.chunk_size = 15;
+        let err = build_message(&audio, &cfg).expect_err("should fail");
+
+        match err {
+            VoiceError::ChunkTooSmall(sz) => assert_eq!(sz, 15),
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn error_chunk_too_large() {
+        let audio = vec![42u8; 32];
+        let mut cfg = base_config();
+        cfg.chunk_size = MAX_BODY_SIZE + 1;
+        let err = build_message(&audio, &cfg).expect_err("should fail");
+
+        match err {
+            VoiceError::ChunkTooLarge { .. } => {}
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn error_empty_audio() {
+        let audio = vec![];
+        let cfg = base_config();
+        let err = build_message(&audio, &cfg).expect_err("should fail");
+
+        match err {
+            VoiceError::TooShort { .. } => {}
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn error_audio_too_large() {
+        let audio = vec![42u8; MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE + 1];
+        let cfg = base_config();
+        let err = build_message(&audio, &cfg).expect_err("should fail");
+
+        match err {
+            VoiceError::AudioTooLarge { .. } => {}
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn error_parity_too_large() {
+        let audio = vec![42u8; 32];
+        let mut cfg = base_config();
+        cfg.parity_count = (MAX_PARITY_PER_MESSAGE + 1) as u8;
+        let err = build_message(&audio, &cfg).expect_err("should fail");
+
+        match err {
+            VoiceError::TooMuchParity(_) => {}
+            _ => panic!("unexpected error: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn frames_respect_max_packet_size() {
+        let audio = vec![42u8; 128];
+        let cfg = base_config();
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        for frame in &msg.frames {
+            assert!(frame.len() <= MAX_PACKET_SIZE);
+        }
+    }
+
+    #[test]
+    fn frame_headers_correct() {
+        let audio = vec![42u8; 200];
+        let mut cfg = base_config();
+        cfg.parity_count = 2;
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        for (i, frame) in msg.frames.iter().enumerate() {
+            assert!(frame.len() >= HEADER_SIZE);
+
+            let header_bytes = &frame[..HEADER_SIZE];
+            let header = ChunkHeader::parse(header_bytes, None).expect("should parse");
+            let (header, _) = header;
+
+            assert_eq!(header.message_id, cfg.message_id);
+            assert_eq!(header.codec, cfg.codec);
+            assert_eq!(header.total_data, msg.total_data);
+            assert_eq!(header.parity_count, msg.parity_count);
+
+            if i < msg.total_data as usize {
+                assert_eq!(header.packet_type, PacketType::Data);
+                assert_eq!(header.chunk_index, i as u8);
+            } else {
+                assert_eq!(header.packet_type, PacketType::Parity);
+                assert_eq!(header.chunk_index, (i - msg.total_data as usize) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn last_chunk_trim() {
+        let audio = vec![42u8; 150];
+        let cfg = base_config();
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        let last_frame = &msg.frames[msg.frames.len() - 1];
+        let body_len = last_frame.len() - HEADER_SIZE;
+
+        assert_eq!(
+            body_len,
+            150 - (cfg.chunk_size * (msg.total_data as usize - 1))
+        );
+    }
+
+    #[test]
+    fn last_in_stream_flag() {
+        let audio = vec![42u8; 32];
+        let mut cfg = base_config();
+        cfg.last_in_stream = true;
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        let last_frame = &msg.frames[msg.frames.len() - 1];
+        let header = ChunkHeader::parse(&last_frame[..HEADER_SIZE], None)
+            .expect("should parse")
+            .0;
+        assert!(header.last_in_stream);
+    }
+
+    #[test]
+    fn max_chunks_per_message_limit() {
+        let chunk_size = MAX_BODY_SIZE;
+        let audio = vec![42u8; chunk_size * (MAX_CHUNKS_PER_MESSAGE - 1)];
+        let mut cfg = base_config();
+        cfg.chunk_size = chunk_size;
+        let msg = build_message(&audio, &cfg).expect("should build");
+
+        assert_eq!(msg.total_data as usize, MAX_CHUNKS_PER_MESSAGE - 1);
+    }
+}

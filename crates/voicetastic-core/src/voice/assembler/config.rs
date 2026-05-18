@@ -131,10 +131,10 @@ mod tests {
 
     #[test]
     fn sync_nack_cap_default() {
-        // Default 1200 s timeout / 1500 ms window = 800 rounds.
+        // Default 1200 s timeout / 3000 ms (3 s) window = 400 rounds.
         let mut cfg = AssemblerConfig::default();
         cfg.sync_nack_cap_to_timeout();
-        assert_eq!(cfg.max_nack_rounds, 800);
+        assert_eq!(cfg.max_nack_rounds, 400);
     }
 
     #[test]
@@ -151,13 +151,13 @@ mod tests {
 
     #[test]
     fn sync_nack_cap_top_of_slider() {
-        // 3600 s slider max / default 1500 ms = 2400 rounds.
+        // 3600 s slider max / default 3000 ms (3 s) = 1200 rounds.
         let mut cfg = AssemblerConfig {
             message_timeout: Duration::from_secs(3_600),
             ..Default::default()
         };
         cfg.sync_nack_cap_to_timeout();
-        assert_eq!(cfg.max_nack_rounds, 2_400);
+        assert_eq!(cfg.max_nack_rounds, 1_200);
     }
 
     #[test]

@@ -224,8 +224,12 @@ impl VoiceAssembler {
             state.header_template.parity_count = header.parity_count;
         }
         state.encrypted_seen = state.encrypted_seen || header.encrypted;
-        state.last_chunk_at = now;
+        // `last_data_at` proves the sender is still alive; bump it on
+        // any frame (including duplicates and parity that fails to
+        // recover) so dead-sender detection at line 350 only trips on
+        // true silence.
         state.last_data_at = now;
+        let received_before = state.received_data;
 
         let ingest_event = match header.packet_type {
             PacketType::Data => ingest_data(state, &header, plain_body)?,
@@ -236,16 +240,24 @@ impl VoiceAssembler {
             return Ok(ev);
         }
 
-        // Progress! A new chunk landed, so reset the consecutive NACK
-        // round counter. This drives both the wire-visible `round` field
-        // on future NACKs and the give-up bound, so a slow-trickling
-        // message that actually services every NACK round will keep
-        // reassembling indefinitely (capped only by `message_timeout`).
-        state.nack_rounds = 0;
-
         // Try FEC recovery if we now have enough shards.
         if let Err(e) = state.try_fec_recover() {
             warn!(?e, message_id = ?header.message_id, "FEC recovery failed");
+        }
+
+        // Reset NACK backoff state only on real DATA progress (direct
+        // DATA shard or successful FEC recovery — both bump
+        // `received_data`). Parity arrivals that don't recover any
+        // missing data shards must NOT reset the round counter or quiet
+        // timer: if they did, exponential backoff would never escalate
+        // during a stuck transmission where parity keeps trickling in
+        // but the data we still need does not. That regression presents
+        // as `round=1` NACKs every few seconds for the entire
+        // `message_timeout` window, saturating the receiver's own radio
+        // queue with NACK retries.
+        if state.received_data > received_before {
+            state.nack_rounds = 0;
+            state.last_chunk_at = now;
         }
 
         if state.received_data == state.header_template.total_data {
@@ -328,6 +340,37 @@ impl VoiceAssembler {
             // alive; only true silence trips the cap. `message_timeout`
             // is the absolute upper bound regardless.
             if elapsed_total >= timeout || state.nack_rounds >= max_nack_rounds {
+                // Emit one final NACK with `give_up = true` so the sender
+                // knows to stop retransmitting. Without this signal the
+                // sender continues to burn airtime for its entire linger
+                // window (default 10 min) on a message we've already
+                // finalized — visible to the receiver as a long tail of
+                // "late chunk after completion (blacklisted)" entries.
+                // The missing list is included for diagnostics; the
+                // sender's `give_up` branch ignores it and just cleans
+                // up the registry entry.
+                let missing = state.missing_data_indices();
+                let give_up_frame = build_nack(
+                    state.header_template.message_id,
+                    state.header_template.stream_seq,
+                    state.header_template.codec,
+                    state.header_template.codec_param,
+                    state.header_template.total_data,
+                    state.header_template.parity_count,
+                    &missing,
+                    true,
+                    cfg.channel_psk.as_deref(),
+                );
+                nacks.push(OutboundNack {
+                    from: key.0.to_string(),
+                    channel: state.channel,
+                    frame: give_up_frame,
+                    give_up: true,
+                    message_id: state.header_template.message_id,
+                    missing_count: missing.len(),
+                    round: state.nack_rounds.saturating_add(1),
+                });
+
                 // The key came from the snapshot above; the only way it would
                 // be missing here is a concurrent mutation, which can't happen
                 // under `&mut inner`. Skip defensively rather than panic.
@@ -352,10 +395,11 @@ impl VoiceAssembler {
             }
 
             // Quiet-period exceeded ⇒ emit a NACK round.
-            // Exponential backoff: each successive round doubles the
+            // Exponential backoff: each successive round triples the
             // effective quiet window so a dead sender doesn't trigger
-            // NACK storms (capped at 32× the base window).
-            let backoff = 1u32 << state.nack_rounds.min(5);
+            // NACK storms (capped at 243× the base window: 3^5).
+            // Round 0: 3s, Round 1: 9s, Round 2: 27s, Round 3: 81s, Round 4+: 243s.
+            let backoff = 3u32.pow((state.nack_rounds.min(4)) as u32);
             let effective_window = nack_window.saturating_mul(backoff);
             if elapsed_quiet >= effective_window
                 && state.received_data < state.header_template.total_data
@@ -681,6 +725,75 @@ mod tests {
         }
     }
 
+    /// Regression: parity frames that arrive but DON'T recover any
+    /// missing data shards must NOT reset the NACK round counter.
+    ///
+    /// Field-observed bug: during a stuck transmission, the sender's
+    /// firmware queue saturates and stops servicing DATA retransmits,
+    /// but parity continues trickling in. Each parity ingest was
+    /// (incorrectly) hitting the "progress" branch and resetting
+    /// `nack_rounds = 0`, so exponential backoff never escalated past
+    /// round 1 and the receiver storm-NACKed every few seconds for the
+    /// entire `message_timeout` window — saturating its OWN radio queue
+    /// in turn (`res=32` on outbound NACK).
+    #[test]
+    fn parity_without_recovery_does_not_reset_round_counter() {
+        // 4 data + 2 parity. With only 1 data shard delivered + parity
+        // shards, FEC can't recover (needs ≥ total_data shards).
+        let audio: Vec<u8> = (0..(64 * 4)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(2)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+        // Establish the slot with chunk 0 (DATA).
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+
+        // Force a NACK round.
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS + 100);
+            }
+        }
+        let out = asm.tick();
+        assert_eq!(out.nacks.len(), 1, "first NACK should fire");
+
+        // Check round counter is now 1.
+        let rounds_after_first_nack = {
+            let inner = asm.inner.lock();
+            inner.in_progress.values().next().unwrap().nack_rounds
+        };
+        assert_eq!(rounds_after_first_nack, 1);
+
+        // Deliver a PARITY frame (insufficient for FEC). This must NOT
+        // reset nack_rounds, because no DATA progress was made.
+        let parity_idx = enc.total_data as usize; // first parity frame
+        let _ = asm.accept(
+            "!cc",
+            VoiceDestination::Broadcast,
+            0,
+            &enc.frames[parity_idx],
+        );
+        let rounds_after_parity = {
+            let inner = asm.inner.lock();
+            inner.in_progress.values().next().unwrap().nack_rounds
+        };
+        assert_eq!(
+            rounds_after_parity, 1,
+            "parity that doesn't recover data must not reset nack_rounds"
+        );
+
+        // Deliver a real DATA chunk — THIS must reset the counter.
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[1]);
+        let rounds_after_data = {
+            let inner = asm.inner.lock();
+            inner.in_progress.values().next().unwrap().nack_rounds
+        };
+        assert_eq!(
+            rounds_after_data, 0,
+            "real data progress must reset nack_rounds"
+        );
+    }
+
     /// Counter-regression: with NO sender response at all, the
     /// consecutive cap MUST trip after `max_nack_rounds` quiet windows.
     #[test]
@@ -698,11 +811,11 @@ mod tests {
 
         // Two consecutive NACK rounds with no progress.
         // Each round must set last_chunk_at far enough back to meet the
-        // exponential-backoff-multiplied effective window (2^round ×
+        // exponential-backoff-multiplied effective window (3^round ×
         // base window), otherwise the backoff check would suppress the
         // NACK until the window is actually exceeded.
         for round in 0..2 {
-            let backoff = 1u32 << round.min(5);
+            let backoff = 3u32.pow((round.min(4)) as u32);
             let ago = Duration::from_millis(NACK_WINDOW_MS * backoff as u64 + 100);
             {
                 let mut inner = asm.inner.lock();
@@ -714,20 +827,58 @@ mod tests {
         }
 
         // Third tick after another quiet window: cap (=2) reached,
-        // partial-finalize and stop NACKing.
+        // partial-finalize and emit ONE final NACK with `give_up = true`
+        // so the sender stops retransmitting.
         {
             let mut inner = asm.inner.lock();
             for (_, st) in inner.in_progress.iter_mut() {
-                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS + 100);
+                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS * 9 + 100);
             }
         }
         let out = asm.tick();
+        assert_eq!(out.nacks.len(), 1, "expected one final give-up NACK");
         assert!(
-            out.nacks.is_empty(),
-            "cap reached: should not emit another NACK, got {:?}",
-            out.nacks,
+            out.nacks[0].give_up,
+            "the final NACK on cap-reached must carry give_up=true"
+        );
+        let (h, body) = ChunkHeader::parse(&out.nacks[0].frame, None).unwrap();
+        let info = parse_nack_body(&h, body).unwrap();
+        assert!(
+            info.give_up,
+            "the wire NACK must serialize give_up=true so the sender side parses it"
         );
         assert_eq!(out.finalized.len(), 1, "expected partial finalize");
+        assert!(!out.finalized[0].is_complete);
+    }
+
+    /// Hard `message_timeout` path also emits a give-up NACK so the
+    /// sender can stop retransmitting instead of burning airtime for the
+    /// entire linger window. Complements the round-cap path covered by
+    /// `silent_sender_partial_finalizes_after_cap`.
+    #[test]
+    fn message_timeout_emits_give_up_nack() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            message_timeout: Duration::from_millis(50),
+            partial_play_on_timeout: true,
+            ..Default::default()
+        });
+
+        // Establish the slot with chunk 0.
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+
+        // Force the message past its hard timeout.
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.started_at = Instant::now() - Duration::from_millis(60);
+            }
+        }
+        let out = asm.tick();
+        assert_eq!(out.nacks.len(), 1, "timeout path must emit give-up NACK");
+        assert!(out.nacks[0].give_up);
+        assert_eq!(out.finalized.len(), 1);
         assert!(!out.finalized[0].is_complete);
     }
 }
