@@ -45,6 +45,19 @@ use parking_lot::Mutex;
 
 use super::builder::EncodedMessage;
 
+/// Reason why a retransmit request was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetransmitSkipReason {
+    /// Message entry was garbage-collected (TTL expired).
+    TtlExpired,
+    /// Maximum retransmit budget exhausted for this message.
+    BudgetExhausted,
+    /// Previous retransmit batch still in flight (cooldown active).
+    CooldownActive,
+    /// All requested chunks are already pending (early NACK overlap).
+    AllChunksPending,
+}
+
 /// Default retain TTL when the app hasn't applied settings yet. Must
 /// cover the full sender lifetime: `max_burst_duration + linger`.
 /// On LongFast (155 chunks × 900 ms ≈ 140 s) with the default linger of
@@ -200,10 +213,14 @@ impl OutgoingVoiceRegistry {
         );
     }
 
-    /// Mark a previously-pending chunk as actually transmitted by the
-    /// voice TX worker, releasing it so a subsequent NACK can request
-    /// it again. No-op if the message has been GC'd or the chunk was
-    /// not pending.
+    /// Release a chunk from the pending state after it has been enqueued
+    /// by the voice TX worker. This allows future NACK rounds to request
+    /// the chunk again if it's still missing from the receiver.
+    ///
+    /// Despite the name, this does NOT mark chunks as successfully received
+    /// by the remote — it merely releases them from the "in flight" tracking
+    /// so they can be retransmitted again if needed. No-op if the message
+    /// has been GC'd or the chunk was not pending.
     pub fn mark_chunk_sent(&self, message_id: u32, chunk_index: u8) {
         let mut map = self.inner.lock();
         if let Some(entry) = map.get_mut(&message_id) {
@@ -242,9 +259,9 @@ impl OutgoingVoiceRegistry {
     }
 
     /// Look up an entry, bump its retransmit counter, and return the frames
-    /// to resend. Returns `None` if no entry exists, the TTL elapsed, the
-    /// retransmit budget is exhausted, or a previous retransmit for this
-    /// message is still draining (cooldown window).
+    /// to resend. Returns `Err` with the reason if the request cannot be
+    /// honored: entry doesn't exist, TTL elapsed, budget exhausted, or
+    /// cooldown still active.
     ///
     /// `pacing` is the current per-frame TX pacing (modem-preset dependent);
     /// it is used to compute the cooldown so the cooldown matches the
@@ -254,33 +271,30 @@ impl OutgoingVoiceRegistry {
         message_id: u32,
         missing: &[u8],
         pacing: Duration,
-    ) -> Option<Vec<(u8, Vec<u8>)>> {
+    ) -> Result<Vec<(u8, Vec<u8>)>, RetransmitSkipReason> {
         let ttl = self.retain_ttl();
         let mut map = self.inner.lock();
-        let entry = map.get_mut(&message_id)?;
+        let entry = map
+            .get_mut(&message_id)
+            .ok_or(RetransmitSkipReason::TtlExpired)?;
         let now = Instant::now();
         if now.duration_since(entry.registered_at) >= ttl {
             map.remove(&message_id);
-            return None;
+            return Err(RetransmitSkipReason::TtlExpired);
         }
         if entry.retransmits >= MAX_RETRANSMITS_PER_MESSAGE {
-            return None;
+            return Err(RetransmitSkipReason::BudgetExhausted);
         }
         if let Some(until) = entry.cooldown_until
             && now < until
         {
-            // Previous retransmit batch for this message is still being
-            // paced out by the worker (or in flight on the air). Drop
-            // this NACK round — once the batch lands the peer will
-            // (re)compute its missing-set and NACK again if it really
-            // needs more.
-            return None;
+            return Err(RetransmitSkipReason::CooldownActive);
         }
         // Filter out chunks already in flight for this message so two
         // overlapping NACK rounds can't enqueue the same chunk twice.
         let frames = entry.frames_for(missing);
         if frames.is_empty() {
-            return None;
+            return Err(RetransmitSkipReason::AllChunksPending);
         }
         // Mark these chunks pending; the watcher will clear them via
         // `mark_chunk_sent` once the worker has actually transmitted
@@ -307,7 +321,7 @@ impl OutgoingVoiceRegistry {
             .clamp(Duration::from_secs(1), Duration::from_secs(30))
             .min(ttl);
         entry.cooldown_until = Some(now + cooldown);
-        Some(frames)
+        Ok(frames)
     }
 }
 
@@ -361,14 +375,15 @@ mod tests {
 
     #[test]
     fn pending_chunks_seeded_at_register_filter_early_nacks() {
-        // Brand-new entry: every data chunk is pending until the burst
-        // loop calls `mark_chunk_sent`. A NACK arriving in that window
-        // returns no plan, regardless of cooldown.
         let reg = OutgoingVoiceRegistry::default();
         let encoded = build_encoded(0);
         reg.register(9, &encoded, 0, None);
         let p = reg.take_retransmit(9, &[0, 1, 2], Duration::from_millis(10));
-        assert!(p.is_none(), "all chunks still pending from register");
+        assert_eq!(
+            p,
+            Err(RetransmitSkipReason::AllChunksPending),
+            "all chunks still pending from register"
+        );
     }
 
     #[test]
@@ -377,16 +392,13 @@ mod tests {
         let encoded = build_encoded(0);
         reg.register(1, &encoded, 0, None);
         drain_initial_burst(&reg, 1, encoded.total_data);
-        // First NACK requests {1} — accepted, marked pending, parks
-        // message under cooldown.
         let p1 = reg
             .take_retransmit(1, &[1], Duration::from_millis(10))
             .expect("first plan");
         assert_eq!(p1.len(), 1);
-        // Second NACK arrives before mark_chunk_sent: blocked by cooldown.
-        assert!(
-            reg.take_retransmit(1, &[1, 2], Duration::from_millis(10))
-                .is_none()
+        assert_eq!(
+            reg.take_retransmit(1, &[1, 2], Duration::from_millis(10)),
+            Err(RetransmitSkipReason::CooldownActive)
         );
     }
 
@@ -412,26 +424,24 @@ mod tests {
     #[test]
     fn ttl_expiry_drops_entry_on_take() {
         let reg = OutgoingVoiceRegistry::default();
-        // `set_retain_ttl` clamps to whole seconds with a 1 s floor, so
-        // we have to actually wait that long for the entry to expire.
         reg.set_retain_ttl(Duration::from_secs(1));
         let encoded = build_encoded(0);
         reg.register(7, &encoded, 0, None);
         drain_initial_burst(&reg, 7, encoded.total_data);
         std::thread::sleep(Duration::from_millis(1100));
-        assert!(
-            reg.take_retransmit(7, &[0], Duration::from_millis(10))
-                .is_none()
+        assert_eq!(
+            reg.take_retransmit(7, &[0], Duration::from_millis(10)),
+            Err(RetransmitSkipReason::TtlExpired)
         );
         assert!(reg.is_empty());
     }
 
     #[test]
-    fn unknown_message_id_returns_none() {
+    fn unknown_message_id_returns_ttl_expired() {
         let reg = OutgoingVoiceRegistry::default();
-        assert!(
-            reg.take_retransmit(0xDEAD, &[0], Duration::from_millis(10))
-                .is_none()
+        assert_eq!(
+            reg.take_retransmit(0xDEAD, &[0], Duration::from_millis(10)),
+            Err(RetransmitSkipReason::TtlExpired)
         );
     }
 
@@ -439,11 +449,15 @@ mod tests {
     fn out_of_range_chunk_index_is_filtered() {
         let reg = OutgoingVoiceRegistry::default();
         let encoded = build_encoded(0);
-        let bogus = encoded.total_data; // == one past last valid index
+        let bogus = encoded.total_data;
         reg.register(3, &encoded, 0, None);
         drain_initial_burst(&reg, 3, encoded.total_data);
         let p = reg.take_retransmit(3, &[bogus], Duration::from_millis(10));
-        assert!(p.is_none(), "all indices filtered ⇒ no plan");
+        assert_eq!(
+            p,
+            Err(RetransmitSkipReason::AllChunksPending),
+            "all indices filtered ⇒ no plan"
+        );
     }
 
     #[test]

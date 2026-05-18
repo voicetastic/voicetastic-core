@@ -48,6 +48,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -64,7 +65,7 @@ use crate::voice::crypto::{EnvelopeKey, derive_key};
 use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
-use crate::voice::outgoing::OutgoingVoiceRegistry;
+use crate::voice::outgoing::{OutgoingVoiceRegistry, RetransmitSkipReason};
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
 /// Default linger window after the initial burst. Matches the
@@ -286,6 +287,10 @@ pub struct VoiceSender {
     /// to prevent unbounded task growth when many messages are NACK'd
     /// simultaneously.
     retransmit_permits: Arc<tokio::sync::Semaphore>,
+    /// Diagnostic counter: NACKs dropped due to listener lagging behind
+    /// the broadcast channel. High values indicate the NACK listener task
+    /// cannot keep up with the message arrival rate.
+    lagged_nack_count: AtomicU64,
 }
 
 impl VoiceSender {
@@ -310,6 +315,7 @@ impl VoiceSender {
             active: Mutex::new(HashMap::new()),
             rt: rt.clone(),
             retransmit_permits: Arc::new(Semaphore::new(16)),
+            lagged_nack_count: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&sender);
         let rx = svc.subscribe_data();
@@ -517,6 +523,13 @@ impl VoiceSender {
         self.active.lock().is_empty()
     }
 
+    /// Diagnostic: number of NACKs dropped due to listener lagging.
+    /// High values indicate the NACK listener cannot keep up with the
+    /// message arrival rate and retransmit requests are being lost.
+    pub fn lagged_nack_count(&self) -> u64 {
+        self.lagged_nack_count.load(Ordering::Relaxed)
+    }
+
     /// Tune how long the internal [`OutgoingVoiceRegistry`] retains
     /// frames after a send for late NACK rounds. Should typically match
     /// the receiver's `AssemblerConfig::message_timeout` so a NACK can
@@ -541,7 +554,14 @@ async fn nack_listener_task(
         let data = match rx.recv().await {
             Ok(d) => d,
             Err(broadcast::error::RecvError::Lagged(n)) => {
-                warn!(skipped = n, "voice sender NACK listener lagged");
+                warn!(
+                    skipped = n,
+                    "voice sender NACK listener lagged; NACKs may have been dropped"
+                );
+                // Track lagging for diagnostics: high values indicate listener overload
+                if let Some(sender) = weak.upgrade() {
+                    sender.lagged_nack_count.fetch_add(n, Ordering::Relaxed);
+                }
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -586,22 +606,22 @@ async fn nack_listener_task(
             continue;
         }
 
-        // P1a: Give up if message is unrecoverable (>80% loss after 5+ retransmits)
+        // P1a: Give up if message is unrecoverable (excessive loss + multiple retransmits)
         let loss_ratio = nack.missing.len() as f32 / nack.total_data as f32;
-        if loss_ratio > 0.8
-            && sender
-                .registry
-                .retransmit_count(nack.message_id)
-                .is_some_and(|r| r >= 5)
-        {
+        let missing_count = nack.missing.len();
+        let retransmit_count = sender
+            .registry
+            .retransmit_count(nack.message_id)
+            .unwrap_or(0);
+        // Give up if: high loss ratio AND many retransmits, OR excessive absolute loss
+        let should_give_up = (loss_ratio > 0.8 && retransmit_count >= 5) || missing_count > 50;
+        if should_give_up {
             warn!(
                 message_id = nack.message_id,
+                missing_count,
                 loss_pct = (loss_ratio * 100.0) as u32,
-                retransmits = sender
-                    .registry
-                    .retransmit_count(nack.message_id)
-                    .unwrap_or(0),
-                "message unrecoverable (>80% loss), giving up"
+                retransmits = retransmit_count,
+                "message unrecoverable: excessive loss, giving up"
             );
             let _ = status_tx.send(SendStatus::GaveUp {
                 message_id: nack.message_id,
@@ -610,16 +630,16 @@ async fn nack_listener_task(
             continue;
         }
 
-        // P2: Detect if receiver is stuck (same chunks NACKed 10+ times).
-        // Threshold is high to allow recovery on slow RF links where identical
-        // NACKs can occur for extended periods during cooldown windows before
-        // a retransmit actually succeeds. 10 rounds ≈ 15 seconds at 1.5s/round.
+        // P2: Detect if receiver is stuck (same chunks NACKed 20+ times).
+        // Threshold is conservative to allow recovery on very slow RF links where
+        // identical NACKs can occur for extended periods during long cooldowns.
+        // 20 rounds ≈ 30 seconds at 1.5s/round.
         {
             let mut map = sender.active.lock();
             if let Some(entry) = map.get_mut(&nack.message_id) {
                 if entry.last_missing_set == nack.missing {
                     entry.identical_nack_count += 1;
-                    if entry.identical_nack_count >= 10 {
+                    if entry.identical_nack_count >= 20 {
                         warn!(
                             message_id = nack.message_id,
                             missing_count = nack.missing.len(),
@@ -641,17 +661,38 @@ async fn nack_listener_task(
         }
 
         let pacing = sender.current_pacing();
-        let Some(plan) = sender
+        let plan = match sender
             .registry
             .take_retransmit(nack.message_id, &nack.missing, pacing)
-        else {
+        {
+            Ok(p) => p,
+            Err(reason) => {
+                // Log skip reason at appropriate level for diagnostics
+                let msg = match reason {
+                    RetransmitSkipReason::TtlExpired => "message expired",
+                    RetransmitSkipReason::BudgetExhausted => "max retransmits exceeded",
+                    RetransmitSkipReason::CooldownActive => "previous batch still in flight",
+                    RetransmitSkipReason::AllChunksPending => "all chunks already pending",
+                };
+                debug!(
+                    message_id = nack.message_id,
+                    requested = nack.missing.len(),
+                    reason = msg,
+                    "voice: retransmit skipped"
+                );
+                continue;
+            }
+        };
+
+        // Skip empty plans to avoid unnecessary task spawn and counter update
+        if plan.is_empty() {
             debug!(
                 message_id = nack.message_id,
                 requested = nack.missing.len(),
-                "voice: retransmit skipped (TTL/budget/cooldown)"
+                "voice: no frames to retransmit (all pending)"
             );
             continue;
-        };
+        }
 
         // P1b: Rate-limit concurrent retransmits to prevent task explosion
         {
@@ -709,9 +750,11 @@ async fn nack_listener_task(
                     .await;
                 if let Err(e) = r {
                     warn!(message_id, idx, ?e, "voice retransmit enqueue failed");
-                    // Clear pending for the un-sent tail of this batch so
-                    // a subsequent NACK round can retry them. Without this
-                    // the chunks stay stuck in `pending_chunks` forever.
+                    // Mark the failed chunk as sent so it can be retried on the next NACK.
+                    // Without this, failed chunks stay stuck in `pending_chunks` forever.
+                    registry.mark_chunk_sent(message_id, *idx);
+                    // Also clear pending for the un-sent tail of this batch so
+                    // a subsequent NACK round can retry them.
                     for (idx, _) in &plan[(batch_idx + 1)..] {
                         registry.mark_chunk_sent(message_id, *idx);
                     }
