@@ -234,6 +234,13 @@ impl OutgoingVoiceRegistry {
         self.inner.lock().get(&message_id).map(|e| e.total_data)
     }
 
+    /// Number of retransmit rounds already issued for a message, or `None`
+    /// if the entry has been GC'd. Used for early give-up detection during
+    /// NACK storms.
+    pub fn retransmit_count(&self, message_id: u32) -> Option<u16> {
+        self.inner.lock().get(&message_id).map(|e| e.retransmits)
+    }
+
     /// Look up an entry, bump its retransmit counter, and return the frames
     /// to resend. Returns `None` if no entry exists, the TTL elapsed, the
     /// retransmit budget is exhausted, or a previous retransmit for this
