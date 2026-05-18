@@ -1,14 +1,14 @@
 //! High-level façade over a [`crate::Transport`] and [`crate::proto`].
 //!
-//! [`MeshService`] owns an `Arc<dyn Transport>`, sends a `WantConfigId`
+//! [`MeshtasticService`] owns an `Arc<dyn Transport>`, sends a `WantConfigId`
 //! handshake on connect, fans incoming `FromRadio` messages out to typed
 //! observers, and exposes outbound helpers (`send_text`, `send_data`).
 //!
 //! Two convenience constructors wrap the in-tree built-in transports:
-//! [`MeshService::connect_by_address`] (BLE, requires the `ble-btleplug`
-//! feature) and [`MeshService::connect_by_serial`] (USB-serial, requires
+//! [`MeshtasticService::connect_by_address`] (BLE, requires the `ble-btleplug`
+//! feature) and [`MeshtasticService::connect_by_serial`] (USB-serial, requires
 //! `serial-tokio`). External transports — e.g. an Android JNI bridge —
-//! plug in via [`MeshService::connect_with_transport`].
+//! plug in via [`MeshtasticService::connect_with_transport`].
 
 mod inbound;
 mod outbound;
@@ -30,6 +30,7 @@ const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(feature = "ble-btleplug")]
 use crate::ble::{BleManager, Connection, DiscoveredDevice};
 use crate::error::{Error, Result};
+use crate::node::NodeId;
 use crate::proto::{
     Channel, DeviceMetadata, MyNodeInfo, NodeInfo, User,
     config::{
@@ -38,11 +39,33 @@ use crate::proto::{
     },
     to_radio,
 };
+use crate::radio_service::{
+    self, ConnectionState as RadioConnectionState, IncomingText as RadioIncomingText, QueueEvent,
+    VoiceData,
+};
 #[cfg(feature = "serial-tokio")]
 use crate::serial::SerialConnection;
 use crate::transport::Transport;
+use crate::voice::ModemPreset;
 
 pub use types::{ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_long_name};
+
+/// Convert Meshtastic `LoRaConfig.modem_preset` proto integer to `ModemPreset`.
+/// Returns `None` for unknown values; callers should fall back to safe defaults.
+pub fn modem_preset_from_proto(value: i32) -> Option<ModemPreset> {
+    Some(match value {
+        0 => ModemPreset::LongFast,
+        1 => ModemPreset::LongSlow,
+        2 => ModemPreset::VeryLongSlow,
+        3 => ModemPreset::MediumSlow,
+        4 => ModemPreset::MediumFast,
+        5 => ModemPreset::ShortSlow,
+        6 => ModemPreset::ShortFast,
+        7 => ModemPreset::LongModerate,
+        8 => ModemPreset::ShortTurbo,
+        _ => return None,
+    })
+}
 
 /// Configuration for serial port auto-reconnection.
 #[derive(Debug, Clone)]
@@ -53,7 +76,7 @@ struct SerialReconnectConfig {
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]
-pub struct MeshService {
+pub struct MeshtasticService {
     inner: Arc<Inner>,
 }
 
@@ -69,8 +92,8 @@ struct Inner {
     incoming_data_tx: broadcast::Sender<IncomingData>,
     next_packet_id: Mutex<u32>,
     /// Producer end of the serialized voice TX queue. The worker is
-    /// spawned in [`MeshService::new`] and holds a `Weak<Inner>` so it
-    /// shuts down when the last external [`MeshService`] clone drops.
+    /// spawned in [`MeshtasticService::new`] and holds a `Weak<Inner>` so it
+    /// shuts down when the last external [`MeshtasticService`] clone drops.
     voice_tx: mpsc::Sender<voice_tx::VoiceTxItem>,
     /// Latest firmware-reported outbound queue snapshot. Updated from
     /// `FromRadio::QueueStatus` events. `free` defaults to `u32::MAX`
@@ -84,9 +107,15 @@ struct Inner {
     /// Consumers (e.g. the chat UI) subscribe to track when individual
     /// outbound packets have actually been transmitted on air.
     pub(super) queue_status_tx: broadcast::Sender<types::QueueStatusEvent>,
+    /// Protocol-agnostic voice data (pre-filtered by port/version).
+    pub(super) voice_data_tx: broadcast::Sender<VoiceData>,
+    /// Protocol-agnostic queue events.
+    pub(super) queue_event_tx: broadcast::Sender<QueueEvent>,
     // Configuration sections, each updated when the device emits its
     // matching `Config` chunk during the want-config burst.
     pub(super) lora_tx: watch::Sender<Option<LoRaConfig>>,
+    /// Modem preset for adaptive pacing (derived from lora_tx).
+    pub(super) modem_preset_tx: watch::Sender<Option<ModemPreset>>,
     pub(super) device_tx: watch::Sender<Option<DeviceConfig>>,
     pub(super) position_tx: watch::Sender<Option<PositionConfig>>,
     pub(super) power_tx: watch::Sender<Option<PowerConfig>>,
@@ -97,19 +126,19 @@ struct Inner {
     pub(super) owner_tx: watch::Sender<Option<User>>,
     pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
     /// Configuration for serial port auto-reconnection. Set by
-    /// [`MeshService::connect_by_serial_baud`]; `None` = reconnect is not
+    /// [`MeshtasticService::connect_by_serial_baud`]; `None` = reconnect is not
     /// configured (e.g. BLE connection). Used by the silence-probe task to
     /// auto-reconnect when it detects a dead read path.
     pub(super) reconnect_config: Mutex<Option<SerialReconnectConfig>>,
     /// Notified when the silence probe triggers a reconnect. A dedicated
-    /// watcher task (spawned once in [`MeshService::new`]) consumes this
-    /// and calls [`MeshService::connect_by_serial_baud`] so the reconnect
+    /// watcher task (spawned once in [`MeshtasticService::new`]) consumes this
+    /// and calls [`MeshtasticService::connect_by_serial_baud`] so the reconnect
     /// doesn't create a `tokio::spawn` recursion through
     /// [`connect_with_transport`].
     pub(super) reconnect_request: Arc<Notify>,
 }
 
-impl MeshService {
+impl MeshtasticService {
     pub async fn new() -> Result<Self> {
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
         let (my_info_tx, _) = watch::channel(None);
@@ -123,7 +152,10 @@ impl MeshService {
         // and force a `Lagged` error. Each event is small (~16 B), so
         // the ~64 KB worst-case footprint is cheap.
         let (queue_status_tx, _) = broadcast::channel(4096);
+        let (voice_data_tx, _) = broadcast::channel(512);
+        let (queue_event_tx, _) = broadcast::channel(256);
         let (lora_tx, _) = watch::channel(None);
+        let (modem_preset_tx, _) = watch::channel(None);
         let (device_tx, _) = watch::channel(None);
         let (position_tx, _) = watch::channel(None);
         let (power_tx, _) = watch::channel(None);
@@ -135,7 +167,7 @@ impl MeshService {
         let (metadata_tx, _) = watch::channel(None);
         // The voice TX queue is bootstrapped here: build the channel,
         // wrap Inner in an Arc, then hand the worker a Weak<Inner> so
-        // it can shut down cleanly when the last MeshService clone drops.
+        // it can shut down cleanly when the last MeshtasticService clone drops.
         let (voice_tx_send, voice_tx_recv) = tokio::sync::mpsc::channel(voice_tx::QUEUE_CAPACITY);
         let reconnect_request = Arc::new(Notify::new());
         let inner = Arc::new(Inner {
@@ -163,7 +195,10 @@ impl MeshService {
             ),
             voice_tx: voice_tx_send,
             queue_status_tx,
+            voice_data_tx,
+            queue_event_tx,
             lora_tx,
+            modem_preset_tx,
             device_tx,
             position_tx,
             power_tx,
@@ -206,7 +241,7 @@ impl MeshService {
                     let Some(SerialReconnectConfig { path, baud }) = cfg else {
                         continue;
                     };
-                    let svc = MeshService { inner };
+                    let svc = MeshtasticService { inner };
                     #[cfg(feature = "serial-tokio")]
                     if let Err(e) = svc.connect_by_serial_baud(&path, baud).await {
                         warn!(?e, "auto-reconnect failed");
@@ -536,7 +571,7 @@ impl MeshService {
         let _ = self.inner.state_tx.send(state);
     }
 
-    /// Lazy-init the BLE adapter on first use. Lets `MeshService::new()`
+    /// Lazy-init the BLE adapter on first use. Lets `MeshtasticService::new()`
     /// succeed on machines without Bluetooth (serial-only setups, CI hosts,
     /// integration tests). Failures still surface to the caller of any
     /// BLE-touching method.
@@ -566,19 +601,20 @@ impl MeshService {
     }
 }
 
-/// Compile-time assertion that `MeshService` can be cloned across `tokio::spawn`
+/// Compile-time assertion that `MeshtasticService` can be cloned across `tokio::spawn`
 /// boundaries and shared between threads. Catches refactors that accidentally
 /// embed a `!Send` or `!Sync` field (e.g. `Rc`, `RefCell`, raw pointers).
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync + Clone + 'static>() {}
-    assert_send_sync::<MeshService>();
+    assert_send_sync::<MeshtasticService>();
 };
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     //! Service-level tests that don't need real BLE or serial hardware.
     //!
-    //! `MeshService::new()` lazy-inits the BLE adapter, so these tests can
+    //! `MeshtasticService::new()` lazy-inits the BLE adapter, so these tests can
     //! exercise inbound decoding and config-burst sequencing on any host.
 
     use super::*;
@@ -597,15 +633,17 @@ mod tests {
         buf
     }
 
-    async fn make_service() -> MeshService {
-        MeshService::new().await.expect("MeshService::new")
+    async fn make_service() -> MeshtasticService {
+        MeshtasticService::new()
+            .await
+            .expect("MeshtasticService::new")
     }
 
     /// Hold one receiver on every watch we inspect: tokio's `watch::Sender::send`
     /// returns `Err` (without updating the cached value) when all receivers
     /// have been dropped. In production the GUI/CLI is always subscribed; in
     /// tests we have to keep the receivers alive ourselves.
-    fn keep_alive(svc: &MeshService) -> Vec<Box<dyn std::any::Any + Send>> {
+    fn keep_alive(svc: &MeshtasticService) -> Vec<Box<dyn std::any::Any + Send>> {
         vec![
             Box::new(svc.watch_state()),
             Box::new(svc.watch_my_info()),
@@ -782,5 +820,117 @@ mod tests {
             prev_state,
             "state must revert when refresh fails"
         );
+    }
+}
+
+// RadioService trait implementation
+#[async_trait::async_trait]
+impl radio_service::RadioService for MeshtasticService {
+    async fn connect_with_transport(
+        &self,
+        transport: Arc<dyn Transport>,
+        inbound: mpsc::Receiver<Vec<u8>>,
+        settle_delay: Duration,
+    ) -> Result<()> {
+        Self::connect_with_transport(self, transport, inbound, settle_delay).await
+    }
+
+    async fn disconnect(&self) -> Result<()> {
+        Self::disconnect(self).await
+    }
+
+    fn my_node_id(&self) -> Option<NodeId> {
+        self.my_node_num().map(NodeId::from_u32)
+    }
+
+    fn watch_state(&self) -> watch::Receiver<RadioConnectionState> {
+        // NOTE: Both types are identical, so we can safely cast
+        // TODO: Unify the types in a future refactor
+        let mut rx = self.watch_state();
+        let (tx, rx_out) = watch::channel(unsafe {
+            std::mem::transmute::<types::ConnectionState, RadioConnectionState>(
+                ConnectionState::Disconnected,
+            )
+        });
+        tokio::spawn(async move {
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let state = *rx.borrow();
+                // Safe because ConnectionState in both modules is identical
+                let mapped = unsafe {
+                    std::mem::transmute::<types::ConnectionState, RadioConnectionState>(state)
+                };
+                let _ = tx.send(mapped);
+            }
+        });
+        rx_out
+    }
+
+    fn watch_nodes(&self) -> watch::Receiver<HashMap<NodeId, crate::node::NodeSummary>> {
+        // TODO: Transform watch_nodes() from HashMap<u32, NodeInfo> to HashMap<NodeId, NodeSummary>
+        // For now, return empty - this will be implemented in next phase
+        let (tx, rx) = watch::channel(HashMap::new());
+        let _ = tx; // Suppress unused warning
+        rx
+    }
+
+    fn watch_modem_preset(&self) -> watch::Receiver<Option<ModemPreset>> {
+        self.inner.modem_preset_tx.subscribe()
+    }
+
+    async fn send_text(&self, _text: &str, _channel: u32, _to: Option<NodeId>) -> Result<()> {
+        // TODO: Implement text sending through RadioService interface
+        Err(Error::Other(
+            "send_text not yet implemented via RadioService".into(),
+        ))
+    }
+
+    async fn send_voice_nack(
+        &self,
+        _frame: Vec<u8>,
+        _channel: u32,
+        _to_node: NodeId,
+    ) -> Result<()> {
+        // TODO: Implement NACK sending
+        Err(Error::Other("send_voice_nack not yet implemented".into()))
+    }
+
+    fn subscribe_text(&self) -> broadcast::Receiver<RadioIncomingText> {
+        // TODO: Transform from internal IncomingText to RadioIncomingText (NodeId wrapping)
+        // For now, return empty - this will be implemented in next phase
+        let (tx, rx) = broadcast::channel(64);
+        let _ = tx; // Suppress unused warning
+        rx
+    }
+
+    fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData> {
+        self.inner.voice_data_tx.subscribe()
+    }
+
+    fn subscribe_queue_event(&self) -> broadcast::Receiver<QueueEvent> {
+        self.inner.queue_event_tx.subscribe()
+    }
+}
+
+// VoiceFrameSink trait implementation
+#[async_trait::async_trait]
+impl crate::voice::sink::VoiceFrameSink for MeshtasticService {
+    async fn enqueue_voice_frame_with_id(
+        &self,
+        frame: Vec<u8>,
+        channel: u32,
+        to: Option<NodeId>,
+        want_ack: bool,
+        pacing: Duration,
+    ) -> Result<u32> {
+        let to_u32 = to.map(|id| id.as_u32());
+        self.enqueue_voice_frame_with_id(frame, channel, to_u32, want_ack, pacing)
+            .await
+    }
+
+    fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData> {
+        <Self as radio_service::RadioService>::subscribe_voice_data(self)
     }
 }

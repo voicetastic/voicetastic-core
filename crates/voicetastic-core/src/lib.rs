@@ -17,23 +17,25 @@
 //! - [`service`]: high-level [`MeshService`](service::MeshService) façade.
 //! - [`error`]: unified error type.
 
+pub mod codec;
 pub mod error;
-pub mod ids;
-pub mod ports;
-pub mod proto;
 pub mod settings;
 pub mod transport;
 pub mod voice;
 
-pub mod codec;
+pub mod meshtastic;
+pub mod node;
+pub mod radio_service;
 
+// Backward-compat re-exports (migrate to meshtastic:: prefix over time)
 #[cfg(feature = "ble-btleplug")]
-pub mod ble;
+pub use meshtastic::ble;
 #[cfg(all(feature = "ble-btleplug", target_os = "linux"))]
-pub mod pairing;
+pub use meshtastic::pairing;
 #[cfg(feature = "serial-tokio")]
-pub mod serial;
-pub mod service;
+pub use meshtastic::serial;
+pub use meshtastic::service::ConnectionState;
+pub use meshtastic::{MeshtasticService, ids, ports, proto, service};
 
 pub use error::{Error, Result};
 pub use transport::Transport;

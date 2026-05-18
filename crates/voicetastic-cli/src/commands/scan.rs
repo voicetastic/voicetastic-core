@@ -5,8 +5,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tracing::info;
 
+use voicetastic_core::MeshtasticService;
 use voicetastic_core::ble::DiscoveredDevice;
-use voicetastic_core::service::MeshService;
 
 pub async fn run(seconds: u64) -> Result<()> {
     // Show available serial ports first
@@ -19,7 +19,7 @@ pub async fn run(seconds: u64) -> Result<()> {
         println!();
     }
 
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     let mut rx = svc.scan().await?;
     info!(seconds, "scanning for BLE Meshtastic devices");
     println!("BLE devices:");

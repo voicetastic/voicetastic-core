@@ -584,7 +584,7 @@ impl Connection {
     }
 }
 
-// Wire `Connection` into the cross-transport `MeshService` plumbing. The
+// Wire `Connection` into the cross-transport `MeshtasticService` plumbing. The
 // inherent methods above are kept (and remain the canonical API for direct
 // BLE callers); this `impl` is a zero-cost forwarding shim so a
 // `Arc<Connection>` can be stored as `Arc<dyn crate::Transport>`.

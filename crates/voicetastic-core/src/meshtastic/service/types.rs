@@ -1,4 +1,4 @@
-//! Public value types and small helpers used by [`super::MeshService`].
+//! Public value types and small helpers used by [`super::MeshtasticService`].
 
 use crate::proto::{NodeInfo, User};
 

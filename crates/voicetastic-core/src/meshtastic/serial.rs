@@ -200,7 +200,7 @@ impl SerialConnection {
     }
 }
 
-// Wire `SerialConnection` into the cross-transport `MeshService` plumbing.
+// Wire `SerialConnection` into the cross-transport `MeshtasticService` plumbing.
 // See the analogous impl in `crate::ble`.
 #[async_trait::async_trait]
 impl crate::Transport for SerialConnection {

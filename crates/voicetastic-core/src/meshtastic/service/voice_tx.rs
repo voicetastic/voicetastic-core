@@ -20,7 +20,7 @@
 //!
 //! ## Pacing measurement
 //!
-//! `last_send` is the instant the underlying [`MeshService::send_data`]
+//! `last_send` is the instant the underlying [`MeshtasticService::send_data`]
 //! call returned, i.e. when the transport (BLE / serial) accepted the
 //! frame — not when the radio finished transmitting it. The configured
 //! `pacing` values include enough headroom (airtime + ~30 %) that the
@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::ports::PRIVATE_APP;
 
 use super::Inner;
-use super::MeshService;
+use super::MeshtasticService;
 
 /// One voice frame waiting to be sent.
 pub(super) struct VoiceTxItem {
@@ -76,9 +76,9 @@ pub(super) const RADIO_QUEUE_LOW_WATER: u32 = 2;
 pub(super) const RADIO_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Spawn the FIFO worker. The worker holds only a `Weak<Inner>` so
-/// dropping the last external [`MeshService`] clone tears it down
+/// dropping the last external [`MeshtasticService`] clone tears it down
 /// cleanly. The receiver half of the channel is created in
-/// [`MeshService::new`] so the producer end can be stored inside
+/// [`MeshtasticService::new`] so the producer end can be stored inside
 /// `Inner` without a bootstrap cycle.
 pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem>) {
     tokio::spawn(async move {
@@ -94,7 +94,7 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
                 }
             }
             // Re-anchor a strong handle every iteration so the worker
-            // exits as soon as the last external `MeshService` is gone.
+            // exits as soon as the last external `MeshtasticService` is gone.
             let Some(inner) = weak.upgrade() else { break };
             // Firmware-driven backpressure. The radio publishes a
             // `QueueStatus { free, maxlen }` after every accept/drain.
@@ -142,7 +142,7 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
                     break;
                 }
             }
-            let svc = MeshService { inner };
+            let svc = MeshtasticService { inner };
             let frame_len = item.frame.len();
             let send_start = Instant::now();
             let res = svc
@@ -184,7 +184,7 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
     });
 }
 
-impl MeshService {
+impl MeshtasticService {
     /// Enqueue a single voice frame for paced transmission. Returns once
     /// the item is in the queue; the actual radio send happens later on
     /// the worker task. Use [`Self::enqueue_voice_frame_with_id`] if you

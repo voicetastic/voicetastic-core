@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use voicetastic_core::ble::DiscoveredDevice;
+use voicetastic_core::meshtastic::service::ConnectionState;
 #[cfg(target_os = "linux")]
 use voicetastic_core::pairing::{PairingPromptKind, PairingResponse};
 use voicetastic_core::proto::{
@@ -10,7 +11,6 @@ use voicetastic_core::proto::{
         PowerConfig,
     },
 };
-use voicetastic_core::service::ConnectionState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {

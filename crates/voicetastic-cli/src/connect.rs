@@ -6,11 +6,12 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tracing::info;
 
-use voicetastic_core::service::{ConnectionState, MeshService};
+use voicetastic_core::MeshtasticService;
+use voicetastic_core::meshtastic::service::ConnectionState;
 
 use crate::util::is_serial;
 
-pub async fn connect(svc: &MeshService, device: &str) -> Result<()> {
+pub async fn connect(svc: &MeshtasticService, device: &str) -> Result<()> {
     if is_serial(device) {
         info!(port = device, "connecting via serial");
         svc.connect_by_serial(device).await?;
@@ -61,7 +62,7 @@ pub async fn connect(svc: &MeshService, device: &str) -> Result<()> {
     }
 }
 
-/// Background task that drains `MeshService::pairing_prompts()` and
+/// Background task that drains `MeshtasticService::pairing_prompts()` and
 /// answers each prompt by reading from the controlling terminal.
 ///
 /// Spawned by [`connect`] before the BLE link is brought up so the
@@ -69,13 +70,13 @@ pub async fn connect(svc: &MeshService, device: &str) -> Result<()> {
 /// waiting. The task exits once the receiver is closed (i.e. when the
 /// `MeshService` drops, normally at process exit).
 ///
-/// Best-effort: if the agent failed to register at `MeshService::new`
+/// Best-effort: if the agent failed to register at `MeshtasticService::new`
 /// (e.g. headless system with no DBus session, or another process
 /// holds the default agent), `pairing_prompts()` returns `None` and
 /// we silently no-op. The user will then see the usual
 /// "BlueZ pairing agent not registered" error from `prepare_link`.
 #[cfg(target_os = "linux")]
-fn spawn_pairing_prompt_handler(svc: MeshService) {
+fn spawn_pairing_prompt_handler(svc: MeshtasticService) {
     use std::io::{Write, stderr, stdin};
     use voicetastic_core::pairing::{PairingPromptKind, PairingResponse};
 

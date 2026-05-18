@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use voicetastic_core::service::MeshService;
+use voicetastic_core::MeshtasticService;
 
 use crate::app::VoicetasticApp;
 
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     })?);
 
     let service = rt
-        .block_on(async { MeshService::new().await })
+        .block_on(async { MeshtasticService::new().await })
         .map_err(|e| {
             error!(error = %e, "failed to initialise MeshService");
             e

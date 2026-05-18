@@ -6,9 +6,11 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tracing::warn;
 
+use voicetastic_core::MeshtasticService;
 use voicetastic_core::ids::{node_id_to_num, node_num_to_id};
+use voicetastic_core::meshtastic::service::modem_preset_from_proto;
+use voicetastic_core::node::NodeId;
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
-use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
     AssemblyEvent, ModemPreset as VoiceModemPreset, PROTOCOL_VERSION, VoiceAssembler,
     VoiceDestination, VoiceMessage, detect_version,
@@ -46,7 +48,7 @@ macro_rules! spawn_watch {
 
 pub fn spawn_watchers(
     rt: &Runtime,
-    svc: &MeshService,
+    svc: &MeshtasticService,
     shared: Arc<Mutex<SharedState>>,
     ctx: egui::Context,
     assembler: Arc<VoiceAssembler>,
@@ -344,7 +346,7 @@ pub fn spawn_watchers(
                             let to = if d.to == BROADCAST_ADDR {
                                 VoiceDestination::Broadcast
                             } else {
-                                VoiceDestination::Node(d.to)
+                                VoiceDestination::Node(NodeId::from_u32(d.to))
                             };
                             match assembler.accept(&from_id, to, d.channel, &d.payload) {
                                 AssemblyEvent::Complete(m) => push_voice_entry(&s, &c, &m),
@@ -432,7 +434,7 @@ fn apply_lora_to_assembler(
     current_pacing: &Mutex<Duration>,
 ) {
     let pacing = lora
-        .and_then(|l| VoiceModemPreset::from_proto(l.modem_preset))
+        .and_then(|l| modem_preset_from_proto(l.modem_preset))
         .map(VoiceModemPreset::pacing)
         .unwrap_or_else(VoiceModemPreset::fallback_pacing);
     *current_pacing.lock() = pacing;
@@ -478,7 +480,7 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
     let from_num = node_id_to_num(&msg.from).unwrap_or(0);
     let to_num = match msg.to {
         VoiceDestination::Broadcast => BROADCAST_ADDR,
-        VoiceDestination::Node(n) => n,
+        VoiceDestination::Node(n) => n.as_u32(),
     };
     let mut st = s.lock();
     // If a "receiving …" placeholder was already pushed for this

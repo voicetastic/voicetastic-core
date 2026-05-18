@@ -4,6 +4,7 @@ use std::sync::Arc;
 use eframe::egui;
 use parking_lot::Mutex;
 
+use voicetastic_core::meshtastic::service::modem_preset_from_proto;
 use voicetastic_core::ports::BROADCAST_ADDR;
 use voicetastic_core::proto::{
     Channel, NodeInfo, channel::Role, config::LoRaConfig, config::lo_ra_config::ModemPreset,
@@ -357,7 +358,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
 }
 
 /// Route the destination channel/node for the active thread to a
-/// `(channel, dest)` pair compatible with `MeshService::send_voice`.
+/// `(channel, dest)` pair compatible with `MeshtasticService::send_voice`.
 fn resolve_destination(
     app: &VoicetasticApp,
     nodes: &std::collections::HashMap<u32, voicetastic_core::proto::NodeInfo>,
@@ -596,7 +597,7 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         .lock()
         .lora
         .as_ref()
-        .and_then(|l: &LoRaConfig| VoiceModemPreset::from_proto(l.modem_preset));
+        .and_then(|l: &LoRaConfig| modem_preset_from_proto(l.modem_preset));
     let chunk_size = preset
         .map(VoiceModemPreset::recommended_chunk_size)
         .unwrap_or(MAX_BODY_SIZE);

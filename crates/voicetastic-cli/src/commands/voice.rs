@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
+use voicetastic_core::MeshtasticService;
 use voicetastic_core::ports::PRIVATE_APP;
-use voicetastic_core::service::MeshService;
 use voicetastic_core::voice::{
     AssemblerConfig, AssemblyEvent, PROTOCOL_VERSION, SendRequest, SendStatus, VoiceAssembler,
     VoiceCodec, VoiceDestination, VoiceMessage, VoiceSender, detect_version,
@@ -54,7 +54,7 @@ pub async fn send(
         bail!("file {} contains no audio frames", file.display());
     }
 
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
 
     // `VoiceSender` owns build → register → burst → NACK-driven
@@ -141,7 +141,7 @@ pub async fn listen(device: &str, out_dir: &Path, format: &str) -> Result<()> {
     if !base_dir.is_dir() {
         bail!("--out-dir {} is not a directory", base_dir.display());
     }
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
     let assembler = VoiceAssembler::new({
         let mut cfg = AssemblerConfig::default();
@@ -191,7 +191,7 @@ pub async fn listen(device: &str, out_dir: &Path, format: &str) -> Result<()> {
                     let to = if d.to == voicetastic_core::ports::BROADCAST_ADDR {
                         VoiceDestination::Broadcast
                     } else {
-                        VoiceDestination::Node(d.to)
+                        VoiceDestination::Node(voicetastic_core::node::NodeId::from_u32(d.to))
                     };
                     match assembler.accept(&from_id, to, d.channel, &d.payload) {
                         AssemblyEvent::Complete(msg) => save_voice(&base_dir, &msg).await?,

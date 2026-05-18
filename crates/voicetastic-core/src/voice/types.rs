@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::consts::MAX_BODY_SIZE;
+use crate::node::NodeId;
 
 /// `packet_type` (top 2 bits of `type_flags`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,7 +77,7 @@ impl VoiceCodec {
 /// Destination of a voice message: a specific node or the channel broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VoiceDestination {
-    Node(u32),
+    Node(NodeId),
     Broadcast,
 }
 
@@ -137,27 +138,5 @@ impl ModemPreset {
     /// Default fallback when the radio's preset is unknown.
     pub fn fallback_pacing() -> Duration {
         Duration::from_millis(500)
-    }
-
-    /// Map the firmware's `LoRaConfig.modem_preset` enum value (i32) to
-    /// our local enum. Returns `None` for unknown values so callers can
-    /// fall back to safe defaults.
-    ///
-    /// Mirrors `meshtastic.Config.LoRaConfig.ModemPreset` integer values.
-    pub fn from_proto(value: i32) -> Option<Self> {
-        // SAFETY: numeric values come straight from the .proto enum.
-        // Keep this match in sync with `proto/meshtastic/config.proto`.
-        Some(match value {
-            0 => Self::LongFast,
-            1 => Self::LongSlow,
-            2 => Self::VeryLongSlow,
-            3 => Self::MediumSlow,
-            4 => Self::MediumFast,
-            5 => Self::ShortSlow,
-            6 => Self::ShortFast,
-            7 => Self::LongModerate,
-            8 => Self::ShortTurbo,
-            _ => return None,
-        })
     }
 }

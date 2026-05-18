@@ -5,7 +5,7 @@
 //! The voice-protocol primitives exposed in PR-MVP (`build_message`,
 //! `VoiceAssembler`) are fully synchronous and do not need a runtime.
 //! Starting with PR 1 the bridge will also expose
-//! `voicetastic_core::service::MeshService`, which internally relies on
+//! `voicetastic_core::MeshtasticService`, which internally relies on
 //! `tokio::spawn` and `tokio::sync::{mpsc, watch, broadcast}`. Those
 //! primitives require a running multi-thread reactor.
 //!

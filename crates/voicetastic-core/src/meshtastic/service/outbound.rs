@@ -12,11 +12,11 @@ use crate::proto::{
     config, mesh_packet, to_radio,
 };
 
-use super::MeshService;
+use super::MeshtasticService;
 use super::types::rand_u32;
 use crate::transport::Transport;
 
-impl MeshService {
+impl MeshtasticService {
     pub(super) async fn send_want_config(&self) -> Result<()> {
         let nonce: u32 = rand_u32()?;
         debug!(nonce, "sending want_config_id");

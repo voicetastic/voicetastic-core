@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use voicetastic_core::node::NodeId;
 use voicetastic_core::settings as s;
 use voicetastic_core::voice as v;
 
@@ -292,7 +293,7 @@ impl From<v::VoiceMessage> for VoiceMessageOut {
     fn from(m: v::VoiceMessage) -> Self {
         let (broadcast, to_node) = match m.to {
             v::VoiceDestination::Broadcast => (true, 0),
-            v::VoiceDestination::Node(n) => (false, n),
+            v::VoiceDestination::Node(n) => (false, n.as_u32()),
         };
         Self {
             message_id: m.message_id,
@@ -478,7 +479,7 @@ impl VoiceAssembler {
         let to = if broadcast {
             v::VoiceDestination::Broadcast
         } else {
-            v::VoiceDestination::Node(to_node)
+            v::VoiceDestination::Node(NodeId::from_u32(to_node))
         };
         self.0.accept(&from, to, channel, &frame).into()
     }
@@ -703,7 +704,7 @@ pub struct VoiceSender {
 impl VoiceSender {
     /// Construct bound to `svc`. Spawns the internal NACK listener
     /// task on the bridge's static tokio runtime.
-    pub(crate) fn new(svc: voicetastic_core::service::MeshService) -> Self {
+    pub(crate) fn new(svc: voicetastic_core::MeshtasticService) -> Self {
         Self {
             inner: v::VoiceSender::new_on(svc, crate::runtime::runtime().handle().clone()),
         }

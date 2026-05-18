@@ -10,7 +10,7 @@ use crate::proto::{
     AdminMessage, FromRadio, MeshPacket, PortNum, admin_message, config, from_radio, mesh_packet,
 };
 
-use super::{ConnectionState, IncomingData, IncomingText, MeshService};
+use super::{ConnectionState, IncomingData, IncomingText, MeshtasticService};
 
 /// Latitude bounds in fixed-point 1e-7 degrees: [-90°, +90°].
 const LAT_I_MIN: i32 = -900_000_000;
@@ -26,7 +26,7 @@ fn lon_i_in_range(v: i32) -> bool {
     (LON_I_MIN..=LON_I_MAX).contains(&v)
 }
 
-impl MeshService {
+impl MeshtasticService {
     pub(super) async fn handle_from_radio(&self, bytes: &[u8]) -> Result<()> {
         let msg = FromRadio::decode(bytes)?;
         let Some(variant) = msg.payload_variant else {

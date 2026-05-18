@@ -35,9 +35,9 @@ use eframe::egui;
 use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 
+use voicetastic_core::MeshtasticService;
 use voicetastic_core::Result as CoreResult;
 use voicetastic_core::proto::config;
-use voicetastic_core::service::MeshService;
 
 use crate::app::VoicetasticApp;
 use crate::state::{Section, SharedState};
@@ -49,7 +49,7 @@ use crate::state::{Section, SharedState};
 /// Bundles everything every section helper needs. Cheap to pass by reference.
 pub(super) struct Ctx<'a> {
     pub(super) rt: &'a Arc<Runtime>,
-    pub(super) svc: &'a MeshService,
+    pub(super) svc: &'a MeshtasticService,
     pub(super) shared: &'a Arc<Mutex<SharedState>>,
 }
 
@@ -117,7 +117,7 @@ pub(super) fn card<T, R, W>(
 ) where
     T: Clone + Send + 'static,
     R: FnOnce(&mut egui::Ui, &mut T) -> bool,
-    W: FnOnce(MeshService, T) -> ApplyFut + Send + 'static,
+    W: FnOnce(MeshtasticService, T) -> ApplyFut + Send + 'static,
 {
     egui::CollapsingHeader::new(meta.title)
         .id_salt(meta.id)
@@ -142,7 +142,7 @@ pub(super) fn card<T, R, W>(
 pub(super) fn spawn_apply<T, W>(ctx: &Ctx<'_>, section: Section, name: &str, value: T, write: W)
 where
     T: Send + 'static,
-    W: FnOnce(MeshService, T) -> ApplyFut + Send + 'static,
+    W: FnOnce(MeshtasticService, T) -> ApplyFut + Send + 'static,
 {
     let svc = ctx.svc.clone();
     let shared = Arc::clone(ctx.shared);
@@ -161,14 +161,17 @@ where
 }
 
 /// Tiny convenience for sections that write a `Config` payload variant.
-pub(super) fn write_config_fut(svc: MeshService, payload: config::PayloadVariant) -> ApplyFut {
+pub(super) fn write_config_fut(
+    svc: MeshtasticService,
+    payload: config::PayloadVariant,
+) -> ApplyFut {
     Box::pin(async move { svc.write_config(payload).await.map(|_| ()) })
 }
 
 /// Fire-and-forget admin call that just updates `config_status`.
 pub(super) fn run_status<F>(ctx: &Ctx<'_>, name: &str, fut_ctor: F)
 where
-    F: FnOnce(MeshService) -> ApplyFut + Send + 'static,
+    F: FnOnce(MeshtasticService) -> ApplyFut + Send + 'static,
 {
     let svc = ctx.svc.clone();
     let shared = Arc::clone(ctx.shared);

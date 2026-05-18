@@ -2,13 +2,14 @@
 
 use anyhow::{Result, bail};
 
+use voicetastic_core::MeshtasticService;
 use voicetastic_core::ids::node_num_to_id;
-use voicetastic_core::service::{MeshService, node_long_name};
+use voicetastic_core::meshtastic::service::node_long_name;
 
 use crate::connect::connect;
 
 pub async fn info(device: &str) -> Result<()> {
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
 
     if let Some(info) = svc.watch_my_info().borrow().as_ref() {
@@ -47,7 +48,7 @@ pub async fn info(device: &str) -> Result<()> {
 }
 
 pub async fn reboot(device: &str, secs: u32) -> Result<()> {
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
     let id = svc.reboot(secs as i32).await?;
     println!("reboot scheduled in {secs}s (admin id={id})");
@@ -59,7 +60,7 @@ pub async fn factory_reset(device: &str, confirmed: bool) -> Result<()> {
     if !confirmed {
         bail!("refusing to factory-reset without --yes");
     }
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
     let id = svc.factory_reset().await?;
     println!("factory reset sent (admin id={id})");

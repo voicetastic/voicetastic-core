@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 
-use voicetastic_core::service::ConnectionState;
+use voicetastic_core::meshtastic::service::ConnectionState;
 
 use super::{Ctx, run_status};
 

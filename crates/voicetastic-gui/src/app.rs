@@ -5,7 +5,8 @@ use parking_lot::Mutex;
 use tokio::runtime::Runtime;
 use tracing::error;
 
-use voicetastic_core::service::{ConnectionState, MeshService};
+use voicetastic_core::MeshtasticService;
+use voicetastic_core::meshtastic::service::ConnectionState;
 use voicetastic_core::settings::{SettingKey, SettingsApi, SettingsListener};
 use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceSender};
 
@@ -26,7 +27,7 @@ pub enum PlaybackSource {
 
 pub struct VoicetasticApp {
     pub rt: Arc<Runtime>,
-    pub service: MeshService,
+    pub service: MeshtasticService,
     pub shared: Arc<Mutex<SharedState>>,
     pub tab: Tab,
     // Devices tab
@@ -59,7 +60,11 @@ pub struct VoicetasticApp {
 }
 
 impl VoicetasticApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, rt: Arc<Runtime>, service: MeshService) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        rt: Arc<Runtime>,
+        service: MeshtasticService,
+    ) -> Self {
         let shared = Arc::new(Mutex::new(SharedState::default()));
         let settings = SettingsApi::open();
         // NB: the `..AssemblerConfig::default()` spread is safe here because

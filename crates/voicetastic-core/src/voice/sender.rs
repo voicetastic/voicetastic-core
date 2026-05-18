@@ -12,13 +12,13 @@
 //! 2. Registers them with the shared [`OutgoingVoiceRegistry`] so NACKs
 //!    can be serviced.
 //! 3. Spawns a background task that paces the initial burst through
-//!    [`MeshService::enqueue_voice_frame_with_id`].
+//!    [`MeshtasticService::enqueue_voice_frame_with_id`].
 //! 4. Listens on `subscribe_data()` for inbound NACKs targeting any of
 //!    its in-flight messages; dispatches retransmits through the same
 //!    paced, QueueStatus-gated path as the original burst.
 //! 5. Emits a stream of [`SendStatus`] events the frontend can render.
 //!
-//! The "shared model" means **one** [`VoiceSender`] per [`MeshService`]
+//! The "shared model" means **one** [`VoiceSender`] per [`MeshtasticService`]
 //! handles every concurrent send. A single NACK-listener task watches
 //! the data broadcast and dispatches by `message_id`, instead of one
 //! task per send fighting over the same channel.
@@ -56,8 +56,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, info, warn};
 
+use crate::meshtastic::MeshtasticService;
 use crate::ports::PRIVATE_APP;
-use crate::service::MeshService;
 use crate::voice::builder::{BuildConfig, build_message, random_message_id};
 use crate::voice::consts::MAX_BODY_SIZE;
 use crate::voice::crypto::{EnvelopeKey, derive_key};
@@ -111,7 +111,7 @@ pub struct SendRequest {
     pub last_in_stream: bool,
     /// Optional override for the inter-frame TX pacing. `None` lets
     /// the sender read the current modem preset off
-    /// [`MeshService::watch_lora_config`]; if that snapshot isn't
+    /// [`MeshtasticService::watch_lora_config`]; if that snapshot isn't
     /// available yet we fall back to [`ModemPreset::fallback_pacing`].
     pub pacing: Option<Duration>,
     /// Channel PSK for the trailing 4-byte header MAC. `Some(psk)` ⇒
@@ -268,13 +268,13 @@ struct ActiveSend {
     identical_nack_count: u8,
 }
 
-/// Shared outbound voice pipeline. One instance per [`MeshService`].
+/// Shared outbound voice pipeline. One instance per [`MeshtasticService`].
 ///
 /// Internally `Arc`'d — the background NACK-listener task holds a
 /// `Weak` reference and shuts down once the last external clone of
 /// the sender drops.
 pub struct VoiceSender {
-    svc: MeshService,
+    svc: MeshtasticService,
     registry: Arc<OutgoingVoiceRegistry>,
     active: Mutex<HashMap<u32, ActiveSend>>,
     /// Tokio runtime handle captured at construction. All background
@@ -297,13 +297,13 @@ impl VoiceSender {
     /// runtime [`Handle`] can be captured). Frontends running off the
     /// runtime thread (egui UI, JNI callbacks) should wrap the call in
     /// `rt.enter()` or use [`Self::new_on`].
-    pub fn new(svc: MeshService) -> Arc<Self> {
+    pub fn new(svc: MeshtasticService) -> Arc<Self> {
         Self::new_on(svc, Handle::current())
     }
 
     /// Like [`Self::new`] but takes an explicit runtime [`Handle`].
     /// Use this when no runtime is entered on the calling thread.
-    pub fn new_on(svc: MeshService, rt: Handle) -> Arc<Self> {
+    pub fn new_on(svc: MeshtasticService, rt: Handle) -> Arc<Self> {
         let sender = Arc::new(Self {
             svc: svc.clone(),
             registry: Arc::new(OutgoingVoiceRegistry::default()),
@@ -412,7 +412,7 @@ impl VoiceSender {
             .watch_lora_config()
             .borrow()
             .as_ref()
-            .and_then(|l| ModemPreset::from_proto(l.modem_preset));
+            .and_then(|l| crate::meshtastic::service::modem_preset_from_proto(l.modem_preset));
         preset
             .map(ModemPreset::pacing)
             .unwrap_or_else(ModemPreset::fallback_pacing)

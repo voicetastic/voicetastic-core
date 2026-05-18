@@ -42,6 +42,7 @@ pub mod message;
 pub mod nack;
 pub mod outgoing;
 pub mod sender;
+pub mod sink;
 pub mod types;
 
 pub use assembler::{AssemblerConfig, OutboundNack, TickOutput, VoiceAssembler};

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-//! UniFFI surface for `voicetastic_core::service::MeshService`.
+//! UniFFI surface for `voicetastic_core::MeshtasticService`.
 //!
 //! ## Threading model
 //!
-//! Kotlin sees a synchronous API: `MeshService::connect` returns once the
+//! Kotlin sees a synchronous API: `MeshtasticService::connect` returns once the
 //! transport has been registered; per-call methods (`send_text`, …) block
 //! until the underlying tokio future resolves. All blocking is done on the
 //! shared `runtime()`; we never block a JVM thread on I/O for longer than
@@ -36,12 +36,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::warn;
 
-use voicetastic_core::proto::{AdminMessage, Channel, Config, MyNodeInfo, NodeInfo, User, config};
-use voicetastic_core::service::{
+use voicetastic_core::MeshtasticService as CoreMeshService;
+use voicetastic_core::meshtastic::service::{
     ConnectionState as CoreConnState, IncomingData as CoreIncomingData,
-    IncomingText as CoreIncomingText, MeshService as CoreMeshService,
-    QueueStatusEvent as CoreQueueStatusEvent,
+    IncomingText as CoreIncomingText, QueueStatusEvent as CoreQueueStatusEvent,
 };
+use voicetastic_core::proto::{AdminMessage, Channel, Config, MyNodeInfo, NodeInfo, User, config};
 use voicetastic_core::transport::Transport;
 use voicetastic_core::voice as v;
 
@@ -279,7 +279,7 @@ pub trait MeshConfigListener: Send + Sync {
 // MeshTransportSink — Rust object Kotlin pushes inbound frames into.
 // -----------------------------------------------------------------------------
 
-/// Handle returned by [`MeshService::connect`]. Kotlin's BLE / serial
+/// Handle returned by [`MeshtasticService::connect`]. Kotlin's BLE / serial
 /// callback path calls [`MeshTransportSink::push_inbound`] for every
 /// decoded `FromRadio` frame; calling [`MeshTransportSink::shutdown`]
 /// signals EOF (e.g. on BLE disconnect) and moves the service to
@@ -418,7 +418,7 @@ pub struct MeshService {
 }
 
 impl MeshService {
-    /// Build a fresh service. `core::MeshService::new` is async only
+    /// Build a fresh service. `core::MeshtasticService::new` is async only
     /// because it constructs a few tokio primitives; we block on it once
     /// here so the Kotlin constructor stays synchronous.
     pub fn new() -> Result<Self, MeshServiceError> {
@@ -533,7 +533,7 @@ impl MeshService {
     /// Send an already-encoded `AdminMessage` protobuf payload. Kotlin
     /// builds the message with its geeksville-mesh codegen and passes the
     /// serialized bytes. We decode just enough to re-route into
-    /// `MeshService::send_admin`, which handles the `to=my_node_num`
+    /// `MeshtasticService::send_admin`, which handles the `to=my_node_num`
     /// framing.
     pub fn write_admin(&self, admin_proto: Vec<u8>) -> Result<u32, MeshServiceError> {
         let admin = AdminMessage::decode(admin_proto.as_slice()).map_err(|e| {

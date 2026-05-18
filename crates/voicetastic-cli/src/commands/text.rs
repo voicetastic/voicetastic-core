@@ -3,12 +3,12 @@
 use anyhow::Result;
 use tracing::info;
 
-use voicetastic_core::service::MeshService;
+use voicetastic_core::MeshtasticService;
 
 use crate::connect::connect;
 
 pub async fn send(device: &str, channel: u32, to: Option<u32>, body: &str) -> Result<()> {
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
     let id = svc.send_text(body, channel, to).await?;
     println!("sent text id={id}");
@@ -17,7 +17,7 @@ pub async fn send(device: &str, channel: u32, to: Option<u32>, body: &str) -> Re
 }
 
 pub async fn listen(device: &str) -> Result<()> {
-    let svc = MeshService::new().await?;
+    let svc = MeshtasticService::new().await?;
     connect(&svc, device).await?;
     let mut rx = svc.subscribe_text();
     info!("listening for text messages, ctrl-c to stop");
