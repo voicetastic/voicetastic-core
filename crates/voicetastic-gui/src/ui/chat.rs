@@ -590,8 +590,8 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
     // MAX_BODY_SIZE (219 B) on slow presets like LongFast/LongModerate
     // pushes each frame's airtime past 1 s, so a fixed 500 ms pacing
     // overruns the firmware queue and most chunks are dropped before they
-    // ever hit the air. The recommended pairing comes from VOICE_PROTOCOL.md
-    // §2.1 / §4 and matches what the Android app uses.
+    // ever hit the air. The recommended pairing comes from the Voice-Protocol
+    // wiki page §2.1 / §4 and matches what the Android app uses.
     let preset = app
         .shared
         .lock()

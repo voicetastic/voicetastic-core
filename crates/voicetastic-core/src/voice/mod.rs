@@ -1,6 +1,5 @@
-//! Voice protocol — see [`VOICE_PROTOCOL.md`](../../../../VOICE_PROTOCOL.md)
-//! at the repository root for the wire-format spec; this module is the
-//! reference implementation.
+//! Voice protocol — see the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol)
+//! for the wire-format spec; this module is the reference implementation.
 //!
 //! This module is **codec-free**: it ships, reassembles, and FEC-protects
 //! opaque codec frame bytes. AMR-NB, Opus, etc. encoding/decoding and

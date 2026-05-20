@@ -3,7 +3,7 @@
 //! After [`crate::voice::build_message`] produces an [`EncodedMessage`],
 //! the sender pushes every frame onto the wire and then the Meshtastic
 //! firmware *forgets* the packet. The wire protocol relies on
-//! NACK-driven selective retransmission (`VOICE_PROTOCOL.md` §5): when a
+//! NACK-driven selective retransmission (Voice-Protocol wiki page §5): when a
 //! receiver can't recover a message via FEC alone it emits a bitmap
 //! NACK and expects the sender to ship the missing DATA chunks back.
 //!

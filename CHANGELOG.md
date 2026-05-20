@@ -81,7 +81,7 @@ Release notes for past `vX.Y.Z` tags are available in the project's
   `HMAC-SHA256(channel_psk, header[0..12])[..4]` when a PSK is
   configured, unkeyed `SHA-256(header[0..12])[..4]` otherwise.
   Selected by the new `mac_keyed` flag bit (`0x08`). New
-  [`docs/wiki/Header-MAC-Future-Work.md`](docs/wiki/Header-MAC-Future-Work.md)
+  [Header-MAC-Future-Work wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Header-MAC-Future-Work)
   enumerates per-sender / per-message key-scoping options for future
   work.
 

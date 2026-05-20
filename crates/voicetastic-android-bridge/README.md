@@ -79,4 +79,4 @@ cargo run --bin uniffi-bindgen -- generate \
 In the Android Gradle build this is automated by a task that emits the
 generated wrapper into `app/build/generated/source/uniffi/`.
 ## Wire format
-See [`VOICE_PROTOCOL.md`](../../VOICE_PROTOCOL.md) at the workspace root.
+See the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol).
