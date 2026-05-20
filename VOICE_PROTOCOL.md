@@ -587,7 +587,7 @@ container themselves if needed (e.g. `#!AMR\n` for AMR-NB playback).
 | Confidentiality                  | delegated to Meshtastic channel AES-CTR | no per-message envelope at this layer |
 | Header integrity                 | SHA-256[..4] (unkeyed) | catches bit-flips against AES-CTR malleability |
 | FEC                              | RS over GF(2⁸)  | survives any `parity_count` losses      |
-| Max NACK rounds                  | 32 cumulative  | bounds total airtime per message        |
+| Max NACK rounds                  | 400 cumulative  | bounds total airtime per message        |
 | Codec                            | application-decided | protocol carries opaque bytes        |
 
 The protocol explicitly does **not** provide:

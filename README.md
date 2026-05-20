@@ -106,15 +106,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 Voice messages are captured live from the microphone, encoded, and protected with
 FEC (Reed-Solomon), then chunked into ≤ 215-byte Meshtastic data packets sent
-over `PortNum::PRIVATE_APP` with a **16-byte v2 header** (protocol version `0x02`),
+over `PortNum::PRIVATE_APP` with a **16-byte v3 header** (protocol version `0x03`),
 see [`VOICE_PROTOCOL.md`](VOICE_PROTOCOL.md). Four codecs are supported:
 
-| Codec    | Wire id | Rate    | Bitrates                          | Notes                                  |
-|----------|---------|---------|-----------------------------------|----------------------------------------|
-| AMR-NB   | `1`     | 8 kHz   | 4.75 – 12.2 kbps (8 modes)        | Default. Wire-compatible with Android. |
-| PCM_S16LE | `2`    | 48 kHz  | 768 kbps                          | Raw PCM; not recommended for LoRa.     |
-| Opus     | `3`     | 48 kHz  | 6 – 64 kbps (configurable)        | Wideband; larger payloads.             |
-| Codec2   | `4`     | 8 kHz   | 1.2 – 3.2 kbps (6 modes)          | Most LoRa-friendly bitrates.           |
+| Codec     | Wire id | Rate    | Bitrates                          | Notes                                  |
+|-----------|---------|---------|-----------------------------------|----------------------------------------|
+| AMR-NB    | `0`     | 8 kHz   | 4.75 – 12.2 kbps (8 modes)        | Default. Wire-compatible with Android. |
+| Opus      | `1`     | 48 kHz  | 6 – 64 kbps (configurable)        | Wideband; larger payloads.             |
+| PCM_S16LE | `2`     | 48 kHz  | 768 kbps                          | Raw PCM; not recommended for LoRa.     |
+| Codec2    | `3`     | 8 kHz   | 1.2 – 3.2 kbps (6 modes)          | Most LoRa-friendly bitrates.           |
 
 The codec used to encode a message is advertised in its header, so peers always
 decode using the correct codec regardless of their own outgoing-codec setting.
