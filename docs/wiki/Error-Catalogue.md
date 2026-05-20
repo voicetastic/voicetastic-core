@@ -17,8 +17,8 @@ the builder returns them as `Result<EncodedMessage, VoiceError>`.
 |------------------------|---------------------------------------------------------|-----------------------------------------|
 | `TooShort`             | Frame shorter than `HEADER_SIZE = 16 B`.                | Drop. Probably a non-voice packet.      |
 | `TooLarge`             | Frame larger than `MAX_PACKET_SIZE = 231 B`.            | Drop; sender is broken.                 |
-| `BadVersion(b)`        | First byte ≠ `0x02`.                                    | Drop; future protocol version.          |
-| `ReservedFlagSet(b)`   | Low nibble of `type_flags` is non-zero.                 | Drop; sender is broken.                 |
+| `BadVersion(b)`        | First byte ≠ `0x03`.                                    | Drop; V2 or future protocol version.    |
+| `ReservedFlagSet(b)`   | Any reserved bit of `type_flags` is set (mask `0x2F`).  | Drop; V2 frame or sender bug.           |
 | `ReservedPacketType`   | `packet_type == 3`.                                     | Drop; reserved.                         |
 | `ZeroMessageId`        | `message_id == 0`.                                      | Drop; spec forbids zero.                |
 | `BadTotal(0)`          | `total_data == 0`.                                      | Drop; spec forbids.                     |
@@ -46,17 +46,11 @@ the builder returns them as `Result<EncodedMessage, VoiceError>`.
 After `MAX_VALIDATION_STRIKES = 3` such mismatches on the same in-progress
 entry, the entry is evicted and blacklisted to free its per-sender slot.
 
-## Encryption errors
+## Integrity errors
 
 | Variant                       | Trigger                                                             | Handle                       |
 |-------------------------------|---------------------------------------------------------------------|------------------------------|
-| `BadTag`                      | AES-GCM tag verification failed.                                    | Drop; possible tampering.    |
-| `BodyTooShortForEnv(n)`       | Encrypted body shorter than `nonce + tag = 28 B`.                   | Drop; sender bug.            |
-| `EncryptedNack`               | NACK frame has the encryption bit set.                              | Drop; spec forbids.          |
-| `EncryptedNoPsk`              | Encrypted frame received but `AssemblerConfig.channel_psk` is `None`. | Configure PSK or drop.     |
-| `BadFromForEncrypted(s)`      | Encrypted frame's `from` is not strict `!hex8`.                     | Drop; potential spoof.       |
-| `BadMac`                      | Header MAC mismatch (corruption or forgery).                        | Drop silently.               |
-| `MacKeyMissing`               | Header advertises keyed MAC but receiver has no channel PSK.        | Drop; configure PSK.         |
+| `BadMac`                      | Header SHA-256 integrity tag mismatch (corruption or PSK-holder tampering). | Drop silently.        |
 
 ## NACK errors
 
@@ -85,10 +79,9 @@ entry, the entry is evicted and blacklisted to free its per-sender slot.
   `AssemblyEvent`, not an error), `BadVersion`, `ReservedPacketType`.
 - **Silent drop, log at debug**: any structural / template / chunk-size
   error.
-- **Log at warn**: `BadTag`, `BadFromForEncrypted`, `EncryptedNoPsk`,
-  `PerSenderCap` — these are signs of misconfiguration or attack.
-- **Surface to UI / app**: `UnknownCodec` (the user may want to install a
-  codec), repeated `BadTag` from the same `from` (possible PSK
-  mismatch).
+- **Log at warn**: `BadMac`, `PerSenderCap` — signs of corruption or
+  rate-limit pressure.
+- **Surface to UI / app**: `UnknownCodec` (the user may want to install
+  a codec).
 
 → Continue to [Glossary](Glossary.md).

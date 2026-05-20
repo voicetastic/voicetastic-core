@@ -10,6 +10,34 @@ Release notes for past `vX.Y.Z` tags are available in the project's
 
 ## [Unreleased]
 
+### Changed (wire-incompatible)
+
+- **Voice protocol bumped v2 → v3.** Body envelope encryption (AES-256-GCM
+  with HKDF-derived per-message key) and the keyed-MAC variant of the
+  trailing header tag are both **removed**. Confidentiality now relies
+  exclusively on Meshtastic's channel encryption; the 4-byte trailing
+  header tag is always unkeyed `SHA-256(header[0..12])[..4]` and serves
+  as an integrity check against on-air bit-flips (Meshtastic uses
+  AES-CTR which is bit-flip malleable). The deprecated flag bits — `0x20`
+  (encrypted) and `0x08` (mac_keyed) — are now reserved-zero; V3 parsers
+  reject frames that set them. Sender and receiver must be upgraded
+  together. Net wire savings: ~28 octets per chunk (12-byte GCM nonce +
+  16-byte tag) ≈ 14% airtime back on the smallest presets.
+
+  Affected public APIs:
+  - `voicetastic-core`: `BuildConfig` no longer carries `encryption` or
+    `mac_key`; `SendRequest` drops `encryption`, `mac_key`, `channel_psk`,
+    `from_node_num`; `AssemblerConfig` drops `channel_psk`;
+    `VoiceMessage` drops `encrypted`; `ChunkHeader` drops `encrypted`
+    and `mac_keyed`; the `crypto` module is gone; `mac::compute_tag`
+    drops its `key` parameter.
+  - Android bridge UniFFI surface drops `channel_psk` / `from_node_num`
+    from `BuildConfig`, `NackConfig`, `AssemblerConfig`, `SendRequestUdl`,
+    and `encrypted` from `VoiceMessageOut`. Six error variants
+    (`BadTag`, `BodyTooShortForEnv`, `EncryptedNack`, `EncryptedNoPsk`,
+    `BadFromForEncrypted`, `MacKeyMissing`) are gone. Kotlin consumers
+    will need a coordinated rebuild.
+
 ### Added
 
 - User-configurable Opus encoder settings: bitrate

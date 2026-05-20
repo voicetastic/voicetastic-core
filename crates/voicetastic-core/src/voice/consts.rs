@@ -2,13 +2,15 @@
 
 use std::time::Duration;
 
-/// On-wire version byte. v2 adds the 4-byte trailing header MAC.
-pub const PROTOCOL_VERSION: u8 = 0x02;
+/// On-wire version byte. v3 removes the envelope encryption layer
+/// (confidentiality now relies on Meshtastic channel encryption) and the
+/// keyed-MAC variant of the trailing header tag. The 4-byte tag is
+/// always SHA-256 truncated — see [`super::mac`].
+pub const PROTOCOL_VERSION: u8 = 0x03;
 /// Fixed header length preceding every frame: 12 logical bytes +
-/// [`HEADER_MAC_LEN`]-byte integrity/authenticity tag.
+/// [`HEADER_MAC_LEN`]-byte integrity tag.
 pub const HEADER_SIZE: usize = 16;
-/// Width of the trailing header MAC tag — keyed (HMAC-SHA256) or
-/// unkeyed (SHA-256), depending on whether a channel PSK is configured.
+/// Width of the trailing header MAC tag — unkeyed SHA-256 truncated.
 /// See [`super::mac`].
 pub const HEADER_MAC_LEN: usize = 4;
 /// Maximum total frame size (header + body) — Meshtastic LoRa MTU.
@@ -57,7 +59,3 @@ pub const NACK_MAX_ROUNDS: u16 = 400;
 /// Quiet-period after the last seen chunk before issuing a NACK.
 /// Receiver uses 3× exponential backoff: 3s, 9s, 27s, 81s, 243s cap.
 pub const NACK_WINDOW_MS: u64 = 3000;
-/// AES-GCM nonce length (96 bits per RFC 5288).
-pub const GCM_NONCE_LEN: usize = 12;
-/// AES-GCM authentication tag length (128 bits).
-pub const GCM_TAG_LEN: usize = 16;

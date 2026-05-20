@@ -12,9 +12,9 @@ the source of truth for these values.
 
 | Constant                | Value | Why                                                          |
 |-------------------------|------:|--------------------------------------------------------------|
-| `PROTOCOL_VERSION`      | `0x02` | Drop frames with any other first byte.                      |
-| `HEADER_SIZE`           | 16 B  | 12 B logical header + 4 B trailing MAC tag.                 |
-| `HEADER_MAC_LEN`        | 4 B   | Truncated HMAC-SHA256 (keyed) or SHA-256 (unkeyed) over `header[0..12]`. |
+| `PROTOCOL_VERSION`      | `0x03` | Drop frames with any other first byte.                      |
+| `HEADER_SIZE`           | 16 B  | 12 B logical header + 4 B trailing integrity tag.           |
+| `HEADER_MAC_LEN`        | 4 B   | Truncated unkeyed `SHA-256` over `header[0..12]`.           |
 | `MAX_PACKET_SIZE`       | 231 B | Meshtastic LoRa MTU. All frames MUST fit.                   |
 | `MAX_BODY_SIZE`         | 215 B | `MAX_PACKET_SIZE − HEADER_SIZE`.                            |
 | `MIN_CHUNK_SIZE`        | 16 B  | Per-frame overhead floor; below this, FEC + pacing waste airtime. |
@@ -27,23 +27,11 @@ the source of truth for these values.
 | `MAX_PARITY_PER_MESSAGE`  | 128        | `reed-solomon-erasure` GF(2⁸) coder limit.                 |
 | `MAX_MESSAGE_BYTES`       | 54 825     | `MAX_CHUNKS_PER_MESSAGE × MAX_BODY_SIZE`.                  |
 
-With encryption enabled, the effective body limit drops by
-`GCM_NONCE_LEN + GCM_TAG_LEN = 28 B`, so:
+## Confidentiality
 
-```
-chunk_size_max(encrypted) = 215 − 12 − 16 = 187 B
-max_audio(encrypted)       = 255 × 187    = 47 685 B
-```
-
-## Encryption
-
-| Constant         | Value | Why                                                                      |
-|------------------|------:|--------------------------------------------------------------------------|
-| `GCM_NONCE_LEN`  | 12 B  | 96-bit nonce per RFC 5288 / NIST SP 800-38D recommendation.              |
-| `GCM_TAG_LEN`    | 16 B  | 128-bit auth tag per AES-GCM standard.                                   |
-
-Key derivation: HKDF-SHA256, `salt = channel_psk`, `ikm = message_id_be ‖ from_node_num_be`,
-`info = "voicetastic/v2"`. See [Encryption](Encryption.md).
+V3 has **no protocol-layer encryption**. Confidentiality is delegated
+to Meshtastic's channel encryption (AES-256-CTR with the channel PSK).
+See [Encryption](Encryption.md).
 
 ## Receiver resource bounds
 
@@ -54,7 +42,7 @@ Key derivation: HKDF-SHA256, `salt = channel_psk`, `ikm = message_id_be ‖ from
 | `BLACKLIST_TTL`                | 60 s           | How long a finalized message blocks late frames for itself.  |
 | `BLACKLIST_MAX`                | 100            | FIFO eviction once exceeded.                                 |
 | `NACK_MAX_ROUNDS`              | 400            | Per-message NACK budget (consecutive rounds without progress; resets on every accepted shard) before the receiver gives up. |
-| `NACK_WINDOW_MS`               | 1500           | Quiet period after the last seen chunk before NACK'ing.      |
+| `NACK_WINDOW_MS`               | 3000           | Quiet period after the last seen chunk before NACK'ing.      |
 | `MAX_VALIDATION_STRIKES` (impl)| 3              | Eviction trigger for chatty bad senders (post-template).     |
 
 ## Sender resource bounds
@@ -108,7 +96,6 @@ For quick sanity-checking message budgets:
 | `chunk_size` | Codec / bitrate         | `max_audio`   | Approx. duration |
 |-------------:|-------------------------|--------------:|-----------------:|
 | 219          | OPUS @ 16 kbps          | 55 845 B      | ~28 s            |
-| 191          | OPUS @ 16 kbps (encrypted) | 48 705 B   | ~24 s            |
 | 160          | AMR-NB @ MR795 (7.95 kbps) | 40 800 B   | ~41 s            |
 | 128          | AMR-NB @ MR795          | 32 640 B      | ~33 s            |
 | 96           | AMR-NB @ MR795          | 24 480 B      | ~25 s            |

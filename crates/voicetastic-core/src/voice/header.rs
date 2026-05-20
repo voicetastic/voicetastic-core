@@ -4,14 +4,13 @@ use super::consts::{
     HEADER_MAC_LEN, HEADER_SIZE, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, PROTOCOL_VERSION,
 };
 use super::error::{Result, VoiceError};
-use super::mac::{self, MAC_KEYED_FLAG};
+use super::mac;
 use super::types::{PacketType, VoiceCodec};
 
 /// Parsed view of a chunk header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkHeader {
     pub packet_type: PacketType,
-    pub encrypted: bool,
     pub last_in_stream: bool,
     pub message_id: u32,
     pub codec: VoiceCodec,
@@ -20,24 +19,13 @@ pub struct ChunkHeader {
     pub chunk_index: u8,
     pub total_data: u8,
     pub parity_count: u8,
-    /// Whether the trailing 4-byte MAC was computed with HMAC-SHA256 over a
-    /// channel PSK (`true`) or with unkeyed SHA-256 (`false`). Set by
-    /// [`Self::serialize_with_mac`] based on the caller-provided key and
-    /// recovered from the on-wire flags byte by [`Self::parse`].
-    pub mac_keyed: bool,
 }
 
 impl ChunkHeader {
     fn type_flags_byte(&self) -> u8 {
         let mut b = self.packet_type.to_bits();
-        if self.encrypted {
-            b |= 0x20;
-        }
         if self.last_in_stream {
             b |= 0x10;
-        }
-        if self.mac_keyed {
-            b |= MAC_KEYED_FLAG;
         }
         b
     }
@@ -55,37 +43,18 @@ impl ChunkHeader {
     }
 
     /// Serialise to a fixed [`HEADER_SIZE`]-byte buffer, computing the
-    /// trailing 4-byte MAC.
-    ///
-    /// - `mac_key = Some(psk)` → HMAC-SHA256(psk, header[0..12])[..4];
-    ///   the `mac_keyed` flag bit is set.
-    /// - `mac_key = None` → SHA-256(header[0..12])[..4]; the flag bit
-    ///   is cleared.
-    ///
-    /// `self.mac_keyed` is overwritten to match `mac_key.is_some()`, so
-    /// callers don't have to keep the two in sync manually.
-    pub(crate) fn serialize_with_mac(&mut self, mac_key: Option<&[u8]>) -> [u8; HEADER_SIZE] {
-        self.mac_keyed = mac_key.is_some();
+    /// trailing 4-byte SHA-256 integrity tag.
+    pub(crate) fn serialize(&self) -> [u8; HEADER_SIZE] {
         let mut out = [0u8; HEADER_SIZE];
         self.write_logical(&mut out);
-        let tag = mac::compute_tag(&out[..HEADER_SIZE - HEADER_MAC_LEN], mac_key);
+        let tag = mac::compute_tag(&out[..HEADER_SIZE - HEADER_MAC_LEN]);
         out[HEADER_SIZE - HEADER_MAC_LEN..].copy_from_slice(&tag);
         out
     }
 
-    /// Parse a frame header from `bytes`, verifying the trailing MAC
-    /// against `mac_key`. Returns the header and the body slice.
-    ///
-    /// MAC verification rules (see [`super::mac::verify`]):
-    /// - Header advertises `mac_keyed = true` and `mac_key = Some` →
-    ///   HMAC compare.
-    /// - Header advertises `mac_keyed = true` and `mac_key = None` →
-    ///   [`VoiceError::MacKeyMissing`]; receivers without the PSK
-    ///   cannot validate the frame.
-    /// - Header advertises `mac_keyed = false` → SHA-256 compare,
-    ///   ignoring `mac_key`. Catches on-air bit-flips but offers no
-    ///   authenticity.
-    pub fn parse<'a>(bytes: &'a [u8], mac_key: Option<&[u8]>) -> Result<(Self, &'a [u8])> {
+    /// Parse a frame header from `bytes`, verifying the trailing MAC.
+    /// Returns the header and the body slice.
+    pub fn parse(bytes: &[u8]) -> Result<(Self, &[u8])> {
         if bytes.len() < HEADER_SIZE {
             return Err(VoiceError::TooShort {
                 len: bytes.len(),
@@ -102,16 +71,16 @@ impl ChunkHeader {
             return Err(VoiceError::BadVersion(bytes[0]));
         }
         let tf = bytes[1];
-        // Bits 0x07 remain reserved (must be zero). 0x08 is the keyed-MAC
-        // flag handled by [`mac::verify`]; 0x10 = last_in_stream;
-        // 0x20 = encrypted; 0xC0 = packet_type.
-        if tf & 0x07 != 0 {
+        // Bits 0x2F are reserved (must be zero): 0x07 unused, 0x08 was the
+        // V2 keyed-MAC flag, 0x20 was the V2 encrypted flag. A V3 parser
+        // rejects any of them being set so a V2 frame that survives the
+        // version check (it shouldn't, but defense in depth) fails fast
+        // rather than silently producing garbage.
+        if tf & 0x2F != 0 {
             return Err(VoiceError::ReservedFlagSet(tf));
         }
         let packet_type = PacketType::from_bits(tf).ok_or(VoiceError::ReservedPacketType)?;
-        let encrypted = tf & 0x20 != 0;
         let last_in_stream = tf & 0x10 != 0;
-        let mac_keyed = tf & MAC_KEYED_FLAG != 0;
         let message_id = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
         if message_id == 0 {
             return Err(VoiceError::ZeroMessageId);
@@ -146,9 +115,6 @@ impl ChunkHeader {
                 }
             }
             PacketType::Nack => {
-                if encrypted {
-                    return Err(VoiceError::EncryptedNack);
-                }
                 // Spec §3.4: NACK frames carry chunk_index = 0.
                 if chunk_index != 0 {
                     return Err(VoiceError::BadNackIndex(chunk_index));
@@ -157,11 +123,10 @@ impl ChunkHeader {
         }
         // Header is structurally well-formed; verify the trailing MAC
         // before handing the body back to the caller.
-        mac::verify(&bytes[..HEADER_SIZE], mac_key)?;
+        mac::verify(&bytes[..HEADER_SIZE])?;
         Ok((
             Self {
                 packet_type,
-                encrypted,
                 last_in_stream,
                 message_id,
                 codec,
@@ -170,7 +135,6 @@ impl ChunkHeader {
                 chunk_index,
                 total_data,
                 parity_count,
-                mac_keyed,
             },
             &bytes[HEADER_SIZE..],
         ))
@@ -181,10 +145,10 @@ impl ChunkHeader {
     ///
     /// Intended for fast-path dispatch where the caller needs to look up
     /// per-message state (e.g. the NACK listener's active-send table)
-    /// *before* it knows which MAC key to verify with. The result MUST
+    /// *before* it knows whether the frame is for them. The result MUST
     /// NOT be trusted for anything beyond table lookup — a full
-    /// [`Self::parse`] with the correct key is still required before
-    /// acting on any other header field.
+    /// [`Self::parse`] is still required before acting on any other
+    /// header field.
     pub fn peek_message_id(bytes: &[u8]) -> Option<u32> {
         if bytes.len() < HEADER_SIZE || bytes[0] != PROTOCOL_VERSION {
             return None;
@@ -202,7 +166,6 @@ mod tests {
     fn sample_header() -> ChunkHeader {
         ChunkHeader {
             packet_type: PacketType::Data,
-            encrypted: true,
             last_in_stream: true,
             message_id: 0x12345678,
             codec: VoiceCodec::Opus,
@@ -211,61 +174,62 @@ mod tests {
             chunk_index: 3,
             total_data: 10,
             parity_count: 4,
-            mac_keyed: false,
         }
     }
 
     #[test]
-    fn header_roundtrip_unkeyed() {
-        let mut h = sample_header();
+    fn header_roundtrip() {
+        let h = sample_header();
         let mut buf = vec![0u8; HEADER_SIZE + 5];
-        buf[..HEADER_SIZE].copy_from_slice(&h.serialize_with_mac(None));
+        buf[..HEADER_SIZE].copy_from_slice(&h.serialize());
         buf[HEADER_SIZE..].copy_from_slice(b"hello");
-        let (parsed, body) = ChunkHeader::parse(&buf, None).unwrap();
-        assert!(!parsed.mac_keyed);
+        let (parsed, body) = ChunkHeader::parse(&buf).unwrap();
         assert_eq!(parsed.message_id, h.message_id);
         assert_eq!(body, b"hello");
     }
 
     #[test]
-    fn header_roundtrip_keyed() {
-        let mut h = sample_header();
-        let psk = b"channel-psk";
-        let mut buf = vec![0u8; HEADER_SIZE];
-        buf[..HEADER_SIZE].copy_from_slice(&h.serialize_with_mac(Some(psk)));
-        let (parsed, _body) = ChunkHeader::parse(&buf, Some(psk)).unwrap();
-        assert!(parsed.mac_keyed);
-        // Wrong key fails.
+    fn header_rejects_bad_version() {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0] = 0x02; // old V2
         assert!(matches!(
-            ChunkHeader::parse(&buf, Some(b"wrong")),
-            Err(VoiceError::BadMac),
-        ));
-        // No key + keyed header fails distinctively.
-        assert!(matches!(
-            ChunkHeader::parse(&buf, None),
-            Err(VoiceError::MacKeyMissing),
+            ChunkHeader::parse(&buf),
+            Err(VoiceError::BadVersion(0x02))
         ));
     }
 
     #[test]
-    fn header_rejects_bad_version() {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = 9;
+    fn header_rejects_v2_encrypted_bit() {
+        // Build a syntactically-valid V3 header, then set the legacy
+        // encrypted flag (0x20). Parser must reject as ReservedFlagSet
+        // before any MAC verification, so a V2 frame that survives the
+        // version check still fails fast.
+        let h = sample_header();
+        let mut buf = h.serialize();
+        buf[1] |= 0x20;
         assert!(matches!(
-            ChunkHeader::parse(&buf, None),
-            Err(VoiceError::BadVersion(9))
+            ChunkHeader::parse(&buf),
+            Err(VoiceError::ReservedFlagSet(_))
+        ));
+    }
+
+    #[test]
+    fn header_rejects_v2_keyed_mac_bit() {
+        let h = sample_header();
+        let mut buf = h.serialize();
+        buf[1] |= 0x08;
+        assert!(matches!(
+            ChunkHeader::parse(&buf),
+            Err(VoiceError::ReservedFlagSet(_))
         ));
     }
 
     #[test]
     fn header_rejects_tampered_logical_field() {
-        let mut h = sample_header();
-        let mut buf = h.serialize_with_mac(None);
+        let h = sample_header();
+        let mut buf = h.serialize();
         // Flip a bit in `total_data` — MAC must catch it.
         buf[10] ^= 1;
-        assert!(matches!(
-            ChunkHeader::parse(&buf, None),
-            Err(VoiceError::BadMac),
-        ));
+        assert!(matches!(ChunkHeader::parse(&buf), Err(VoiceError::BadMac)));
     }
 }

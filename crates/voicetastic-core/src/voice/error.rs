@@ -34,12 +34,6 @@ pub enum VoiceError {
     ChunkTooLarge { got: usize, max: usize },
     #[error("data body length {got} != established chunk_size {expected}")]
     BodyLenMismatch { got: usize, expected: usize },
-    #[error("AES-GCM authentication failed")]
-    BadTag,
-    #[error("body too short for encryption envelope ({0} bytes)")]
-    BodyTooShortForEnv(usize),
-    #[error("NACK frames must not have the encrypted bit set")]
-    EncryptedNack,
     #[error("NACK frame body too short")]
     NackTooShort,
     #[error("Reed-Solomon error: {0}")]
@@ -62,14 +56,8 @@ pub enum VoiceError {
     Blacklisted,
     #[error("per-sender in-flight cap reached for {0}")]
     PerSenderCap(String),
-    #[error("encrypted frame received but no channel PSK is configured")]
-    EncryptedNoPsk,
-    #[error("`from` field {0:?} is not a valid !hex8 node id (required for encrypted frames)")]
-    BadFromForEncrypted(String),
     #[error("header MAC verification failed")]
     BadMac,
-    #[error("frame advertises a keyed header MAC but no channel PSK is configured")]
-    MacKeyMissing,
     #[error("OS RNG unavailable: {0}")]
     Rng(String),
 }

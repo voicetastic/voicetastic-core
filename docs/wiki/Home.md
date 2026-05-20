@@ -8,7 +8,7 @@ The normative wire-format spec lives in
 implementer-friendly companion: it explains the *why*, walks through frames
 byte-by-byte, and provides recipes for senders and receivers.
 
-> **Protocol version: 2 (wire byte `0x02`)** • **Reference impl:**
+> **Protocol version: 3 (wire byte `0x03`)** • **Reference impl:**
 > [`crates/voicetastic-core/src/voice/`](../../crates/voicetastic-core/src/voice/)
 
 ---
@@ -20,7 +20,7 @@ byte-by-byte, and provides recipes for senders and receivers.
 | [Overview](Overview.md)                                       | What the protocol does, design goals, non-goals.         |
 | [Frame Format](Frame-Format.md)                               | Byte-level walkthrough of header + body for every type.  |
 | [Reliability — FEC and NACK](Reliability-FEC-and-NACK.md)     | How loss recovery works, end-to-end.                     |
-| [Encryption Envelope](Encryption.md)                          | AES-256-GCM keying, AAD, replay protection.              |
+| [Encryption](Encryption.md)                                   | Why this layer no longer carries an AEAD envelope (V3).  |
 | [Sender Guide](Sender-Guide.md)                               | How to build a compatible transmitter.                   |
 | [Receiver Guide](Receiver-Guide.md)                           | How to build a compatible reassembler.                   |
 | [Constants and Limits](Constants-and-Limits.md)               | All numeric ceilings in one place, with rationale.       |
@@ -50,7 +50,7 @@ byte-by-byte, and provides recipes for senders and receivers.
 
 ## Status
 
-- ✅ Builder, assembler, FEC, encryption envelope, NACK construction & parsing.
+- ✅ Builder, assembler, FEC, NACK construction & parsing.
 - ✅ Receiver-driven NACK transmission.
 - ✅ Sender-side state machine: [`VoiceSender`](../../crates/voicetastic-core/src/voice/sender.rs)
   owns build → register → burst → NACK → retransmit → linger as a single

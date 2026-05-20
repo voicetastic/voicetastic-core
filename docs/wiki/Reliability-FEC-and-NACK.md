@@ -110,8 +110,7 @@ Sender                                                 Receiver
 ──────                                                 ────────
 build_message(audio)                                       │
   ├─ split into N data chunks                              │
-  ├─ RS-encode P parity chunks                             │
-  └─ optional AES-GCM envelope per frame                   │
+  └─ RS-encode P parity chunks                             │
        │                                                   │
        ├─ DATA[0]    ─────────────────────────────────►    │
        ├─ DATA[1]    ─────X (lost)                         │
@@ -174,17 +173,17 @@ registry entry expired while the sender is still alive).
 
 ## NACK trust model
 
-NACKs are deliberately **not** AES-GCM-enveloped. This keeps them small
-(bitmap fits in 32 bytes for the maximum 255 chunks) and forwarder-debuggable.
-
-The trade-off: a peer with the channel PSK can forge a `give_up` NACK and
-abort an in-flight transmission. This is documented as a non-goal in the
-spec. Mitigations available to senders:
+This protocol does not authenticate NACK frames; like DATA / PARITY, any
+peer with the channel PSK (i.e. anyone Meshtastic lets join the channel)
+can fabricate a `give_up` NACK and abort an in-flight transmission. This
+matches Meshtastic's threat model for text traffic and is documented as
+a non-goal in the spec. Mitigations available to senders:
 
 - Treat `give_up` as advisory; if airtime budget allows, retry under a
   fresh `message_id` after a backoff.
-- A future revision MAY add an HMAC field over the NACK body keyed by the
-  envelope key. The current header has 4 reserved flag bits available.
+- A future revision MAY reintroduce a keyed MAC field if a concrete
+  threat model warrants it. See git history at the v2 line for the
+  previous design.
 
 ---
 

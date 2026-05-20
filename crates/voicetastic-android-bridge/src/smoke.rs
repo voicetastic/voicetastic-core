@@ -6,7 +6,7 @@
 #[cfg(test)]
 mod tests {
     use super::super::*;
-    fn cfg(parity: u8, psk: Option<Vec<u8>>) -> BuildConfig {
+    fn cfg(parity: u8) -> BuildConfig {
         BuildConfig {
             message_id: 0xCAFEBABE,
             stream_seq: 7,
@@ -15,23 +15,23 @@ mod tests {
             chunk_size: 64,
             parity_count: parity,
             last_in_stream: false,
-            channel_psk: psk,
-            from_node_num: 0x12345678,
+        }
+    }
+    fn asm_cfg() -> AssemblerConfig {
+        AssemblerConfig {
+            message_timeout_ms: 60_000,
+            partial_play_on_timeout: false,
+            max_nack_rounds: 8,
+            nack_window_ms: 1_500,
+            completion_memory_ms: 60_000,
         }
     }
     #[test]
     fn build_and_assemble_roundtrip_plaintext() {
         let audio = (0u8..200).cycle().take(300).collect::<Vec<_>>();
-        let encoded = build_message(audio.clone(), cfg(2, None)).unwrap();
+        let encoded = build_message(audio.clone(), cfg(2)).unwrap();
         assert!(encoded.frames.len() >= encoded.total_data as usize);
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            message_timeout_ms: 60_000,
-            partial_play_on_timeout: false,
-            channel_psk: None,
-            max_nack_rounds: 8,
-            nack_window_ms: 1_500,
-            completion_memory_ms: 60_000,
-        });
+        let asm = VoiceAssembler::new(asm_cfg());
         let mut got_complete = false;
         for frame in encoded.frames.iter().take(encoded.total_data as usize) {
             let ev = asm.accept("!12345678".into(), true, 0, 0, frame.clone());
@@ -46,16 +46,9 @@ mod tests {
     #[test]
     fn fec_recovers_dropped_chunk() {
         let audio = (0u8..200).cycle().take(300).collect::<Vec<_>>();
-        let encoded = build_message(audio.clone(), cfg(3, None)).unwrap();
+        let encoded = build_message(audio.clone(), cfg(3)).unwrap();
         let total_data = encoded.total_data as usize;
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            message_timeout_ms: 60_000,
-            partial_play_on_timeout: false,
-            channel_psk: None,
-            max_nack_rounds: 8,
-            nack_window_ms: 1_500,
-            completion_memory_ms: 60_000,
-        });
+        let asm = VoiceAssembler::new(asm_cfg());
         // Drop data chunk 1; feed remaining data + first parity shard.
         let mut sent = 0;
         for (i, frame) in encoded.frames.iter().enumerate() {
@@ -87,16 +80,8 @@ mod tests {
             parity_count: 2,
             missing: vec![1, 4, 9],
             give_up: false,
-            channel_psk: None,
         });
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            message_timeout_ms: 60_000,
-            partial_play_on_timeout: false,
-            channel_psk: None,
-            max_nack_rounds: 8,
-            nack_window_ms: 1_500,
-            completion_memory_ms: 60_000,
-        });
+        let asm = VoiceAssembler::new(asm_cfg());
         let ev = asm.accept("!12345678".into(), true, 0, 0, frame);
         match ev {
             AssemblyEvent::Nack { info } => {

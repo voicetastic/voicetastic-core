@@ -57,7 +57,6 @@ pub(super) struct AssemblyState {
     pub(super) validation_strikes: u8,
     pub(super) to: VoiceDestination,
     pub(super) channel: u32,
-    pub(super) encrypted_seen: bool,
     pub(super) recovered_via_fec: u8,
 }
 
@@ -84,7 +83,6 @@ impl AssemblyState {
             validation_strikes: 0,
             to,
             channel,
-            encrypted_seen: false,
             recovered_via_fec: 0,
         }
     }
@@ -192,7 +190,6 @@ mod tests {
     fn sample_header() -> ChunkHeader {
         ChunkHeader {
             packet_type: crate::voice::types::PacketType::Data,
-            encrypted: false,
             last_in_stream: false,
             message_id: 12345,
             codec: crate::voice::types::VoiceCodec::AmrNb,
@@ -201,7 +198,6 @@ mod tests {
             chunk_index: 0,
             total_data: 3,
             parity_count: 0,
-            mac_keyed: false,
         }
     }
 

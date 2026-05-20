@@ -4,8 +4,10 @@
 
 Every voice frame is a Meshtastic `Data` payload sent on
 `PortNum::PRIVATE_APP` (256). The payload is **at most 231 bytes** (LoRa
-MTU) and consists of a fixed 16-byte header followed by an
-optionally-encrypted body.
+MTU) and consists of a fixed 16-byte header followed by a plaintext
+body. Confidentiality on the air comes from Meshtastic's channel
+encryption wrapping the whole `Data` payload — see
+[Encryption](Encryption.md).
 
 ```
 ┌────────── 16 B header ───────────────────────┬──── ≤ 215 B body ────┐
@@ -17,17 +19,18 @@ optionally-encrypted body.
 
 ## Header (16 bytes)
 
-The header is logically 12 bytes followed by a 4-byte MAC trailer that
-covers the preceding 12 bytes. The MAC is either keyed
-(`HMAC-SHA256(channel_psk, header[0..12])[..4]`) or unkeyed
-(`SHA-256(header[0..12])[..4]`), selected by the `mac_keyed` flag bit.
-See [Encryption](Encryption.md) and
-[Header-MAC-Future-Work](Header-MAC-Future-Work.md).
+The header is logically 12 bytes followed by a 4-byte integrity tag
+that covers the preceding 12 bytes:
+`SHA-256(header[0..12])[..4]` (unkeyed). The tag catches on-air
+bit-flips (AES-CTR is malleable, so this remains useful inside
+Meshtastic's channel encryption) and accidental corruption that slips
+past LoRa FEC. It is **not** an authenticator: any peer with the
+channel PSK can both read and forge frames.
 
 | Off | Size | Field         | Notes                                                |
 |-----|------|---------------|------------------------------------------------------|
-|  0  |  1   | `version`     | `0x02`. Drop frames where this is anything else.    |
-|  1  |  1   | `type_flags`  | bits 6–7 = `packet_type`, bit 5 = `encrypted`, bit 4 = `last_in_stream`, bit 3 = `mac_keyed`, bits 0–2 reserved (must be 0). |
+|  0  |  1   | `version`     | `0x03`. Drop frames where this is anything else.    |
+|  1  |  1   | `type_flags`  | bits 6–7 = `packet_type`, bit 4 = `last_in_stream`, all other bits reserved (must be 0). |
 |  2  |  4   | `message_id`  | `u32` big-endian, non-zero, sender-chosen.           |
 |  6  |  1   | `codec`       | See [codec table](#codec-table).                     |
 |  7  |  1   | `codec_param` | Codec-specific (e.g. AMR-NB bitrate ordinal).        |
@@ -35,25 +38,26 @@ See [Encryption](Encryption.md) and
 |  9  |  1   | `chunk_index` | `u8`. Range depends on `packet_type`.                |
 | 10  |  1   | `total_data`  | `u8`. Number of original DATA chunks. `0` is reserved (rejected). |
 | 11  |  1   | `parity_count`| `u8`. Number of FEC parity chunks (≤ 128). `0` = no FEC (default). |
-| 12  |  4   | `mac_tag`     | Truncated HMAC-SHA256 (if `mac_keyed`) or SHA-256 of `header[0..12]`. |
+| 12  |  4   | `mac_tag`     | `SHA-256(header[0..12])[..4]` (unkeyed integrity tag). |
 
 ### `type_flags` bit layout
 
 ```
    bit 7  bit 6     bit 5         bit 4         bit 3       bits 2..0
-   ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
-   │ packet_type  │ │encrypted│ │last_in_stream│ │mac_keyed│ │ reserved │
-   └──────────────┘ └─────────┘ └──────────────┘ └────────┘ └──────────┘
-     (2 bits)        (1 bit)     (1 bit)         (1 bit)    (3 bits, =0)
+   ┌──────────────┐ ┌────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
+   │ packet_type  │ │reserved│ │last_in_stream│ │reserved│ │ reserved │
+   └──────────────┘ └────────┘ └──────────────┘ └────────┘ └──────────┘
+     (2 bits)        (=0; V2     (1 bit)        (=0; V2     (3 bits, =0)
+                     encrypted)                  mac_keyed)
 ```
 
 | Field            | Mask   | Values                                  |
 |------------------|--------|-----------------------------------------|
 | `packet_type`    | `0xC0` | `0=DATA`, `1=PARITY`, `2=NACK`, `3` reserved |
-| `encrypted`      | `0x20` | `1` ⇒ body is `nonce ‖ ciphertext ‖ tag`     |
+| reserved (V2 `encrypted`) | `0x20` | MUST be 0; a V2 frame that sets it is rejected as `ReservedFlagSet` |
 | `last_in_stream` | `0x10` | `1` on the final frame of a recording session |
-| `mac_keyed`      | `0x08` | `1` ⇒ header MAC is HMAC-SHA256(channel_psk, …); `0` ⇒ unkeyed SHA-256 |
-| reserved         | `0x07` | MUST be 0; receivers MUST reject otherwise   |
+| reserved (V2 `mac_keyed`) | `0x08` | MUST be 0; rejected if set                    |
+| reserved         | `0x07` | MUST be 0; rejected if set                    |
 
 ---
 
@@ -88,7 +92,8 @@ A selective-retransmit request. See [NACK frames](#nack-frames) below.
 | `0`     | `AMR_NB`    | AMR-NB bitrate ordinal (0..=7); see [AMR-NB rates](#amr-nb-bitrates) |
 | `1`     | `OPUS`      | bitrate / 1000 (kbps); typical 6..=64 — advisory            |
 | `2`     | `PCM_S16LE` | sample-rate index: 0 = 8 kHz, 1 = 16 kHz                    |
-| `3..=255` | reserved  | receivers MUST drop                                         |
+| `3`     | `CODEC2`    | Codec2 mode ordinal                                         |
+| `4..=255` | reserved  | receivers MUST drop                                         |
 
 The protocol does **not** transcode. `codec_param` is metadata passed
 through unchanged; receivers SHOULD interpret it per the column above but
@@ -115,22 +120,11 @@ re-prepend on receive when writing files.
 
 ## Body layout
 
-```
-              encrypted=0                       encrypted=1
- ───────────────────────────  ─────────────────────────────────────
- plaintext payload bytes      12 B nonce ‖ ciphertext ‖ 16 B tag
-```
-
-For encrypted bodies, the nonce is randomly chosen per frame, prepended,
-and authenticated against the **12 logical header bytes as AAD**
-(`header[0..12]`, i.e. the header *excluding* the 4-byte MAC trailer).
-See [Encryption](Encryption.md) for the full envelope.
-
-The unencrypted plaintext is:
+The body is always plaintext at this layer:
 
 - **DATA** — the codec frame bytes for this chunk.
 - **PARITY** — the Reed-Solomon parity shard, sized to `chunk_size`.
-- **NACK** — the bitmap structure below; never encrypted.
+- **NACK** — the bitmap structure below.
 
 ---
 
@@ -139,7 +133,6 @@ The unencrypted plaintext is:
 A NACK carries the standard 16-byte header with these constraints:
 
 - `packet_type = NACK`
-- `encrypted = 0` (NACKs MUST NOT be enveloped)
 - `chunk_index = 0`
 - `message_id`, `codec`, `codec_param`, `stream_seq`, `total_data` echo
   the values of the message being NACK'd.
@@ -177,7 +170,7 @@ themselves retransmitted — the loss-recovery loop *is* the retransmission.
 ## Worked example
 
 A 200-byte AMR-NB recording at MR795, sent on a `MEDIUM_FAST` channel
-(chunk_size = 160), with `parity_count = 1`, plaintext:
+(chunk_size = 160), with `parity_count = 1`:
 
 ```
 total_data   = ceil(200 / 160) = 2
@@ -187,14 +180,14 @@ frames       = 2 DATA + 1 PARITY = 3 frames
 
 | Frame | Header (hex)                                   | Body              |
 |-------|------------------------------------------------|-------------------|
-| 0     | `02 00 dd cc bb aa 00 05 07 00 02 01 ab cd ef 34` | 160 B AMR data    |
-| 1     | `02 00 dd cc bb aa 00 05 07 01 02 01 12 34 56 78` | 40 B AMR data (last, trimmed) |
-| 2     | `02 40 dd cc bb aa 00 05 07 00 02 01 9a bc de f0` | 160 B RS parity   |
+| 0     | `03 00 dd cc bb aa 00 05 07 00 02 01 ab cd ef 34` | 160 B AMR data    |
+| 1     | `03 00 dd cc bb aa 00 05 07 01 02 01 12 34 56 78` | 40 B AMR data (last, trimmed) |
+| 2     | `03 40 dd cc bb aa 00 05 07 00 02 01 9a bc de f0` | 160 B RS parity   |
 
 Header field decode (frame 0):
 
-- `02` — version (protocol v2, wire byte `0x02`)
-- `00` — `type_flags`: DATA, plaintext, not last_in_stream
+- `03` — version (protocol v3, wire byte `0x03`)
+- `00` — `type_flags`: DATA, not last_in_stream
 - `dd cc bb aa` — message_id (BE) = `0xddccbbaa`
 - `00` — codec = AMR_NB
 - `05` — codec_param = MR795 ordinal
@@ -202,6 +195,6 @@ Header field decode (frame 0):
 - `00` — chunk_index = 0
 - `02` — total_data = 2
 - `01` — parity_count = 1
-- `ab cd ef 34` — 4-byte header MAC (truncated HMAC-SHA256 or SHA-256)
+- `ab cd ef 34` — 4-byte SHA-256 integrity tag
 
 → Continue to [Reliability — FEC and NACK](Reliability-FEC-and-NACK.md).

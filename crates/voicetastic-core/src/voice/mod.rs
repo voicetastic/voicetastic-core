@@ -10,9 +10,11 @@
 //! # Wire dispatch
 //!
 //! Receivers reading a frame from `PortNum::PRIVATE_APP` MUST drop any
-//! frame whose first byte is not [`PROTOCOL_VERSION`] (`0x02`). The
+//! frame whose first byte is not [`PROTOCOL_VERSION`] (`0x03`). The
 //! version byte exists so that future protocol revisions can coexist on
-//! the same port.
+//! the same port; V3 is wire-incompatible with V2 (which carried an
+//! AES-GCM body envelope and an optional keyed-MAC variant of the header
+//! tag — both removed in favour of Meshtastic's channel encryption).
 //!
 //! # Submodule layout
 //!
@@ -20,8 +22,7 @@
 //! - [`types`] — `PacketType`, `VoiceCodec`, `VoiceDestination`, `ModemPreset`.
 //! - [`error`] — `VoiceError` and the local `Result` alias.
 //! - [`header`] — `ChunkHeader` (parse/serialize the 16-byte frame header).
-//! - [`crypto`] — `EnvelopeKey`, `derive_key`, `encrypt_body`, `decrypt_body`.
-//! - [`mac`] — 4-byte trailing header MAC (HMAC-SHA256 keyed / SHA-256 unkeyed).
+//! - [`mac`] — 4-byte trailing header integrity tag (SHA-256 truncated).
 //! - [`builder`] — `BuildConfig`, `EncodedMessage`, `build_message`,
 //!   `random_message_id`.
 //! - [`nack`] — `build_nack`, `NackInfo`, `parse_nack_body`.
@@ -34,7 +35,6 @@
 pub mod assembler;
 pub mod builder;
 pub mod consts;
-pub mod crypto;
 pub mod error;
 pub mod header;
 pub mod mac;
@@ -48,12 +48,11 @@ pub mod types;
 pub use assembler::{AssemblerConfig, OutboundNack, TickOutput, VoiceAssembler};
 pub use builder::{BuildConfig, EncodedMessage, build_message, random_message_id};
 pub use consts::{
-    BLACKLIST_MAX, BLACKLIST_TTL, DEAD_SENDER_TIMEOUT, GCM_NONCE_LEN, GCM_TAG_LEN, HEADER_MAC_LEN,
-    HEADER_SIZE, MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL,
-    MAX_IN_PROGRESS_PER_SENDER, MAX_MESSAGE_BYTES, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE,
-    MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS, PROTOCOL_VERSION,
+    BLACKLIST_MAX, BLACKLIST_TTL, DEAD_SENDER_TIMEOUT, HEADER_MAC_LEN, HEADER_SIZE, MAX_BODY_SIZE,
+    MAX_CHUNKS_PER_MESSAGE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_MESSAGE_BYTES,
+    MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE, NACK_MAX_ROUNDS, NACK_WINDOW_MS,
+    PROTOCOL_VERSION,
 };
-pub use crypto::{EnvelopeKey, decrypt_body, derive_key, encrypt_body};
 pub use error::{Result, VoiceError};
 pub use header::ChunkHeader;
 pub use message::{AssemblyEvent, VoiceMessage};
@@ -74,10 +73,10 @@ pub fn detect_version(bytes: &[u8]) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    //! End-to-end tests that span builder + assembler + crypto.
+    //! End-to-end tests that span builder + assembler.
     use super::*;
 
-    fn cfg(parity: u8, encrypt: bool) -> BuildConfig {
+    fn cfg(parity: u8) -> BuildConfig {
         BuildConfig {
             message_id: 0xCAFEBABE,
             stream_seq: 7,
@@ -86,24 +85,11 @@ mod tests {
             chunk_size: 64,
             parity_count: parity,
             last_in_stream: false,
-            encryption: if encrypt {
-                Some(EnvelopeKey::from_bytes([0x42; 32]))
-            } else {
-                None
-            },
-            mac_key: None,
         }
     }
 
-    fn assembler(encrypt: bool) -> VoiceAssembler {
-        VoiceAssembler::new(AssemblerConfig {
-            channel_psk: if encrypt {
-                Some(b"unit-test-psk".to_vec())
-            } else {
-                None
-            },
-            ..Default::default()
-        })
+    fn assembler() -> VoiceAssembler {
+        VoiceAssembler::new(AssemblerConfig::default())
     }
 
     fn synthesize(n: usize) -> Vec<u8> {
@@ -113,11 +99,11 @@ mod tests {
     #[test]
     fn build_and_assemble_no_loss_no_fec() {
         let audio = synthesize(500);
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
         assert_eq!(enc.total_data, 500_u32.div_ceil(64) as u8);
         assert_eq!(enc.parity_count, 0);
 
-        let asm = assembler(false);
+        let asm = assembler();
         let mut completed = None;
         for f in &enc.frames {
             match asm.accept("!00000001", VoiceDestination::Broadcast, 0, f) {
@@ -135,8 +121,8 @@ mod tests {
     #[test]
     fn fec_recovers_dropped_data_chunk() {
         let audio = synthesize(64 * 5);
-        let enc = build_message(&audio, &cfg(2, false)).unwrap();
-        let asm = assembler(false);
+        let enc = build_message(&audio, &cfg(2)).unwrap();
+        let asm = assembler();
         let mut completed = None;
         // Drop data chunk index 2; deliver everything else. After completion
         // the key is blacklisted, so trailing parity frames come back as
@@ -162,9 +148,9 @@ mod tests {
     #[test]
     fn fec_completes_with_one_loss_and_parity() {
         let audio = synthesize(64 * 4);
-        let enc = build_message(&audio, &cfg(2, false)).unwrap();
+        let enc = build_message(&audio, &cfg(2)).unwrap();
         assert_eq!(enc.frames.len(), 6);
-        let asm = assembler(false);
+        let asm = assembler();
         let mut completed = None;
         // Deliver: data 0, 1, 3 + parity 0 (skip data 2 + parity 1)
         let order = [0usize, 1, 3, 4];
@@ -182,41 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn build_assemble_with_encryption() {
-        let audio = synthesize(200);
-        let mut c = cfg(1, true);
-        c.chunk_size = 64;
-        let enc = build_message(&audio, &c).unwrap();
-        let body_len = enc.frames[0].len() - HEADER_SIZE;
-        assert!(body_len >= 64 + GCM_NONCE_LEN + GCM_TAG_LEN);
-
-        let from_id_str = "!12345678";
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            channel_psk: Some(b"unit-test-psk".to_vec()),
-            ..Default::default()
-        });
-        // Sender used the test BuildConfig key directly; rebuild encrypted
-        // frames with the receiver-derivable key for an end-to-end test.
-        let real_key = derive_key(b"unit-test-psk", c.message_id, 0x12345678).unwrap();
-        let mut c2 = c.clone();
-        c2.encryption = Some(real_key);
-        let enc2 = build_message(&audio, &c2).unwrap();
-        let mut completed = None;
-        for f in &enc2.frames {
-            match asm.accept(from_id_str, VoiceDestination::Broadcast, 0, f) {
-                AssemblyEvent::Pending { .. }
-                | AssemblyEvent::Duplicate
-                | AssemblyEvent::Rejected(_) => {}
-                AssemblyEvent::Complete(m) => completed = Some(m),
-                AssemblyEvent::Nack(_) => panic!("unexpected NACK"),
-            }
-        }
-        let m = completed.expect("complete");
-        assert!(m.encrypted);
-        assert_eq!(m.audio, audio);
-    }
-
-    #[test]
     fn detect_version_branch() {
         assert_eq!(detect_version(&[0x01, 0, 0]), Some(0x01));
         assert_eq!(detect_version(&[0x99, 0, 0]), Some(0x99));
@@ -230,12 +181,10 @@ mod tests {
     /// subsequent full-size frame as BodyLenMismatch.
     #[test]
     fn last_chunk_first_does_not_freeze_chunk_size() {
-        // Audio sized so the final chunk is shorter than chunk_size.
         let audio = synthesize(64 * 3 + 17);
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
         assert_eq!(enc.total_data, 4);
-        let asm = assembler(false);
-        // Deliver the trimmed final DATA chunk first, then the rest in order.
+        let asm = assembler();
         let mut order: Vec<usize> = (0..enc.frames.len()).collect();
         let last = order.remove(enc.total_data as usize - 1);
         order.insert(0, last);
@@ -260,15 +209,15 @@ mod tests {
     #[test]
     fn unknown_codec_is_rejected() {
         // Build a valid frame, then poke the codec byte to an unknown
-        // value and recompute the unkeyed header MAC so the frame survives
-        // the header integrity check and reaches codec validation.
+        // value and recompute the header MAC so the frame survives the
+        // header integrity check and reaches codec validation.
         let audio = synthesize(64);
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
         let mut frame = enc.frames[0].clone();
         frame[6] = 0xEE; // codec
-        let tag = super::mac::compute_tag(&frame[..HEADER_SIZE - HEADER_MAC_LEN], None);
+        let tag = super::mac::compute_tag(&frame[..HEADER_SIZE - HEADER_MAC_LEN]);
         frame[HEADER_SIZE - HEADER_MAC_LEN..HEADER_SIZE].copy_from_slice(&tag);
-        let asm = assembler(false);
+        let asm = assembler();
         let ev = asm.accept("!cc", VoiceDestination::Broadcast, 0, &frame);
         assert!(
             matches!(ev, AssemblyEvent::Rejected(VoiceError::UnknownCodec(0xEE))),
@@ -279,14 +228,10 @@ mod tests {
     /// Codec known to the wire (e.g. AMR-NB byte 0) but not in the
     /// receiver's `supported_codecs` allowlist is rejected with
     /// `UnsupportedCodec` *before* any reassembly state is allocated.
-    /// Otherwise an Opus-only build would waste a per-sender slot
-    /// reassembling an AMR-NB message it can never play back.
     #[test]
     fn unsupported_codec_is_rejected_when_allowlist_set() {
         let audio = synthesize(64 * 2);
-        // Default cfg uses Opus on the sender side.
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
-        // Receiver only accepts AMR-NB.
+        let enc = build_message(&audio, &cfg(0)).unwrap();
         let asm = VoiceAssembler::new(AssemblerConfig {
             supported_codecs: Some(vec![VoiceCodec::AmrNb]),
             ..Default::default()
@@ -301,49 +246,23 @@ mod tests {
         );
     }
 
-    /// Spec §7: encrypted frames whose `from` is not a valid !hex8 must be
-    /// rejected (otherwise the receiver would silently derive a wrong key).
+    /// Regression: V2 frames (header version byte 0x02) must be rejected
+    /// by a V3 parser. Combined with the reserved-bit checks in
+    /// `header_rejects_v2_encrypted_bit` / `header_rejects_v2_keyed_mac_bit`
+    /// this gives a clean break between the two protocol revisions.
     #[test]
-    fn encrypted_frame_with_bad_from_is_rejected() {
-        let audio = synthesize(64);
-        let mut c = cfg(0, true);
-        c.encryption = Some(derive_key(b"psk", c.message_id, 0).unwrap());
-        let enc = build_message(&audio, &c).unwrap();
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            channel_psk: Some(b"psk".to_vec()),
-            ..Default::default()
-        });
-        let ev = asm.accept(
-            "not-a-node-id",
-            VoiceDestination::Broadcast,
-            0,
-            &enc.frames[0],
-        );
+    fn v2_frame_is_rejected() {
+        let asm = assembler();
+        // Build a buffer with version byte 0x02 and otherwise plausible
+        // contents. The parser must reject on version *before* touching
+        // the MAC.
+        let mut frame = vec![0u8; HEADER_SIZE + 4];
+        frame[0] = 0x02; // V2
+        frame[2..6].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        let ev = asm.accept("!ab", VoiceDestination::Broadcast, 0, &frame);
         assert!(
-            matches!(
-                ev,
-                AssemblyEvent::Rejected(VoiceError::BadFromForEncrypted(_))
-            ),
-            "expected BadFromForEncrypted, got {ev:?}",
-        );
-    }
-
-    /// Spec §9.2: encrypted frame with no PSK configured is rejected with
-    /// a dedicated error (not the generic AES-GCM `BadTag`).
-    #[test]
-    fn encrypted_frame_without_psk_is_rejected() {
-        let audio = synthesize(64);
-        let mut c = cfg(0, true);
-        c.encryption = Some(derive_key(b"psk", c.message_id, 0x12345678).unwrap());
-        let enc = build_message(&audio, &c).unwrap();
-        let asm = VoiceAssembler::new(AssemblerConfig {
-            channel_psk: None,
-            ..Default::default()
-        });
-        let ev = asm.accept("!12345678", VoiceDestination::Broadcast, 0, &enc.frames[0]);
-        assert!(
-            matches!(ev, AssemblyEvent::Rejected(VoiceError::EncryptedNoPsk)),
-            "expected EncryptedNoPsk, got {ev:?}",
+            matches!(ev, AssemblyEvent::Rejected(VoiceError::BadVersion(0x02))),
+            "expected BadVersion(0x02), got {ev:?}"
         );
     }
 
@@ -354,14 +273,12 @@ mod tests {
     #[test]
     fn tampered_duplicate_reports_duplicate_not_mismatch() {
         let audio = synthesize(64 * 3);
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
-        let asm = assembler(false);
-        // Ingest the first DATA frame normally.
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = assembler();
         assert!(matches!(
             asm.accept("!aa", VoiceDestination::Broadcast, 0, &enc.frames[0]),
             AssemblyEvent::Pending { .. },
         ));
-        // Build a tampered duplicate of chunk 0 with a shorter body.
         let mut tampered = enc.frames[0].clone();
         tampered.truncate(HEADER_SIZE + 32);
         let ev = asm.accept("!aa", VoiceDestination::Broadcast, 0, &tampered);
@@ -371,24 +288,17 @@ mod tests {
         );
     }
 
-    /// Mismatched `stream_seq` on a follow-up frame is rejected as
-    /// `StreamSeqMismatch` — the template captures stream_seq from the
     /// Regression: once a `(from, message_id)` pair has completed, late
     /// chunks for the same id must NOT resurrect a fresh in-progress
-    /// assembly within the configured `completion_memory` window. This
-    /// is what was producing the phantom "voice message (partial: …)"
-    /// chat entry that appeared right after the real completion on
-    /// slow LoRa presets where the sender's firmware queue keeps
-    /// draining for tens of seconds past the receiver's completion.
+    /// assembly within the configured `completion_memory` window.
     #[test]
     fn late_chunk_after_complete_does_not_resurrect_assembly() {
         let audio = synthesize(64 * 4);
-        let enc = build_message(&audio, &cfg(0, false)).unwrap();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
         assert_eq!(enc.total_data, 4);
-        let asm = assembler(false);
+        let asm = assembler();
         let from = "!deadbeef";
 
-        // Drive a normal complete.
         let mut completed = None;
         for f in &enc.frames {
             match asm.accept(from, VoiceDestination::Broadcast, 0, f) {
@@ -399,11 +309,6 @@ mod tests {
         }
         assert!(completed.is_some_and(|m| m.is_complete));
 
-        // Replay every wire frame. None of them should bring the
-        // assembler back into a Pending state, and none should produce
-        // a second Complete event for the same `message_id`. The
-        // exact rejection variant is not part of the contract — what
-        // matters is that we don't see Pending or Complete.
         for f in &enc.frames {
             let ev = asm.accept(from, VoiceDestination::Broadcast, 0, f);
             assert!(
@@ -416,33 +321,24 @@ mod tests {
         }
     }
 
-    /// Regression for finding #1: when the **last** DATA chunk is lost and
-    /// we have enough parity to reconstruct it, the assembler must NOT
-    /// silently emit a padded shard \u2014 its real (un-padded) length was
-    /// never observed on the wire, so any trailing zeros would corrupt the
-    /// audio tail. The expected behaviour is: defer FEC recovery for the
-    /// final chunk and stay Pending until a NACK retransmit brings the
-    /// real frame in.
+    /// Regression for finding #1: when the **last** DATA chunk is lost
+    /// and we have enough parity to reconstruct it, the assembler must
+    /// NOT silently emit a padded shard — its real (un-padded) length was
+    /// never observed on the wire, so any trailing zeros would corrupt
+    /// the audio tail.
     #[test]
     fn fec_does_not_pad_recovered_last_data() {
-        // 3 data chunks + 1 trimmed last chunk; 2 parity shards.
         let audio = synthesize(64 * 3 + 17);
-        let enc = build_message(&audio, &cfg(2, false)).unwrap();
+        let enc = build_message(&audio, &cfg(2)).unwrap();
         assert_eq!(enc.total_data, 4);
         assert_eq!(enc.parity_count, 2);
-        let asm = assembler(false);
-        // Deliver the first 3 data chunks + both parity shards, but
-        // omit the trimmed final data chunk. Parity alone could in
-        // principle reconstruct slot 3 \u2014 the test pins that we do NOT
-        // synthesize a corrupt last shard.
+        let asm = assembler();
         for i in [0usize, 1, 2, 4, 5] {
             match asm.accept("!ab", VoiceDestination::Broadcast, 0, &enc.frames[i]) {
                 AssemblyEvent::Pending { .. } => {}
                 e => panic!("unexpected event for idx {i}: {e:?}"),
             }
         }
-        // Now deliver the real final DATA chunk; this should complete the
-        // message cleanly with the correct audio bytes (no trailing pad).
         match asm.accept("!ab", VoiceDestination::Broadcast, 0, &enc.frames[3]) {
             AssemblyEvent::Complete(m) => {
                 assert!(m.is_complete);
@@ -458,18 +354,14 @@ mod tests {
     #[test]
     fn parity_count_decrease_is_rejected() {
         let audio = synthesize(64 * 3);
-        let enc = build_message(&audio, &cfg(2, false)).unwrap();
-        let asm = assembler(false);
-        // Establish template with parity_count = 2.
+        let enc = build_message(&audio, &cfg(2)).unwrap();
+        let asm = assembler();
         let _ = asm.accept("!cd", VoiceDestination::Broadcast, 0, &enc.frames[0]);
-        // Forge a properly-MACed follow-up DATA frame for chunk 1 with
-        // parity_count = 1. We can't just flip the raw byte any more —
-        // the header MAC would catch that as `BadMac` before any
-        // field-level validation runs. So parse, mutate, re-serialize.
-        let (mut hdr, body) = ChunkHeader::parse(&enc.frames[1], None).expect("frame 1 must parse");
+        // Parse, mutate, re-serialize so the MAC stays valid.
+        let (mut hdr, body) = ChunkHeader::parse(&enc.frames[1]).expect("frame 1 must parse");
         hdr.parity_count = 1;
         let mut tampered = Vec::with_capacity(HEADER_SIZE + body.len());
-        tampered.extend_from_slice(&hdr.serialize_with_mac(None));
+        tampered.extend_from_slice(&hdr.serialize());
         tampered.extend_from_slice(body);
         let ev = asm.accept("!cd", VoiceDestination::Broadcast, 0, &tampered);
         assert!(
@@ -481,15 +373,13 @@ mod tests {
         );
     }
 
-    /// Spec \u00a73.4: NACK frames carry `chunk_index = 0`. The header parser
+    /// Spec §3.4: NACK frames carry `chunk_index = 0`. The header parser
     /// MUST reject any other value before the body is touched.
     #[test]
     fn nack_with_nonzero_chunk_index_is_rejected() {
         use super::types::PacketType;
-        // Build a syntactically valid NACK header with chunk_index = 5.
-        let mut h = ChunkHeader {
+        let h = ChunkHeader {
             packet_type: PacketType::Nack,
-            encrypted: false,
             last_in_stream: false,
             message_id: 0xCAFEBABE,
             codec: VoiceCodec::Opus,
@@ -498,13 +388,11 @@ mod tests {
             chunk_index: 5,
             total_data: 4,
             parity_count: 0,
-            mac_keyed: false,
         };
         let mut frame = vec![0u8; HEADER_SIZE + 4];
-        frame[..HEADER_SIZE].copy_from_slice(&h.serialize_with_mac(None));
-        // Minimal NACK body (nack_version + flags + 1 bitmap byte).
+        frame[..HEADER_SIZE].copy_from_slice(&h.serialize());
         frame[HEADER_SIZE..].copy_from_slice(&[0x01, 0x00, 0x00, 0x00]);
-        let asm = assembler(false);
+        let asm = assembler();
         let ev = asm.accept("!ef", VoiceDestination::Broadcast, 0, &frame);
         assert!(
             matches!(ev, AssemblyEvent::Rejected(VoiceError::BadNackIndex(5))),

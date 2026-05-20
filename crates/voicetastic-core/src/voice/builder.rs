@@ -3,10 +3,9 @@
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use super::consts::{
-    GCM_NONCE_LEN, GCM_TAG_LEN, HEADER_SIZE, MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE,
-    MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, MIN_CHUNK_SIZE,
+    HEADER_SIZE, MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE,
+    MIN_CHUNK_SIZE,
 };
-use super::crypto::{EnvelopeKey, encrypt_body};
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
 use super::types::{PacketType, VoiceCodec};
@@ -21,15 +20,6 @@ pub struct BuildConfig {
     pub chunk_size: usize,
     pub parity_count: u8,
     pub last_in_stream: bool,
-    /// If `Some`, every DATA/PARITY body is wrapped with the AES-GCM
-    /// envelope. `None` keeps bodies plaintext.
-    pub encryption: Option<EnvelopeKey>,
-    /// Channel PSK for the trailing 4-byte header MAC. `Some` ⇒
-    /// HMAC-SHA256 (authenticity); `None` ⇒ unkeyed SHA-256
-    /// (integrity only). Independent of `encryption`: a sender on a
-    /// PSK-configured channel SHOULD pass the PSK here even for
-    /// plaintext frames so the receiver can reject tampered headers.
-    pub mac_key: Option<Vec<u8>>,
 }
 
 /// Output of [`build_message`]: the wire frames to transmit, in send order.
@@ -62,22 +52,15 @@ pub fn random_message_id() -> Result<u32> {
 ///    chunk may be shorter; padded with zeros for FEC, padding stripped on
 ///    reassembly).
 /// 2. RS-encode `parity_count` parity shards (skipped if `parity_count == 0`).
-/// 3. For each shard: build header, optionally encrypt body, push frame.
+/// 3. For each shard: build header + push frame.
 pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> {
     if cfg.chunk_size < MIN_CHUNK_SIZE {
         return Err(VoiceError::ChunkTooSmall(cfg.chunk_size));
     }
-    if cfg.chunk_size > MAX_BODY_SIZE
-        || (cfg.encryption.is_some()
-            && cfg.chunk_size + GCM_NONCE_LEN + GCM_TAG_LEN > MAX_BODY_SIZE)
-    {
+    if cfg.chunk_size > MAX_BODY_SIZE {
         return Err(VoiceError::ChunkTooLarge {
             got: cfg.chunk_size,
-            max: if cfg.encryption.is_some() {
-                MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN
-            } else {
-                MAX_BODY_SIZE
-            },
+            max: MAX_BODY_SIZE,
         });
     }
     if audio.is_empty() {
@@ -124,7 +107,7 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
     // Frame each shard.
     let mut frames: Vec<Vec<u8>> = Vec::with_capacity(shards.len());
     for (idx, shard) in shards.iter().enumerate() {
-        let (packet_type, chunk_index, body_plain) = if (idx as u8) < total_data {
+        let (packet_type, chunk_index, body) = if (idx as u8) < total_data {
             // Data frame: trim padding on the last chunk.
             let body = if idx == total_data_usize - 1 {
                 &shard[..last_data_len]
@@ -141,7 +124,6 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
         };
         let header = ChunkHeader {
             packet_type,
-            encrypted: cfg.encryption.is_some(),
             // last_in_stream marks the very last frame of the very last
             // message in a recording session.
             last_in_stream: cfg.last_in_stream && idx == shards.len() - 1,
@@ -152,15 +134,8 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
             chunk_index,
             total_data,
             parity_count,
-            // Overwritten by serialize_with_mac to mirror mac_key.
-            mac_keyed: false,
         };
-        let mut header = header;
-        let header_bytes = header.serialize_with_mac(cfg.mac_key.as_deref());
-        let body = match &cfg.encryption {
-            Some(key) => encrypt_body(key, &header_bytes, body_plain)?,
-            None => body_plain.to_vec(),
-        };
+        let header_bytes = header.serialize();
         if HEADER_SIZE + body.len() > MAX_PACKET_SIZE {
             return Err(VoiceError::ChunkTooLarge {
                 got: body.len(),
@@ -169,7 +144,7 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
         }
         let mut frame = Vec::with_capacity(HEADER_SIZE + body.len());
         frame.extend_from_slice(&header_bytes);
-        frame.extend_from_slice(&body);
+        frame.extend_from_slice(body);
         frames.push(frame);
     }
 
@@ -193,8 +168,6 @@ mod tests {
             chunk_size: 64,
             parity_count: 0,
             last_in_stream: true,
-            encryption: None,
-            mac_key: None,
         }
     }
 
@@ -325,7 +298,7 @@ mod tests {
             assert!(frame.len() >= HEADER_SIZE);
 
             let header_bytes = &frame[..HEADER_SIZE];
-            let header = ChunkHeader::parse(header_bytes, None).expect("should parse");
+            let header = ChunkHeader::parse(header_bytes).expect("should parse");
             let (header, _) = header;
 
             assert_eq!(header.message_id, cfg.message_id);
@@ -366,7 +339,7 @@ mod tests {
         let msg = build_message(&audio, &cfg).expect("should build");
 
         let last_frame = &msg.frames[msg.frames.len() - 1];
-        let header = ChunkHeader::parse(&last_frame[..HEADER_SIZE], None)
+        let header = ChunkHeader::parse(&last_frame[..HEADER_SIZE])
             .expect("should parse")
             .0;
         assert!(header.last_in_stream);

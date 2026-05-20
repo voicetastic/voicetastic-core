@@ -9,7 +9,16 @@ lives in [`crates/voicetastic-core/src/voice/`](crates/voicetastic-core/src/voic
 For an implementer-friendly companion (byte walkthroughs, diagrams,
 sender/receiver recipes), see the [voice protocol wiki](docs/wiki/Home.md).
 
-**Protocol version: 2 (wire byte `0x02`)**
+**Protocol version: 3 (wire byte `0x03`)**
+
+V3 is wire-incompatible with V2: the body envelope encryption
+(AES-256-GCM with a per-message HKDF-derived key) and the keyed-MAC
+variant of the trailing header tag have been removed in favour of
+Meshtastic's channel encryption. The four-byte trailing header tag is
+now always unkeyed `SHA-256(header[0..12])[..4]` and serves as a
+tamper-detection check (channel AES-CTR is bit-flip malleable, so this
+remains useful even though the payload is encrypted on the wire).
+A V3 parser MUST reject any frame whose `version` byte is `0x02`.
 
 ---
 
@@ -23,11 +32,12 @@ sender/receiver recipes), see the [voice protocol wiki](docs/wiki/Home.md).
   playback is allowed if loss is unrecoverable.
 - Be codec-agnostic so future codecs (Opus, Codec2, …) can ship without a
   protocol bump.
-- Resist abuse: bound per-sender resource use, reject malformed frames early,
-  authenticate payloads end-to-end on top of Meshtastic's channel encryption.
+- Resist abuse: bound per-sender resource use, reject malformed frames early.
+  Confidentiality is delegated to Meshtastic's channel encryption layer
+  (AES-256-CTR with the channel PSK).
 
 Receivers MUST drop any frame whose first byte is not [`PROTOCOL_VERSION`]
-(`0x02`). The version byte exists so future revisions can coexist on the
+(`0x03`). The version byte exists so future revisions can coexist on the
 same port without breaking older receivers.
 
 ---
@@ -104,11 +114,11 @@ Every frame is at most 231 bytes and starts with a 16-byte header
 ```
  Byte  Size  Field            Encoding
  ───────────────────────────────────────────────────────────────────────
-   0     1   version          UInt8 = 0x02
+   0     1   version          UInt8 = 0x03
    1     1   type_flags       UInt8: bits 6-7 packet_type
-                                     bit  5  encrypted
+                                     bit  5  reserved (must be 0; was V2 `encrypted`)
                                      bit  4  last_in_stream
-                                     bit  3  mac_keyed
+                                     bit  3  reserved (must be 0; was V2 `mac_keyed`)
                                      bits 0-2 reserved (must be 0)
    2     4   message_id       UInt32, big-endian
    6     1   codec            UInt8 (see §3.2)
@@ -117,10 +127,9 @@ Every frame is at most 231 bytes and starts with a 16-byte header
    9     1   chunk_index      UInt8
   10     1   total_data       UInt8 (1..=255, original data chunks; 0 is reserved and rejected — see §9.2)
   11     1   parity_count     UInt8 (0..=128, FEC parity chunks; 0 = no FEC, the default)
-  12     4   mac_tag          truncated HMAC-SHA256 (mac_keyed=1) or SHA-256
-                              (mac_keyed=0) over header[0..12]
+  12     4   mac_tag          SHA-256(header[0..12])[..4] — unkeyed integrity tag
  ───────────────────────────────────────────────────────────────────────
-  16   ≤215  body             see §3.3
+  16   ≤215  body             plaintext codec/parity/NACK bytes (see §3.3)
 ```
 
 ### 3.1 Packet types
@@ -188,23 +197,20 @@ the protocol body carries raw codec frames only; no container header.
 
 ### 3.3 Body layout
 
-```
-              encrypted=0                       encrypted=1
- ───────────────────────────  ─────────────────────────────────────────
- plaintext payload bytes      12 B nonce ‖ ciphertext ‖ 16 B tag
-```
+The body is always plaintext at this layer; confidentiality on the air
+comes from Meshtastic's channel encryption wrapping the whole `Data`
+payload (header + body) at the firmware level.
 
-For `DATA` frames the plaintext is the codec frame bytes for this chunk.
-For `PARITY` frames the plaintext is the Reed-Solomon parity for this chunk
-index, sized to `chunk_size` (see §4). For `NACK` frames the body is never
-encrypted; the `encrypted` bit MUST be zero.
+- `DATA` frames carry the codec frame bytes for this chunk.
+- `PARITY` frames carry the Reed-Solomon parity for this chunk index,
+  sized to `chunk_size` (see §4).
+- `NACK` frames carry the bitmap described in §3.4.
 
 ### 3.4 NACK body
 
 A NACK frame carries the standard 16-byte header, with these constraints:
 
 - `packet_type = NACK` (binary `10` in `type_flags` bits 6–7)
-- `encrypted = 0` (NACKs MUST NOT use the AES-GCM envelope; see §7)
 - `chunk_index = 0`
 - `message_id`, `codec`, `codec_param`, `stream_seq`, `total_data` MUST
   echo the values of the message being NACK'd. `parity_count` MUST be
@@ -232,8 +238,8 @@ shape, but parsers MUST accept it. When `give_up` is set, the receiver
 has timed out and the sender SHOULD discard any remaining queued chunks
 for this message.
 
-NACKs are not encrypted, are not retransmitted (the loss-recovery loop is
-itself the retransmission), and SHOULD be sent with `want_ack=false`.
+NACKs are not retransmitted (the loss-recovery loop is itself the
+retransmission), and SHOULD be sent with `want_ack=false`.
 
 ---
 
@@ -266,11 +272,6 @@ max_audio_bytes(chunk_size) = chunk_size × 255  # 255 = max total_data
 
 At `chunk_size = 219` and OPUS @ 16 kbps that's ~28 s of audio per message;
 at `chunk_size = 48` and AMR-NB @ MR795 it's ~12 s.
-
-When the encryption envelope is enabled (see §7), `chunk_size` is bounded
-by `MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN = 219 - 12 - 16 = 191`,
-so the corresponding maximum reassembled audio drops to
-`255 × 191 = 48 705 B`.
 
 ---
 
@@ -322,9 +323,8 @@ DATA / PARITY frames are paced under the same rules as the original send
 - **Message identity**: `(from_node_num, message_id)` where `message_id` is
   a non-zero `u32` chosen by the sender. The 32-bit space makes accidental
   collision with the receiver's recently-finalized blacklist negligible.
-  `from` MUST be the lowercase 8-hex-digit form `!hex8`; uppercase or
-  shortened ids are rejected for encrypted frames (§7) and SHOULD be
-  normalized for plaintext frames.
+  `from` MUST be the lowercase 8-hex-digit form `!hex8`; ids should be
+  normalized before lookup.
 - **Stream identity**: `(from_node_num, channel, stream_seq)` where
   `stream_seq` is a `u8` monotonic counter per (sender, channel) pair,
   wrapping at 256. It is intended for receivers that order overlapping
@@ -338,41 +338,36 @@ DATA / PARITY frames are paced under the same rules as the original send
 
 ---
 
-## 7. Encryption envelope (optional, recommended)
+## 7. Confidentiality and integrity
 
-Meshtastic encrypts the whole `Data` payload at the channel level using
-AES-256-CTR with the channel PSK. This protects confidentiality on the LoRa
-air interface but **not** at the BLE/serial link to the radio, nor against
-other channel members.
+Confidentiality is provided by Meshtastic's channel encryption layer:
+the whole `Data` payload (this protocol's header + body) is encrypted
+with AES-256-CTR using the channel PSK before being handed to the LoRa
+PHY. Peers without the channel PSK cannot read the bytes.
 
-The protocol OPTIONALLY adds an end-to-end AES-256-GCM envelope on top:
+This protocol layer does **not** add a per-message AEAD envelope. V2
+carried one (AES-256-GCM with an HKDF-derived per-message key); it was
+removed in V3 because Meshtastic's channel encryption already covers
+the threat we care about (an outsider passively snooping the air) and
+the GCM nonce + tag burned 28 octets of every chunk — meaningful on
+LoRa where the body budget is ~199 bytes.
 
-- **Key derivation**: `key = HKDF-SHA256(salt = channel_psk, ikm =
-  message_id_be ‖ from_node_num_be, info = "voicetastic/v2")`. This binds
-  each message to its channel and sender; replaying a captured frame on a
-  different channel or with a spoofed sender id fails authentication. The
-  HKDF `info` string is preserved across protocol revisions for
-  forward-compat with derivers that have already shipped — the literal
-  `"voicetastic/v2"` is permanent and does not track the wire-protocol
-  version byte (currently `0x02`).
-- **Sender id requirement**: when `encrypted = 1`, the receiver MUST
-  reject any frame whose `from` is not a strict `!hex8` Meshtastic node
-  id, since key derivation otherwise diverges silently.
-- **Nonce**: 96-bit random per frame, prepended to the body. Nonces are
-  never reused for the same `key`; a fresh `message_id` ⇒ fresh `key` ⇒
-  fresh nonce space.
-- **AAD** (additional authenticated data): the 12 logical header bytes
-  (`header[0..12]`, i.e. the header *excluding* the 4-byte MAC trailer),
-  ensuring an attacker cannot tamper with `chunk_index`, `parity_count`,
-  etc.
-- **Tag**: 16 bytes appended to the ciphertext, as per AES-GCM standard.
+The 4-byte trailing `mac_tag` is `SHA-256(header[0..12])[..4]`,
+**unkeyed**. It serves two purposes:
 
-When `encrypted = 0`, the body is plaintext (codec frame bytes for DATA,
-parity bytes for PARITY). Senders SHOULD set `encrypted = 1` whenever a
-channel PSK is available; receivers MUST accept both.
+1. **Bit-flip detection.** AES-CTR is malleable: an attacker who can
+   modify ciphertext bits on the air can flip the corresponding bits of
+   the underlying plaintext header (`chunk_index`, `parity_count`,
+   `message_id`, etc.). The SHA-256 truncated tag catches such tampering
+   before any field is acted on.
+2. **Accidental-corruption check.** On marginal links, occasional
+   in-frame bit errors slip past LoRa FEC; the tag rejects them rather
+   than silently corrupting the reassembly state.
 
-For peers without a shared channel PSK (encryption-disabled or default
-channel), encryption is a no-op.
+The tag is **not** an authenticator: any peer who holds the channel PSK
+(and can therefore both encrypt new frames and read existing ones) can
+forge a valid mac_tag. Authentication of the audio stream against
+malicious channel members is out of scope for this layer.
 
 ---
 
@@ -395,12 +390,6 @@ channel), encryption is a no-op.
                      ┌─────────────────┐
                      │ Reed-Solomon    │ produce parity_count parity shards
                      │ encode          │
-                     └────────┬────────┘
-                              │
-                              ▼
-                     ┌─────────────────┐
-                     │ optional        │ AES-GCM(envelope key, nonce)
-                     │ encryption      │
                      └────────┬────────┘
                               │
                               ▼
@@ -445,7 +434,8 @@ frame.
 chunk arrives
       │
       ▼
-parse 16-byte header  ─────► reject if version != 2
+parse 16-byte header  ─────► reject if version != 3
+                     ─────► reject if any reserved type_flags bit is set
                      ─────► reject if header MAC mismatches (§3)
       │
       ▼
@@ -458,9 +448,6 @@ lookup or create AssemblyState for (from, message_id)
       │
       ├─ new state → start internal timer (chunk_timeout_seconds)
       │              and per-sender rate-limit slot
-      │
-      ▼
-decrypt body if encrypted bit set; verify GCM tag
       │
       ▼
 store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
@@ -509,7 +496,10 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
 A receiver MUST reject (silently drop) a frame when **any** of the
 following hold:
 
-- `version != 0x02` (protocol version 2)
+- `version != 0x03` (protocol version 3)
+- any reserved bit of `type_flags` is set (`0x2F` mask — covers the
+  former V2 `encrypted` (`0x20`) and `mac_keyed` (`0x08`) bits plus the
+  three low reserved bits)
 - `packet_type == 3` (reserved)
 - `total_data == 0`
 - `chunk_index >= total_data` for `DATA` frames
@@ -526,9 +516,6 @@ following hold:
 - DATA body length differs from the message's established `chunk_size` and
   this is not the last data chunk
 - PARITY body length differs from the message's established `chunk_size`
-- AES-GCM tag verification fails
-- `encrypted = 1` but the receiver has no channel PSK configured, or the
-  frame's `from` is not a strict `!hex8` Meshtastic node id
 - a NACK frame's `chunk_index` is non-zero (spec §3.4)
 - the `(from, message_id)` is on the recently-completed blacklist
 - the sender already has `MAX_IN_PROGRESS_PER_SENDER` in-flight messages
@@ -553,7 +540,6 @@ pub struct VoiceMessage {
     pub received_data: u8,
     pub recovered_via_fec: u8,              // chunks reconstructed by RS
     pub channel: u32,
-    pub encrypted: bool,                    // was on the wire?
 }
 
 pub enum VoiceCodec { AmrNb, Opus, PcmS16Le, Codec2, Unknown(u8) }
@@ -572,10 +558,11 @@ container themselves if needed (e.g. `#!AMR\n` for AMR-NB playback).
 |----------------------------------|-----------------|-----------------------------------------|
 | Max chunks per message           | 255 (`u8`)      | header byte                             |
 | Max parity per message           | 128             | RS coder limit                          |
-| Max audio per message            | 55 845 B (clear) / 48 705 B (encrypted) | 255 × 219 (or × 191 with GCM envelope) |
+| Max audio per message            | 55 845 B        | 255 × 219                                |
 | Min chunk size                   | 16 B            | per-frame overhead floor                |
 | Stream sequence wrap             | 256             | per-(from,channel)                      |
-| Encryption                       | AES-256-GCM     | end-to-end on top of channel AES-CTR    |
+| Confidentiality                  | delegated to Meshtastic channel AES-CTR | no per-message envelope at this layer |
+| Header integrity                 | SHA-256[..4] (unkeyed) | catches bit-flips against AES-CTR malleability |
 | FEC                              | RS over GF(2⁸)  | survives any `parity_count` losses      |
 | Max NACK rounds                  | 32 cumulative  | bounds total airtime per message        |
 | Codec                            | application-decided | protocol carries opaque bytes        |
@@ -583,23 +570,21 @@ container themselves if needed (e.g. `#!AMR\n` for AMR-NB playback).
 The protocol explicitly does **not** provide:
 
 - a built-in audio codec (out of scope; bring-your-own)
-- per-recipient end-to-end encryption (the envelope is per-channel; for
-  per-recipient privacy a future revision could add X25519 key exchange)
+- end-to-end authentication or confidentiality beyond what Meshtastic's
+  channel encryption already gives you. Any peer with the channel PSK
+  can forge any frame on this layer (DATA, PARITY, NACK including
+  `give_up`). A future revision MAY reintroduce a per-message AEAD
+  envelope or a keyed header MAC if a concrete threat model warrants it
+  — see git history (V2) for the previous design.
 - congestion control (relies on adaptive pacing + per-sender rate limit)
 - ordering across messages (only within a stream via `stream_seq`)
-- authenticated NACKs: NACK frames travel in the clear (Meshtastic's
-  channel AES-CTR aside) and any peer with the channel PSK can forge a
-  `give_up` NACK and abort an in-flight transmission. Senders SHOULD
-  treat a forged-NACK cancellation as a benign failure mode; a future
-  revision MAY add an HMAC field over the NACK body keyed by the
-  envelope key.
 
 ---
 
 ## Appendix A: Reference constants
 
 ```rust
-pub const PROTOCOL_VERSION: u8 = 0x02;
+pub const PROTOCOL_VERSION: u8 = 0x03;
 pub const HEADER_SIZE: usize = 16;
 pub const MAX_PACKET_SIZE: usize = 231;
 pub const MAX_BODY_SIZE: usize = MAX_PACKET_SIZE - HEADER_SIZE;  // 215
@@ -612,26 +597,25 @@ pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
 pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 pub const BLACKLIST_MAX: usize = 100;
 pub const NACK_MAX_ROUNDS: u16 = 400;
-pub const NACK_WINDOW_MS: u64 = 1500;
-pub const GCM_NONCE_LEN: usize = 12;
-pub const GCM_TAG_LEN: usize = 16;
+pub const NACK_WINDOW_MS: u64 = 3000;
 ```
 
 ## Appendix B: Type/flag bit layout
 
 ```
    type_flags byte:
-     bit 7  bit 6  bit 5      bit 4           bits 3..0
-     ┌──────────────┐ ┌─────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
-     │ packet_type  │ │encrypted│ │last_in_stream│ │mac_keyed│ │ reserved │
-     └──────────────┘ └─────────┘ └──────────────┘ └────────┘ └──────────┘
-       (2 bits)       (1 bit)      (1 bit)         (1 bit)    (3 bits, =0)
+     bit 7  bit 6  bit 5      bit 4           bit 3      bits 2..0
+     ┌──────────────┐ ┌────────┐ ┌──────────────┐ ┌────────┐ ┌──────────┐
+     │ packet_type  │ │reserved│ │last_in_stream│ │reserved│ │ reserved │
+     └──────────────┘ └────────┘ └──────────────┘ └────────┘ └──────────┘
+       (2 bits)       (=0; V2    (1 bit)         (=0; V2    (3 bits, =0)
+                      encrypted)                  mac_keyed)
 ```
 
 | Field            | Mask   |
 |------------------|--------|
 | `packet_type`    | `0xC0` |
-| `encrypted`      | `0x20` |
+| reserved (V2 `encrypted`) | `0x20` |
 | `last_in_stream` | `0x10` |
-| `mac_keyed`      | `0x08` |
+| reserved (V2 `mac_keyed`) | `0x08` |
 | reserved         | `0x07` |

@@ -18,9 +18,6 @@ pub struct AssemblerConfig {
     pub message_timeout: Duration,
     /// Emit incomplete messages on hard timeout (vs. discard).
     pub partial_play_on_timeout: bool,
-    /// If `Some`, the channel PSK used to derive envelope keys for incoming
-    /// encrypted frames. `None` ⇒ encrypted frames are dropped.
-    pub channel_psk: Option<Vec<u8>>,
     /// Maximum NACK rounds before the receiver finalizes (with whatever
     /// chunks it has). Each round fires after `nack_window` of silence.
     pub max_nack_rounds: u16,
@@ -63,7 +60,6 @@ impl Default for AssemblerConfig {
         Self {
             message_timeout,
             partial_play_on_timeout: true,
-            channel_psk: None,
             // Allow many NACK rounds: with a 1.5 s window that's ~3 min of
             // total silence before we stop trying. The hard message_timeout
             // is the real ceiling.

@@ -61,7 +61,6 @@ use crate::meshtastic::MeshtasticService;
 use crate::ports::PRIVATE_APP;
 use crate::voice::builder::{BuildConfig, build_message, random_message_id};
 use crate::voice::consts::MAX_BODY_SIZE;
-use crate::voice::crypto::{EnvelopeKey, derive_key};
 use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
@@ -96,9 +95,6 @@ pub struct SendRequest {
     /// Override the per-message chunk size. `None` means use
     /// [`MAX_BODY_SIZE`] (best throughput for short-range presets).
     pub chunk_size: Option<usize>,
-    /// AES-GCM envelope key. `None` keeps bodies plaintext (still
-    /// inside Meshtastic's channel encryption).
-    pub encryption: Option<EnvelopeKey>,
     /// How long to keep the registry entry alive after the initial
     /// burst so late NACK rounds can be serviced. `None` ⇒
     /// [`DEFAULT_LINGER`].
@@ -115,23 +111,6 @@ pub struct SendRequest {
     /// [`MeshtasticService::watch_lora_config`]; if that snapshot isn't
     /// available yet we fall back to [`ModemPreset::fallback_pacing`].
     pub pacing: Option<Duration>,
-    /// Channel PSK for the trailing 4-byte header MAC. `Some(psk)` ⇒
-    /// HMAC-SHA256 (authenticity); `None` ⇒ unkeyed SHA-256
-    /// (integrity only). Should match the receiver's
-    /// [`crate::voice::AssemblerConfig::channel_psk`].
-    pub mac_key: Option<Vec<u8>>,
-    /// When set alongside [`mac_key`] the envelope encryption key is
-    /// derived *after* the per-message `message_id` has been assigned.
-    /// This is the correct path for callers (e.g. Android bridge) that
-    /// do not know the `message_id` before calling [`Self::send`].
-    ///
-    /// If [`Self::encryption`] is `Some` it takes precedence and this
-    /// field is ignored.
-    pub channel_psk: Option<Vec<u8>>,
-    /// Sender's node number, used alongside [`channel_psk`] for
-    /// per-message envelope key derivation. Ignored when
-    /// [`Self::encryption`] is set.
-    pub from_node_num: u32,
 }
 
 impl Default for SendRequest {
@@ -144,14 +123,10 @@ impl Default for SendRequest {
             to: None,
             parity_count: 0,
             chunk_size: None,
-            encryption: None,
             linger: None,
             stream_seq: 0,
             last_in_stream: true,
             pacing: None,
-            mac_key: None,
-            channel_psk: None,
-            from_node_num: 0,
         }
     }
 }
@@ -252,12 +227,6 @@ struct ActiveSend {
     status_tx: broadcast::Sender<SendStatus>,
     channel: u32,
     to: Option<u32>,
-    /// Channel PSK captured from the originating `SendRequest`. The
-    /// NACK listener uses this to verify keyed-MAC NACK frames for
-    /// this specific message; it is per-active-send rather than
-    /// per-sender because callers can in principle target multiple
-    /// channels (each with its own PSK) from one [`VoiceSender`].
-    mac_key: Option<Vec<u8>>,
 }
 
 /// Shared outbound voice pipeline. One instance per [`MeshtasticService`].
@@ -325,18 +294,6 @@ impl VoiceSender {
     pub fn send(self: &Arc<Self>, req: SendRequest) -> Result<SendHandle, VoiceError> {
         let message_id = random_message_id()?;
 
-        // Deferred envelope key derivation: if the caller provided a
-        // channel PSK (but no pre-derived key) we derive it here with
-        // the freshly-assigned message_id.  Pre-derived encryption
-        // takes precedence.
-        let encryption = match (req.encryption.clone(), &req.channel_psk) {
-            (Some(k), _) => Some(k),
-            (None, Some(psk)) if !psk.is_empty() => {
-                Some(derive_key(psk, message_id, req.from_node_num)?)
-            }
-            _ => None,
-        };
-
         let chunk_size = req.chunk_size.unwrap_or(MAX_BODY_SIZE);
         let cfg = BuildConfig {
             message_id,
@@ -346,8 +303,6 @@ impl VoiceSender {
             chunk_size,
             parity_count: req.parity_count,
             last_in_stream: req.last_in_stream,
-            encryption,
-            mac_key: req.mac_key.clone(),
         };
         let encoded = build_message(&req.audio, &cfg)?;
         let total_frames = encoded.frames.len() as u32;
@@ -372,7 +327,6 @@ impl VoiceSender {
                 status_tx: status_tx.clone(),
                 channel: req.channel,
                 to: req.to,
-                mac_key: req.mac_key.clone(),
             },
         );
 
@@ -559,23 +513,21 @@ async fn nack_listener_task(
             continue;
         }
         // Cheap version + packet-type filter before locking anything.
-        // We don't yet know which `mac_key` to use — the right one is
-        // the [`ActiveSend.mac_key`] for this message_id — so peek the
-        // message_id from the raw bytes, look it up, then re-parse with
-        // the proper key. Frames for messages we know nothing about
-        // are dropped without a full parse.
+        // Peek the message_id from the raw bytes, look it up, then
+        // re-parse the whole header. Frames for messages we know
+        // nothing about are dropped without a full parse.
         let Some(message_id) = ChunkHeader::peek_message_id(&data.payload) else {
             continue;
         };
         let entry = {
             let map = sender.active.lock();
             map.get(&message_id)
-                .map(|a| (a.status_tx.clone(), a.channel, a.to, a.mac_key.clone()))
+                .map(|a| (a.status_tx.clone(), a.channel, a.to))
         };
-        let Some((status_tx, _channel, to, mac_key)) = entry else {
+        let Some((status_tx, _channel, to)) = entry else {
             continue;
         };
-        let Ok((header, body)) = ChunkHeader::parse(&data.payload, mac_key.as_deref()) else {
+        let Ok((header, body)) = ChunkHeader::parse(&data.payload) else {
             continue;
         };
         if header.packet_type != PacketType::Nack {

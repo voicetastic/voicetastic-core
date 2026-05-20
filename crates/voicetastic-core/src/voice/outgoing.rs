@@ -398,8 +398,6 @@ mod tests {
             chunk_size: 32,
             parity_count: parity,
             last_in_stream: false,
-            encryption: None,
-            mac_key: None,
         };
         build_message(&audio, &cfg).unwrap()
     }

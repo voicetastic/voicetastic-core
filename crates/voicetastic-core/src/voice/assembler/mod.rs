@@ -21,9 +21,8 @@ use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use super::consts::{
-    HEADER_SIZE, MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MIN_CHUNK_SIZE,
+    MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MIN_CHUNK_SIZE,
 };
-use super::crypto::{decrypt_body, derive_key};
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
 use super::message::{AssemblyEvent, VoiceMessage};
@@ -110,16 +109,6 @@ impl VoiceAssembler {
         Ok(())
     }
 
-    /// Strict parse of a Meshtastic `"!aabbccdd"` id.
-    /// Returns `None` if the format is malformed (encryption requires this).
-    fn parse_from_node_num(from: &str) -> Option<u32> {
-        let hex = from.strip_prefix('!')?;
-        if hex.len() != 8 {
-            return None;
-        }
-        u32::from_str_radix(hex, 16).ok()
-    }
-
     /// Feed a frame.
     pub fn accept(
         &self,
@@ -145,12 +134,11 @@ impl VoiceAssembler {
         // re-acquire `self.cfg` while `inner` is held, and both paths see a
         // consistent view across the frame.
         let cfg_guard = self.cfg.lock();
-        let psk_snapshot = cfg_guard.channel_psk.clone();
         let completion_memory = cfg_guard.completion_memory;
         let supported_codecs = cfg_guard.supported_codecs.clone();
         drop(cfg_guard);
 
-        let (header, body) = ChunkHeader::parse(bytes, psk_snapshot.as_deref())?;
+        let (header, body) = ChunkHeader::parse(bytes)?;
 
         // NACK frames bypass assembly.
         if header.packet_type == PacketType::Nack {
@@ -183,9 +171,10 @@ impl VoiceAssembler {
             return Err(VoiceError::UnsupportedCodec(header.codec));
         }
 
-        // Decrypt body if needed (uses original header bytes as AAD).
-        let plain_body =
-            self.decrypt_if_needed(from, &header, bytes, body, psk_snapshot.as_deref())?;
+        // V3 carries plaintext bodies (Meshtastic channel encryption
+        // provides confidentiality on the wire). We hand the body bytes
+        // straight to the per-packet ingest path.
+        let plain_body = body.to_vec();
 
         // Establish or look up the per-message slot.
         let initial_chunk_size = derive_initial_chunk_size(&header, &plain_body)?;
@@ -223,7 +212,6 @@ impl VoiceAssembler {
             state.parity_shards.resize(new_len, None);
             state.header_template.parity_count = header.parity_count;
         }
-        state.encrypted_seen = state.encrypted_seen || header.encrypted;
         // `last_data_at` proves the sender is still alive; bump it on
         // any frame (including duplicates and parity that fails to
         // recover) so dead-sender detection at line 350 only trips on
@@ -290,25 +278,6 @@ impl VoiceAssembler {
         })
     }
 
-    fn decrypt_if_needed(
-        &self,
-        from: &str,
-        header: &ChunkHeader,
-        bytes: &[u8],
-        body: &[u8],
-        psk: Option<&[u8]>,
-    ) -> Result<Vec<u8>> {
-        if !header.encrypted {
-            return Ok(body.to_vec());
-        }
-        let psk = psk.ok_or(VoiceError::EncryptedNoPsk)?;
-        // Spec §7: encrypted frames MUST carry a valid !hex8 `from`.
-        let from_node = Self::parse_from_node_num(from)
-            .ok_or_else(|| VoiceError::BadFromForEncrypted(from.to_string()))?;
-        let derived = derive_key(psk, header.message_id, from_node)?;
-        decrypt_body(&derived, &bytes[..HEADER_SIZE], body)
-    }
-
     /// Drive timeouts and NACK emission. Call periodically (~100 ms cadence).
     pub fn tick(&self) -> TickOutput {
         let cfg = self.cfg.lock().clone();
@@ -359,7 +328,6 @@ impl VoiceAssembler {
                     state.header_template.parity_count,
                     &missing,
                     true,
-                    cfg.channel_psk.as_deref(),
                 );
                 nacks.push(OutboundNack {
                     from: key.0.to_string(),
@@ -414,7 +382,6 @@ impl VoiceAssembler {
                     state.header_template.parity_count,
                     &missing,
                     false,
-                    cfg.channel_psk.as_deref(),
                 );
                 nacks.push(OutboundNack {
                     from: key.0.to_string(),
@@ -650,8 +617,6 @@ mod tests {
             chunk_size: 64,
             parity_count: parity,
             last_in_stream: false,
-            encryption: None,
-            mac_key: None,
         }
     }
 
@@ -670,7 +635,7 @@ mod tests {
         }
         let out = asm.tick();
         assert_eq!(out.nacks.len(), 1);
-        let (h, body) = ChunkHeader::parse(&out.nacks[0].frame, None).unwrap();
+        let (h, body) = ChunkHeader::parse(&out.nacks[0].frame).unwrap();
         let info = parse_nack_body(&h, body).unwrap();
         assert_eq!(info.missing, vec![1, 2]);
     }
@@ -841,7 +806,7 @@ mod tests {
             out.nacks[0].give_up,
             "the final NACK on cap-reached must carry give_up=true"
         );
-        let (h, body) = ChunkHeader::parse(&out.nacks[0].frame, None).unwrap();
+        let (h, body) = ChunkHeader::parse(&out.nacks[0].frame).unwrap();
         let info = parse_nack_body(&h, body).unwrap();
         assert!(
             info.give_up,

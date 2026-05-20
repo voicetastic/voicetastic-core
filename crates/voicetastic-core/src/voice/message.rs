@@ -21,7 +21,6 @@ pub struct VoiceMessage {
     pub received_data: u8,
     pub recovered_via_fec: u8,
     pub channel: u32,
-    pub encrypted: bool,
 }
 
 /// Outcome of feeding a frame to the assembler's `accept`.

@@ -13,7 +13,7 @@ You'll be receiving Meshtastic `Data` packets. Filter:
 
 ```rust
 if data.portnum != PRIVATE_APP as i32 { return; }   // 256
-if detect_version(&data.payload) != Some(0x02) { return; }
+if detect_version(&data.payload) != Some(0x03) { return; }
 ```
 
 The first-byte version check lets future protocol revisions co-exist on
@@ -30,7 +30,7 @@ use std::time::Duration;
 let asm = VoiceAssembler::new(AssemblerConfig {
     message_timeout: Duration::from_secs(30),
     partial_play_on_timeout: true,
-    channel_psk: Some(channel_psk.to_vec()), // None ⇒ encrypted frames are dropped
+    ..AssemblerConfig::default()
 });
 ```
 
@@ -38,7 +38,6 @@ let asm = VoiceAssembler::new(AssemblerConfig {
 |-----------------------------|---------------|---------------------------------------------------------------|
 | `message_timeout`           | 30 s          | Hard timeout per in-progress message.                         |
 | `partial_play_on_timeout`   | `true`        | Emit incomplete messages on timeout (vs. discard).            |
-| `channel_psk`               | `None`        | If `Some`, used to derive AES-GCM envelope keys.              |
 
 ---
 
@@ -55,8 +54,7 @@ match asm.accept(&from_id, to, channel, &payload) {
 ```
 
 `from_id` MUST be the canonical lowercase `!hex8` form
-(`voicetastic_core::ids::node_num_to_id`); the assembler parses it
-strictly when the encryption envelope is involved.
+(`voicetastic_core::ids::node_num_to_id`).
 
 ---
 
@@ -91,7 +89,7 @@ loop {
 
 Recommended cadence: **100–250 ms**. Below that you spin needlessly;
 above that you delay NACK emission past the spec's
-`NACK_WINDOW_MS = 1500`.
+`NACK_WINDOW_MS = 3000`.
 
 ---
 
@@ -107,7 +105,7 @@ The assembler enforces all of these for you:
 | `BLACKLIST_TTL`                    | 60 s        | After a message completes/times out, late frames for it are silently dropped.            |
 | `BLACKLIST_MAX`                    | 100         | Oldest entries evicted FIFO.                                                             |
 | `NACK_MAX_ROUNDS`                  | 400         | After 400 *consecutive* NACK rounds with no new chunks, finalize-or-discard. Resets on every accepted shard.                              |
-| `NACK_WINDOW_MS`                   | 1500        | Quiet period after the last seen chunk before emitting a NACK.                           |
+| `NACK_WINDOW_MS`                   | 3000        | Quiet period after the last seen chunk before emitting a NACK.                           |
 | `MAX_VALIDATION_STRIKES` (impl)    | 3           | After 3 post-template mismatches, the entry is evicted + blacklisted.                    |
 
 ---
@@ -116,7 +114,8 @@ The assembler enforces all of these for you:
 
 The assembler returns `AssemblyEvent::Rejected(VoiceError::*)` for:
 
-- `version != 0x02` (protocol version 2)
+- `version != 0x03` (V2 or future protocol version)
+- Any reserved bit of `type_flags` set (`0x2F` mask)
 - `packet_type == 3` (reserved)
 - `total_data == 0`
 - `chunk_index >= total_data` (DATA) or `>= parity_count` (PARITY)
@@ -125,8 +124,7 @@ The assembler returns `AssemblyEvent::Rejected(VoiceError::*)` for:
 - Codec / `total_data` / `stream_seq` mismatch versus the established
   template
 - DATA / PARITY body length mismatch versus the established `chunk_size`
-- AES-GCM tag failure
-- `encrypted = 1` but no PSK configured, or `from` is not strict `!hex8`
+- Header SHA-256 integrity tag mismatch
 - `(from, message_id)` is on the recently-completed blacklist
 - New `message_id` while the sender is at `MAX_IN_PROGRESS_PER_SENDER`
 
@@ -160,7 +158,6 @@ The fields you'll usually inspect:
 | `is_complete`         | All `total_data` chunks present (after FEC).           |
 | `received_data`       | How many DATA chunks landed (incl. FEC reconstructions).|
 | `recovered_via_fec`   | How many were reconstructed by Reed-Solomon.           |
-| `encrypted`           | Whether any frame in this message was enveloped.       |
 | `audio`               | Raw codec bytes, no container header.                  |
 
 ---
@@ -170,16 +167,13 @@ The fields you'll usually inspect:
 - **Forgetting `tick()`.** Without it, NACKs are never emitted and
   partially-lost messages stall until `message_timeout`.
 - **Passing the wrong `from`.** Use
-  `voicetastic_core::ids::node_num_to_id(packet.from)` — the assembler's
-  encryption path requires the strict `!hex8` form.
+  `voicetastic_core::ids::node_num_to_id(packet.from)` so the assembler
+  receives the canonical lowercase `!hex8` form.
 - **Accepting frames from non-`PRIVATE_APP` ports.** Other apps share the
   same Meshtastic radio; filter by `portnum == 256` *and* the version
   byte.
 - **Wrapping the audio in a container header at the wrong layer.** The
   protocol carries raw codec frames. Wrap to `#!AMR\n` (or whatever) only
   when writing to disk for an external player.
-- **Re-using `channel_psk` between channels.** The HKDF salt is the PSK,
-  so a single PSK across two channels lets messages from one decrypt on
-  the other if the message_id collides.
 
 → Continue to [Constants and Limits](Constants-and-Limits.md).

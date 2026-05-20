@@ -6,8 +6,9 @@
 // and `VoiceAssembler` (receiver). Android keeps its existing BLE / USB
 // transport and Meshtastic state machine; this bridge replaces the
 // Kotlin `VoiceChunker` / `VoiceAssembler` (protocol v1) with calls into
-// `voicetastic-core::voice::*` (protocol v2: 12-byte header, AES-GCM
-// envelope, Reed-Solomon FEC, NACK-driven selective retransmit).
+// `voicetastic-core::voice::*` (protocol v3: 16-byte header with 4-byte
+// SHA-256 integrity tag, Reed-Solomon FEC, NACK-driven selective
+// retransmit; confidentiality from Meshtastic's channel encryption).
 //
 // Out of scope here: `MeshService` facade, `Transport` foreign trait.
 // Add those in a follow-up when we're ready to also retire
@@ -95,7 +96,6 @@ dictionary NackConfig {
     u8 parity_count;
     sequence<u8> missing;
     boolean give_up;
-    sequence<u8>? channel_psk;
 };
 
 // -----------------------------------------------------------------------------
@@ -121,9 +121,6 @@ enum VoiceError {
     "ChunkTooSmall",
     "ChunkTooLarge",
     "BodyLenMismatch",
-    "BadTag",
-    "BodyTooShortForEnv",
-    "EncryptedNack",
     "NackTooShort",
     "Fec",
     "CodecMismatch",
@@ -135,10 +132,7 @@ enum VoiceError {
     "UnsupportedCodec",
     "Blacklisted",
     "PerSenderCap",
-    "EncryptedNoPsk",
-    "BadFromForEncrypted",
     "BadMac",
-    "MacKeyMissing",
     "Rng",
 };
 
@@ -165,13 +159,6 @@ dictionary BuildConfig {
     u32 chunk_size;
     u8 parity_count;
     boolean last_in_stream;
-    /// If `Some`, every DATA/PARITY body is wrapped with the AES-GCM
-    /// envelope keyed by HKDF(channel_psk, message_id || from_node_num).
-    /// `None` keeps bodies plaintext.
-    bytes? channel_psk;
-    /// Only consulted when `channel_psk` is `Some`. Mirrors the `!hex8`
-    /// `from` field on the wire.
-    u32 from_node_num;
 };
 
 /// Output of `build_message`: the wire frames to transmit, in send order.
@@ -200,7 +187,6 @@ dictionary VoiceMessageOut {
     u8 received_data;
     u8 recovered_via_fec;
     u32 channel;
-    boolean encrypted;
 };
 
 /// Parsed NACK contents.
@@ -246,7 +232,6 @@ dictionary TickOutput {
 dictionary AssemblerConfig {
     u64 message_timeout_ms;
     boolean partial_play_on_timeout;
-    bytes? channel_psk;
     u16 max_nack_rounds;
     u64 nack_window_ms;
     u64 completion_memory_ms;
@@ -303,10 +288,6 @@ dictionary SendRequestUdl {
     u32 to_node;
     u8 parity_count;
     u32 chunk_size;
-    /// AES-GCM channel PSK; empty = plaintext bodies.
-    bytes channel_psk;
-    /// Required when `channel_psk` is non-empty; ignored otherwise.
-    u32 from_node_num;
     u64 linger_ms;
     u8 stream_seq;
     boolean last_in_stream;

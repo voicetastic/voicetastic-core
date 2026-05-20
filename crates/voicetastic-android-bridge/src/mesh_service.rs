@@ -508,10 +508,6 @@ impl MeshService {
         dest: Option<u32>,
         pacing_ms: u64,
     ) -> Result<Vec<u32>, MeshServiceError> {
-        let encryption = match cfg.channel_psk.as_ref() {
-            Some(psk) => Some(v::derive_key(psk, cfg.message_id, cfg.from_node_num)?),
-            None => None,
-        };
         let core_cfg = v::BuildConfig {
             message_id: cfg.message_id,
             stream_seq: cfg.stream_seq,
@@ -520,8 +516,6 @@ impl MeshService {
             chunk_size: cfg.chunk_size as usize,
             parity_count: cfg.parity_count,
             last_in_stream: cfg.last_in_stream,
-            encryption,
-            mac_key: cfg.channel_psk.clone(),
         };
         let message = v::build_message(&audio, &core_cfg)?;
         let svc = self.core.clone();

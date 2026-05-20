@@ -5,8 +5,8 @@
 The Voicetastic Voice Protocol layers short voice messages on top of the
 Meshtastic mesh. It runs as a tenant of `PortNum::PRIVATE_APP` (256),
 fragments codec frames into LoRa-sized chunks, recovers loss with
-Reed-Solomon FEC and selective NACKs, and optionally adds an end-to-end
-AES-256-GCM envelope on top of Meshtastic's channel encryption.
+Reed-Solomon FEC and selective NACKs, and delegates confidentiality to
+Meshtastic's channel encryption (AES-256-CTR with the channel PSK).
 
 ---
 
@@ -18,8 +18,10 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
 - **Forward Error Correction** (Reed-Solomon over GF(2⁸)) tolerates loss up
   to `parity_count` chunks without retransmission.
 - **Selective NACKs** with bitmap recover heavier loss in one round-trip.
-- **End-to-end AES-256-GCM envelope** binds each message to its channel +
-  sender, on top of Meshtastic's per-hop AES-CTR.
+- **Confidentiality on the air** comes from Meshtastic's channel
+  encryption (AES-256-CTR with the channel PSK). This protocol does not
+  add its own envelope — V2 did, V3 dropped it (see
+  [Encryption](Encryption.md)).
 - **Resource-bounded** receiver: per-sender + global in-flight caps,
   blacklist for recently-finalized messages, validation-strike eviction
   for chatty bad senders.
@@ -27,7 +29,9 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
 ## What it does *not* do
 
 - No built-in audio codec — bring your own encoder/decoder.
-- No per-recipient end-to-end encryption — the envelope is per-channel.
+- No protocol-layer encryption or authentication. Confidentiality on
+  the air is delegated to Meshtastic; any peer with the channel PSK
+  can read or forge voice frames at this layer.
 - No congestion control beyond adaptive pacing per modem preset.
 - No cross-message ordering — only within a stream via `stream_seq`.
 - No authenticated NACKs — see [Reliability](Reliability-FEC-and-NACK.md#nack-trust-model).
@@ -41,7 +45,7 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
 3. **Codec-agnostic** wire format so codec evolution doesn't bump the
    protocol version.
 4. **Resist abuse** — bound per-sender resource use, reject malformed
-   frames at the earliest possible point, authenticate payloads end-to-end.
+   frames at the earliest possible point.
 5. **Forward-compatible** — a single version byte at offset 0 lets future
    revisions coexist on the same port.
 
@@ -77,6 +81,6 @@ AES-256-GCM envelope on top of Meshtastic's channel encryption.
 ```
 
 The voice protocol is one of many `PRIVATE_APP` tenants. The leading
-version byte (`0x02`) lets receivers triage frames before parsing.
+version byte (`0x03`) lets receivers triage frames before parsing.
 
 → Continue to [Frame Format](Frame-Format.md).

@@ -63,7 +63,6 @@ pub(super) fn finalize(
         received_data: state.received_data,
         recovered_via_fec: state.recovered_via_fec,
         channel: state.channel,
-        encrypted: state.encrypted_seen,
     }
 }
 
@@ -146,7 +145,6 @@ mod tests {
         let mut state = AssemblyState::new(
             super::super::super::header::ChunkHeader {
                 packet_type: super::super::super::types::PacketType::Data,
-                encrypted: false,
                 last_in_stream: false,
                 message_id: 12345,
                 codec,
@@ -155,7 +153,6 @@ mod tests {
                 chunk_index: 0,
                 total_data: 2,
                 parity_count: 0,
-                mac_keyed: false,
             },
             Some(chunk_size),
             destination,
@@ -186,7 +183,6 @@ mod tests {
         let mut state = AssemblyState::new(
             super::super::super::header::ChunkHeader {
                 packet_type: super::super::super::types::PacketType::Data,
-                encrypted: false,
                 last_in_stream: false,
                 message_id: 12345,
                 codec,
@@ -195,7 +191,6 @@ mod tests {
                 chunk_index: 0,
                 total_data: 3,
                 parity_count: 0,
-                mac_keyed: false,
             },
             Some(chunk_size),
             destination,
@@ -233,7 +228,6 @@ mod tests {
         let mut state = AssemblyState::new(
             super::super::super::header::ChunkHeader {
                 packet_type: super::super::super::types::PacketType::Data,
-                encrypted: false,
                 last_in_stream: false,
                 message_id: 12345,
                 codec,
@@ -242,7 +236,6 @@ mod tests {
                 chunk_index: 0,
                 total_data: 2,
                 parity_count: 0,
-                mac_keyed: false,
             },
             Some(chunk_size),
             destination,

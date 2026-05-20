@@ -55,12 +55,6 @@ pub enum VoiceError {
     ChunkTooLarge,
     #[error("body length does not match established chunk_size")]
     BodyLenMismatch,
-    #[error("AES-GCM authentication failed")]
-    BadTag,
-    #[error("body too short for encryption envelope")]
-    BodyTooShortForEnv,
-    #[error("NACK frames must not have the encrypted bit set")]
-    EncryptedNack,
     #[error("NACK frame body too short")]
     NackTooShort,
     #[error("Reed-Solomon error")]
@@ -83,14 +77,8 @@ pub enum VoiceError {
     Blacklisted,
     #[error("per-sender in-flight cap reached")]
     PerSenderCap,
-    #[error("encrypted frame received but no channel PSK is configured")]
-    EncryptedNoPsk,
-    #[error("`from` field is not a valid !hex8 node id (required for encrypted frames)")]
-    BadFromForEncrypted,
     #[error("header MAC mismatch")]
     BadMac,
-    #[error("frame advertises keyed MAC but no channel PSK is configured")]
-    MacKeyMissing,
     #[error("OS RNG unavailable")]
     Rng,
 }
@@ -113,9 +101,6 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::ChunkTooSmall(_) => Self::ChunkTooSmall,
             v::VoiceError::ChunkTooLarge { .. } => Self::ChunkTooLarge,
             v::VoiceError::BodyLenMismatch { .. } => Self::BodyLenMismatch,
-            v::VoiceError::BadTag => Self::BadTag,
-            v::VoiceError::BodyTooShortForEnv(_) => Self::BodyTooShortForEnv,
-            v::VoiceError::EncryptedNack => Self::EncryptedNack,
             v::VoiceError::NackTooShort => Self::NackTooShort,
             v::VoiceError::Fec(_) => Self::Fec,
             v::VoiceError::CodecMismatch { .. } => Self::CodecMismatch,
@@ -127,10 +112,7 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::UnsupportedCodec(_) => Self::UnsupportedCodec,
             v::VoiceError::Blacklisted => Self::Blacklisted,
             v::VoiceError::PerSenderCap(_) => Self::PerSenderCap,
-            v::VoiceError::EncryptedNoPsk => Self::EncryptedNoPsk,
-            v::VoiceError::BadFromForEncrypted(_) => Self::BadFromForEncrypted,
             v::VoiceError::BadMac => Self::BadMac,
-            v::VoiceError::MacKeyMissing => Self::MacKeyMissing,
             v::VoiceError::Rng(_) => Self::Rng,
         }
     }
@@ -186,8 +168,6 @@ pub struct BuildConfig {
     pub chunk_size: u32,
     pub parity_count: u8,
     pub last_in_stream: bool,
-    pub channel_psk: Option<Vec<u8>>,
-    pub from_node_num: u32,
 }
 
 #[derive(Debug)]
@@ -221,10 +201,6 @@ pub fn detect_version(payload: Vec<u8>) -> Option<u8> {
 }
 
 pub fn build_message(audio: Vec<u8>, cfg: BuildConfig) -> Result<EncodedMessage, VoiceError> {
-    let encryption = match cfg.channel_psk.as_ref() {
-        Some(psk) => Some(v::derive_key(psk, cfg.message_id, cfg.from_node_num)?),
-        None => None,
-    };
     let core_cfg = v::BuildConfig {
         message_id: cfg.message_id,
         stream_seq: cfg.stream_seq,
@@ -233,8 +209,6 @@ pub fn build_message(audio: Vec<u8>, cfg: BuildConfig) -> Result<EncodedMessage,
         chunk_size: cfg.chunk_size as usize,
         parity_count: cfg.parity_count,
         last_in_stream: cfg.last_in_stream,
-        encryption,
-        mac_key: cfg.channel_psk.clone(),
     };
     Ok(v::build_message(&audio, &core_cfg)?.into())
 }
@@ -249,7 +223,6 @@ pub struct NackConfig {
     pub parity_count: u8,
     pub missing: Vec<u8>,
     pub give_up: bool,
-    pub channel_psk: Option<Vec<u8>>,
 }
 
 pub fn build_nack(cfg: NackConfig) -> Vec<u8> {
@@ -262,7 +235,6 @@ pub fn build_nack(cfg: NackConfig) -> Vec<u8> {
         cfg.parity_count,
         &cfg.missing,
         cfg.give_up,
-        cfg.channel_psk.as_deref(),
     )
 }
 
@@ -286,7 +258,6 @@ pub struct VoiceMessageOut {
     pub received_data: u8,
     pub recovered_via_fec: u8,
     pub channel: u32,
-    pub encrypted: bool,
 }
 
 impl From<v::VoiceMessage> for VoiceMessageOut {
@@ -310,7 +281,6 @@ impl From<v::VoiceMessage> for VoiceMessageOut {
             received_data: m.received_data,
             recovered_via_fec: m.recovered_via_fec,
             channel: m.channel,
-            encrypted: m.encrypted,
         }
     }
 }
@@ -429,7 +399,6 @@ impl From<v::TickOutput> for TickOutput {
 pub struct AssemblerConfig {
     pub message_timeout_ms: u64,
     pub partial_play_on_timeout: bool,
-    pub channel_psk: Option<Vec<u8>>,
     pub max_nack_rounds: u16,
     pub nack_window_ms: u64,
     pub completion_memory_ms: u64,
@@ -440,7 +409,6 @@ impl From<AssemblerConfig> for v::AssemblerConfig {
         Self {
             message_timeout: Duration::from_millis(c.message_timeout_ms),
             partial_play_on_timeout: c.partial_play_on_timeout,
-            channel_psk: c.channel_psk,
             max_nack_rounds: c.max_nack_rounds,
             nack_window: Duration::from_millis(c.nack_window_ms),
             completion_memory: Duration::from_millis(c.completion_memory_ms),
@@ -586,7 +554,6 @@ impl Default for OutgoingVoiceRegistry {
 /// with UniFFI-friendly type substitutions:
 ///
 /// - `Option<u32> to` is split into `(broadcast, to_node)`.
-/// - `Option<Vec<u8>> channel_psk` is collapsed to an empty `Vec`.
 /// - `Option<Duration> linger` / `pacing` become `u64` ms with `0` = default.
 /// - `Option<usize> chunk_size` becomes `u32` with `0` = default.
 #[derive(Debug)]
@@ -599,8 +566,6 @@ pub struct SendRequestUdl {
     pub to_node: u32,
     pub parity_count: u8,
     pub chunk_size: u32,
-    pub channel_psk: Vec<u8>,
-    pub from_node_num: u32,
     pub linger_ms: u64,
     pub stream_seq: u8,
     pub last_in_stream: bool,
@@ -733,11 +698,6 @@ impl VoiceSender {
         } else {
             Some(Duration::from_millis(req.pacing_ms))
         };
-        let channel_psk = if req.channel_psk.is_empty() {
-            None
-        } else {
-            Some(req.channel_psk.clone())
-        };
         let core_req = v::SendRequest {
             audio: req.audio,
             codec: req.codec.into(),
@@ -750,18 +710,10 @@ impl VoiceSender {
             },
             parity_count: req.parity_count,
             chunk_size,
-            encryption: None,
-            channel_psk,
-            from_node_num: req.from_node_num,
             linger,
             stream_seq: req.stream_seq,
             last_in_stream: req.last_in_stream,
             pacing,
-            mac_key: if req.channel_psk.is_empty() {
-                None
-            } else {
-                Some(req.channel_psk.clone())
-            },
         };
         let handle = self.inner.send(core_req)?;
         let message_id = handle.message_id;
