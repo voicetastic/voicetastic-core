@@ -3,6 +3,8 @@
 
 use std::time::Instant;
 
+use tracing::warn;
+
 use super::super::consts::BLACKLIST_MAX;
 use super::super::message::VoiceMessage;
 use super::state::{AssemblyState, SenderKey};
@@ -28,27 +30,53 @@ pub(super) fn finalize(
     state: AssemblyState,
     complete: bool,
 ) -> VoiceMessage {
-    // chunk_size may still be None if we only ever saw the (trimmed) final
-    // DATA chunk. Fall back to that body's length for capacity hints / fill.
-    let chunk_size = state.chunk_size.unwrap_or_else(|| {
-        state
-            .data_shards
-            .iter()
-            .filter_map(|s| s.as_ref().map(|b| b.len()))
-            .max()
-            .unwrap_or(0)
-    });
-    let mut audio = Vec::with_capacity(chunk_size * state.data_shards.len());
-    for slot in &state.data_shards {
-        match slot {
-            Some(payload) => audio.extend_from_slice(payload),
-            None => {
-                // Missing chunk → fill with zeros (codec-specific silence is
-                // the responsibility of the decoder/playback layer).
-                audio.resize(audio.len() + chunk_size, 0);
+    // chunk_size is only pinned when we receive a non-last DATA or any PARITY
+    // frame, so it can still be None at finalize time. Two cases:
+    //
+    //   total_data == 1 — the single shard is also the (un-padded) last one;
+    //   we just emit its bytes verbatim. The fallback below collapses to that.
+    //
+    //   total_data >  1 with only the last (trimmed) shard observed — we
+    //   genuinely don't know the original chunk_size. Padding the missing
+    //   slots with the trimmed shard's length would silently produce a
+    //   shorter-than-real audio buffer with misaligned data; the decoder
+    //   would then read garbage. Instead, emit the bytes we have without
+    //   leading zero-padding and rely on `is_complete=false` to signal the
+    //   caller that the message is partial.
+    let audio = match state.chunk_size {
+        Some(chunk_size) => {
+            let mut audio = Vec::with_capacity(chunk_size * state.data_shards.len());
+            for slot in &state.data_shards {
+                match slot {
+                    Some(payload) => audio.extend_from_slice(payload),
+                    None => {
+                        // Missing chunk → fill with zeros (codec-specific silence
+                        // is the responsibility of the decoder/playback layer).
+                        audio.resize(audio.len() + chunk_size, 0);
+                    }
+                }
             }
+            audio
         }
-    }
+        None => {
+            if state.header_template.total_data > 1 && !complete {
+                warn!(
+                    from = %from,
+                    message_id = key.1,
+                    total_data = state.header_template.total_data,
+                    received_data = state.received_data,
+                    "finalize: chunk_size unknown (only trimmed last shard seen); \
+                     emitting available bytes without padding"
+                );
+            }
+            state
+                .data_shards
+                .iter()
+                .filter_map(|s| s.as_ref())
+                .flat_map(|b| b.iter().copied())
+                .collect()
+        }
+    };
     VoiceMessage {
         message_id: key.1,
         from: from.to_string(),

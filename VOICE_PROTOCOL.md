@@ -496,14 +496,21 @@ store body at chunks[chunk_index] (DATA) or parity[chunk_index] (PARITY)
   drain (which can outrun the receiver's completion by tens of seconds
   on slow presets) doesn't resurrect a phantom partial reassembly.
   The window should be ≥ the assembler's `message_timeout`.
-- `NACK_MAX_ROUNDS = 32` cumulative per message before the receiver
+- `NACK_MAX_ROUNDS = 400` cumulative per message before the receiver
   gives up. This counter is *not* reset on progress: a sender that
   trickles one shard just before every quiet-window deadline must
   still finish within this many NACK rounds, otherwise the assembler
-  finalizes partial. The previous value of `3` gave up after only
-  ~4–5 s of quiet, which is far too aggressive on slow LoRa presets
-  where inter-chunk gaps routinely exceed a second.
-- `NACK_WINDOW_MS = 1500` after the last seen chunk before issuing a NACK.
+  finalizes partial. Sized so the worst-case consecutive-silence
+  budget (`NACK_MAX_ROUNDS × NACK_WINDOW_MS`) covers the default
+  `message_timeout` of 600 s — i.e. the per-message timeout is the
+  only practical ceiling. Earlier revisions used `3` (gave up after
+  ~4–5 s) and `32` (~48 s); both tripped well before `message_timeout`
+  on slow LoRa presets where inter-chunk gaps routinely exceed a
+  second.
+- `NACK_WINDOW_MS = 3000` after the last seen chunk before issuing a
+  NACK. Receivers apply 3× exponential backoff between rounds
+  (3 s, 9 s, 27 s, 81 s, 243 s cap) so a stuck sender is probed
+  aggressively at first but does not flood the channel indefinitely.
   Global NACK emission is bounded by `MAX_IN_PROGRESS_GLOBAL` per tick;
   senders / transports SHOULD pace NACK transmission per §2.1.
 

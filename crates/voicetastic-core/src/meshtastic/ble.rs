@@ -8,7 +8,7 @@ use std::time::Duration;
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, WriteType};
 use btleplug::platform::{Adapter, Manager, Peripheral, PeripheralId};
 use futures::stream::StreamExt;
-use tokio::sync::{Mutex, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -299,7 +299,7 @@ impl BleManager {
 /// An open Meshtastic GATT connection.
 ///
 /// Wraps a connected [`Peripheral`] plus the three characteristics we need.
-/// All `to_radio` writes are serialised by an internal [`Semaphore`] and
+/// All `to_radio` writes are serialised by an internal [`Mutex`] and
 /// guarded by [`WRITE_TIMEOUT`] to match the Kotlin write-gate that prevents
 /// `GATT_WRITE_REQUEST_BUSY`.
 pub struct Connection {
@@ -307,7 +307,6 @@ pub struct Connection {
     to_radio: btleplug::api::Characteristic,
     from_radio: btleplug::api::Characteristic,
     write_lock: Arc<Mutex<()>>,
-    write_sema: Arc<Semaphore>,
     read_lock: Arc<Mutex<()>>,
     shutdown: watch::Sender<bool>,
 }
@@ -408,7 +407,6 @@ impl Connection {
             to_radio,
             from_radio,
             write_lock: Arc::new(Mutex::new(())),
-            write_sema: Arc::new(Semaphore::new(1)),
             read_lock: Arc::new(Mutex::new(())),
             shutdown: watch::channel(false).0,
         })
@@ -425,11 +423,6 @@ impl Connection {
     /// down. Pick the `WriteType` from the characteristic's declared
     /// properties so we match whichever flag the firmware exposes.
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
-        let _permit = self
-            .write_sema
-            .acquire()
-            .await
-            .map_err(|_| Error::Other("write semaphore closed".into()))?;
         let _g = self.write_lock.lock().await;
         let kind = if self
             .to_radio

@@ -192,6 +192,12 @@ impl VoiceAssembler {
 
         // Validate consistency vs. the established header template. After
         // MAX_VALIDATION_STRIKES the entry is evicted + blacklisted.
+        //
+        // The counter intentionally accumulates without resetting on a
+        // subsequent good frame: a sender that occasionally interleaves
+        // a malformed retransmit alongside valid ones should still be
+        // evicted within MAX_VALIDATION_STRIKES total mismatches. The
+        // saturating `u8` makes overflow a non-issue.
         if let Err(err) = validate_template(state, &header) {
             state.validation_strikes = state.validation_strikes.saturating_add(1);
             if state.validation_strikes >= MAX_VALIDATION_STRIKES {

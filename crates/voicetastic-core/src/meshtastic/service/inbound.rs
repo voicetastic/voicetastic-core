@@ -5,10 +5,13 @@ use tracing::{debug, info, warn};
 
 use crate::error::Result;
 use crate::ids::node_num_to_id;
-use crate::ports::MAX_TEXT_BYTES;
+use crate::node::NodeId;
+use crate::ports::{BROADCAST_ADDR, MAX_TEXT_BYTES, PRIVATE_APP};
 use crate::proto::{
     AdminMessage, FromRadio, MeshPacket, PortNum, admin_message, config, from_radio, mesh_packet,
 };
+use crate::radio_service::VoiceData;
+use crate::voice::{PROTOCOL_VERSION as VOICE_PROTOCOL_VERSION, VoiceDestination, detect_version};
 
 use super::{ConnectionState, IncomingData, IncomingText, MeshtasticService};
 
@@ -168,8 +171,19 @@ impl MeshtasticService {
     }
 
     fn handle_packet(&self, pkt: MeshPacket) {
-        let Some(mesh_packet::PayloadVariant::Decoded(data)) = pkt.payload_variant.as_ref() else {
-            return;
+        let data = match pkt.payload_variant.as_ref() {
+            Some(mesh_packet::PayloadVariant::Decoded(d)) => d,
+            Some(mesh_packet::PayloadVariant::Encrypted(bytes)) => {
+                debug!(
+                    from = pkt.from,
+                    to = pkt.to,
+                    channel = pkt.channel,
+                    len = bytes.len(),
+                    "dropping encrypted MeshPacket (channel decrypt not yet implemented)"
+                );
+                return;
+            }
+            None => return,
         };
         let portnum = data.portnum;
         let mut payload = data.payload.clone();
@@ -233,6 +247,25 @@ impl MeshtasticService {
                     payload = e.into_bytes();
                 }
             }
+        }
+        // Tap PRIVATE_APP voice frames matching our wire version onto the
+        // protocol-agnostic RadioService channel, so callers using only the
+        // trait API receive voice traffic without having to know about
+        // PortNum or the version byte. Legacy consumers continue to read
+        // from `incoming_data_tx` below.
+        if portnum == PRIVATE_APP as i32 && detect_version(&payload) == Some(VOICE_PROTOCOL_VERSION)
+        {
+            let dest = if pkt.to == BROADCAST_ADDR {
+                VoiceDestination::Broadcast
+            } else {
+                VoiceDestination::Node(NodeId::from_u32(pkt.to))
+            };
+            let _ = self.inner.voice_data_tx.send(VoiceData {
+                from: NodeId::from_u32(pkt.from),
+                to: dest,
+                channel: pkt.channel,
+                payload: payload.clone(),
+            });
         }
         let _ = self.inner.incoming_data_tx.send(IncomingData {
             from: pkt.from,

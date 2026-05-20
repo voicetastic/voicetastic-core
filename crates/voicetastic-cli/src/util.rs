@@ -16,5 +16,11 @@ pub async fn read_stdin_line() -> Result<String> {
     BufReader::new(tokio::io::stdin())
         .read_line(&mut line)
         .await?;
-    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!(
+            "empty message body (stdin EOF or blank line); pass --message or pipe non-empty text"
+        ));
+    }
+    Ok(trimmed)
 }

@@ -85,6 +85,11 @@ struct Inner {
     ble: tokio::sync::OnceCell<BleManager>,
     transport: Mutex<Option<Arc<dyn Transport>>>,
     state_tx: watch::Sender<ConnectionState>,
+    /// Mirror of `state_tx` in the protocol-agnostic [`RadioConnectionState`]
+    /// type. A single forwarder task (spawned in [`MeshtasticService::new`])
+    /// keeps it in sync, so [`RadioService::watch_state`] can hand out
+    /// subscribers cheaply instead of spawning a fresh adapter task per call.
+    radio_state_tx: watch::Sender<RadioConnectionState>,
     my_info_tx: watch::Sender<Option<MyNodeInfo>>,
     nodes_tx: watch::Sender<HashMap<u32, NodeInfo>>,
     config_complete_tx: broadcast::Sender<u32>,
@@ -141,6 +146,7 @@ struct Inner {
 impl MeshtasticService {
     pub async fn new() -> Result<Self> {
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
+        let (radio_state_tx, _) = watch::channel(map_conn_state(ConnectionState::Disconnected));
         let (my_info_tx, _) = watch::channel(None);
         let (nodes_tx, _) = watch::channel(HashMap::new());
         let (config_complete_tx, _) = broadcast::channel(8);
@@ -175,6 +181,7 @@ impl MeshtasticService {
             ble: tokio::sync::OnceCell::new(),
             transport: Mutex::new(None),
             state_tx,
+            radio_state_tx,
             my_info_tx,
             nodes_tx,
             radio_queue_free: parking_lot::Mutex::new(u32::MAX),
@@ -248,6 +255,21 @@ impl MeshtasticService {
                     }
                     #[cfg(not(feature = "serial-tokio"))]
                     let _ = (path, baud);
+                }
+            });
+        }
+        // RadioService state forwarder: one long-lived task that maps the
+        // internal `ConnectionState` watch onto the protocol-agnostic
+        // `RadioConnectionState` watch. Holds a `Weak<Inner>` so it shuts
+        // down when the last external `MeshtasticService` clone drops.
+        {
+            let weak = Arc::downgrade(&inner);
+            let mut rx = inner.state_tx.subscribe();
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    let Some(inner) = weak.upgrade() else { return };
+                    let state = *rx.borrow();
+                    let _ = inner.radio_state_tx.send(map_conn_state(state));
                 }
             });
         }
@@ -585,15 +607,30 @@ impl MeshtasticService {
 
     /// Spawn a one-shot task that reverts `Configuring` to `Connected` if the
     /// device never sends `ConfigCompleteId` within [`CONFIG_BURST_TIMEOUT`].
+    /// Re-sends `WantConfigId` once at the first timeout (in case the original
+    /// request was dropped) and waits another window before giving up.
     /// Cheap to call repeatedly; tasks self-exit if state has already moved on.
     fn spawn_config_watchdog(&self) {
         let svc = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(CONFIG_BURST_TIMEOUT).await;
+            if *svc.inner.state_tx.borrow() != ConnectionState::Configuring {
+                return;
+            }
+            warn!(
+                timeout_s = CONFIG_BURST_TIMEOUT.as_secs(),
+                "config burst did not complete; retrying WantConfigId once"
+            );
+            if let Err(e) = svc.send_want_config().await {
+                warn!(?e, "config-burst retry send failed; reverting to Connected");
+                svc.set_state(ConnectionState::Connected);
+                return;
+            }
+            tokio::time::sleep(CONFIG_BURST_TIMEOUT).await;
             if *svc.inner.state_tx.borrow() == ConnectionState::Configuring {
                 warn!(
-                    timeout_s = CONFIG_BURST_TIMEOUT.as_secs(),
-                    "config burst did not complete; reverting to Connected"
+                    timeout_s = CONFIG_BURST_TIMEOUT.as_secs() * 2,
+                    "config burst still incomplete after retry; reverting to Connected"
                 );
                 svc.set_state(ConnectionState::Connected);
             }
@@ -823,6 +860,16 @@ mod tests {
     }
 }
 
+fn map_conn_state(s: ConnectionState) -> RadioConnectionState {
+    match s {
+        ConnectionState::Disconnected => RadioConnectionState::Disconnected,
+        ConnectionState::Connecting => RadioConnectionState::Connecting,
+        ConnectionState::Connected => RadioConnectionState::Connected,
+        ConnectionState::Configuring => RadioConnectionState::Configuring,
+        ConnectionState::Ready => RadioConnectionState::Ready,
+    }
+}
+
 // RadioService trait implementation
 #[async_trait::async_trait]
 impl radio_service::RadioService for MeshtasticService {
@@ -844,28 +891,7 @@ impl radio_service::RadioService for MeshtasticService {
     }
 
     fn watch_state(&self) -> watch::Receiver<RadioConnectionState> {
-        // NOTE: Both types are identical, so we can safely cast
-        // TODO: Unify the types in a future refactor
-        let mut rx = self.watch_state();
-        let (tx, rx_out) = watch::channel(unsafe {
-            std::mem::transmute::<types::ConnectionState, RadioConnectionState>(
-                ConnectionState::Disconnected,
-            )
-        });
-        tokio::spawn(async move {
-            loop {
-                if rx.changed().await.is_err() {
-                    break;
-                }
-                let state = *rx.borrow();
-                // Safe because ConnectionState in both modules is identical
-                let mapped = unsafe {
-                    std::mem::transmute::<types::ConnectionState, RadioConnectionState>(state)
-                };
-                let _ = tx.send(mapped);
-            }
-        });
-        rx_out
+        self.inner.radio_state_tx.subscribe()
     }
 
     fn watch_nodes(&self) -> watch::Receiver<HashMap<NodeId, crate::node::NodeSummary>> {
