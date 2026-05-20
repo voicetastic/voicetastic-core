@@ -589,4 +589,19 @@ impl crate::Transport for Connection {
     async fn disconnect(&self) -> Result<()> {
         Connection::disconnect(self).await
     }
+
+    fn max_tx_payload(&self) -> usize {
+        // Query the live negotiated ATT MTU and subtract the 3-byte
+        // ATT header (1 opcode + 2 handle). The Meshtastic firmware's
+        // BLE stack does not implement GATT Long Write — anything
+        // past MTU − 3 in a single write is silently dropped by the
+        // controller. Modern firmwares negotiate MTU = 255 (effective
+        // 252), pre-negotiation peripherals report MTU = 23 (the BLE
+        // default), so we clamp up to a sensible floor that still
+        // gives the voice sender room to chunk audio meaningfully if
+        // a send fires before MTU negotiation completes.
+        const BLE_MTU_FLOOR: u16 = 255;
+        let mtu = self.peripheral.mtu().max(BLE_MTU_FLOOR);
+        usize::from(mtu).saturating_sub(3)
+    }
 }

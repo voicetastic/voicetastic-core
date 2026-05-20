@@ -17,6 +17,7 @@ mod voice_tx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
@@ -84,6 +85,13 @@ struct Inner {
     #[cfg(feature = "ble-btleplug")]
     ble: tokio::sync::OnceCell<BleManager>,
     transport: Mutex<Option<Arc<dyn Transport>>>,
+    /// Cached snapshot of [`Transport::max_tx_payload`] from whichever
+    /// transport is currently connected. Read on the sync hot path by
+    /// [`VoiceFrameSink::max_voice_body_size`] (which can't `.await`
+    /// the `transport` mutex) and refreshed at every connect /
+    /// disconnect site. Defaults to [`usize::MAX`] so the absence of a
+    /// transport doesn't artificially throttle chunk sizing in tests.
+    transport_max_tx_payload: AtomicUsize,
     state_tx: watch::Sender<ConnectionState>,
     /// Mirror of `state_tx` in the protocol-agnostic [`RadioConnectionState`]
     /// type. A single forwarder task (spawned in [`MeshtasticService::new`])
@@ -180,6 +188,7 @@ impl MeshtasticService {
             #[cfg(feature = "ble-btleplug")]
             ble: tokio::sync::OnceCell::new(),
             transport: Mutex::new(None),
+            transport_max_tx_payload: AtomicUsize::new(usize::MAX),
             state_tx,
             radio_state_tx,
             my_info_tx,
@@ -399,6 +408,9 @@ impl MeshtasticService {
     ) -> Result<()> {
         {
             let mut slot = self.inner.transport.lock().await;
+            self.inner
+                .transport_max_tx_payload
+                .store(transport.max_tx_payload(), Ordering::Relaxed);
             *slot = Some(transport);
         }
         self.set_state(ConnectionState::Connected);
@@ -460,6 +472,9 @@ impl MeshtasticService {
             svc.set_state(ConnectionState::Disconnected);
             let mut slot = svc.inner.transport.lock().await;
             *slot = None;
+            svc.inner
+                .transport_max_tx_payload
+                .store(usize::MAX, Ordering::Relaxed);
             drop(slot);
             // Auto-reconnect so the user doesn't have to manually
             // reconnect after a USB CDC ACM endpoint stall.
@@ -553,6 +568,9 @@ impl MeshtasticService {
         *self.inner.reconnect_config.lock().await = None;
         let transport = {
             let mut slot = self.inner.transport.lock().await;
+            self.inner
+                .transport_max_tx_payload
+                .store(usize::MAX, Ordering::Relaxed);
             slot.take()
         };
         if let Some(t) = transport {
@@ -958,5 +976,23 @@ impl crate::voice::sink::VoiceFrameSink for MeshtasticService {
 
     fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData> {
         <Self as radio_service::RadioService>::subscribe_voice_data(self)
+    }
+
+    fn max_voice_body_size(&self) -> usize {
+        // ToRadio wrapping adds protobuf field tags + length varints +
+        // MeshPacket headers (from/to/id/channel/portnum) on top of
+        // the raw voice frame (16-byte header + body). Empirically
+        // ~32-44 bytes depending on varint width; 48 is a safe upper
+        // bound that leaves headroom across all realistic from/to/id
+        // values without slicing into transports' usable payload.
+        const TORADIO_OVERHEAD_BYTES: usize = 48;
+        const HEADER_SIZE: usize = crate::voice::consts::HEADER_SIZE;
+        const MAX_BODY_SIZE: usize = crate::voice::consts::MAX_BODY_SIZE;
+
+        let tx_max = self.inner.transport_max_tx_payload.load(Ordering::Relaxed);
+        tx_max
+            .saturating_sub(TORADIO_OVERHEAD_BYTES)
+            .saturating_sub(HEADER_SIZE)
+            .min(MAX_BODY_SIZE)
     }
 }

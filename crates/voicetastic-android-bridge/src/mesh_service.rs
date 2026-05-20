@@ -336,6 +336,22 @@ impl Transport for ForeignTransportAdapter {
             .map_err(|e| voicetastic_core::Error::Other(format!("shutdown join: {e}")))?;
         Ok(())
     }
+
+    fn max_tx_payload(&self) -> usize {
+        // Android only currently uses this adapter for BLE and USB
+        // serial. BLE caps at MTU − 3 = 252 (most Meshtastic firmwares
+        // negotiate MTU = 255 and silently truncate beyond that
+        // because their GATT stack doesn't implement Long Write);
+        // USB serial has no real cap. We can't tell here which
+        // transport the foreign object actually wraps, so report the
+        // tighter of the two — USB users pay ~7% extra frames per
+        // voice message, which is cheap compared to losing frames
+        // entirely on BLE.
+        //
+        // If/when the foreign trait grows a `max_tx_payload` method,
+        // this can delegate to it for transport-accurate sizing.
+        252
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -38,4 +38,24 @@ pub trait Transport: Send + Sync {
     /// [`crate::service::MeshService::disconnect`] and on inbound stream
     /// EOF. Implementations should be idempotent.
     async fn disconnect(&self) -> Result<()>;
+
+    /// Maximum bytes per single [`write_to_radio`](Self::write_to_radio)
+    /// call that the transport can carry without truncation.
+    ///
+    /// Returns [`usize::MAX`] by default for transports with no fixed
+    /// per-write cap (USB serial, in-process loopback). BLE transports
+    /// should override to return `negotiated_ATT_MTU − 3`: GATT
+    /// characteristic writes are hard-capped at that size and any
+    /// excess is silently dropped by the controller. Most Meshtastic
+    /// firmwares cap the negotiated MTU at 255, leaving 252 bytes per
+    /// write; the firmware's BLE stack does NOT implement GATT
+    /// Long Write (Prepare/Execute), so going past this cap is a
+    /// guaranteed silent drop.
+    ///
+    /// Used by [`crate::voice::sender::VoiceSender`] (via the
+    /// [`crate::voice::sink::VoiceFrameSink`] trait) to size voice
+    /// chunks so each wire frame fits in a single transport write.
+    fn max_tx_payload(&self) -> usize {
+        usize::MAX
+    }
 }

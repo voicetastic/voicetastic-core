@@ -65,6 +65,7 @@ use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
 use crate::voice::outgoing::{OutgoingVoiceRegistry, RetransmitSkipReason};
+use crate::voice::sink::VoiceFrameSink;
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
 /// Default linger window after the initial burst. Matches the
@@ -294,7 +295,19 @@ impl VoiceSender {
     pub fn send(self: &Arc<Self>, req: SendRequest) -> Result<SendHandle, VoiceError> {
         let message_id = random_message_id()?;
 
-        let chunk_size = req.chunk_size.unwrap_or(MAX_BODY_SIZE);
+        // Clamp the per-chunk body size to whatever the underlying
+        // transport can deliver intact in a single write. For BLE this
+        // is `negotiated_MTU − 3 − ToRadio_overhead − HEADER_SIZE`;
+        // for USB serial / loopback it's `MAX_BODY_SIZE`. Honour an
+        // explicit override from the caller but still cap it at the
+        // transport limit — a caller asking for a body bigger than the
+        // wire can carry would otherwise silently lose chunks past
+        // the transport's truncation point.
+        let transport_max_body = self.svc.max_voice_body_size().min(MAX_BODY_SIZE);
+        let chunk_size = req
+            .chunk_size
+            .unwrap_or(transport_max_body)
+            .min(transport_max_body);
         let cfg = BuildConfig {
             message_id,
             stream_seq: req.stream_seq,

@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 use crate::Result;
 use crate::node::NodeId;
 use crate::radio_service::VoiceData;
+use crate::voice::consts::MAX_BODY_SIZE;
 
 /// Minimal interface for voice frame transmission.
 ///
@@ -35,4 +36,17 @@ pub trait VoiceFrameSink: Send + Sync {
     /// Subscribe to inbound voice data (used by NACK listener to find packets
     /// targeting our outgoing messages). Pre-filtered; only voice frames arrive.
     fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData>;
+
+    /// Maximum voice-frame body size (excluding the 16-byte chunk
+    /// header) that this sink can carry intact in a single outbound
+    /// frame. The voice sender uses this to size [`SendRequest::chunk_size`]
+    /// when the caller doesn't specify one, and to clamp explicit
+    /// requests down to a transport-safe value.
+    ///
+    /// Returns [`MAX_BODY_SIZE`] by default for sinks with no fixed
+    /// per-frame cap (loopback, USB serial). BLE-backed sinks return
+    /// `transport_mtu − 3 − HEADER_SIZE − ToRadio_overhead`.
+    fn max_voice_body_size(&self) -> usize {
+        MAX_BODY_SIZE
+    }
 }
