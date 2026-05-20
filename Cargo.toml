@@ -15,7 +15,7 @@ members = [
 version = "0.0.0-git"
 edition = "2024"
 rust-version = "1.95"
-license = "MIT"
+license = "GPL-3.0-or-later"
 repository = "https://git.cha-sam.re/acarteron/voicetastic-desktop"
 
 [workspace.dependencies]

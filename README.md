@@ -147,4 +147,4 @@ Full key reference: [`docs/wiki/Settings.md`](docs/wiki/Settings.md).
 
 ## License
 
-MIT
+GPL-3.0-or-later. See [LICENSE](LICENSE) for the full text.
