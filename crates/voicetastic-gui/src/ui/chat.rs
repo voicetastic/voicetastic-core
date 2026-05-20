@@ -453,7 +453,8 @@ fn render_idle(app: &mut VoicetasticApp, ui: &mut egui::Ui, max_secs: u32) -> Vo
                 }
                 voicetastic_core::settings::OpusBandwidthKind::Wide => audio::OpusBandwidth::Wide,
             };
-            match Recorder::start(max_secs, codec, codec_param, opus_bw) {
+            let denoise = app.settings.voice_denoise_enabled();
+            match Recorder::start(max_secs, codec, codec_param, opus_bw, denoise) {
                 Ok(rec) => {
                     return VoiceCompose::Recording(rec);
                 }

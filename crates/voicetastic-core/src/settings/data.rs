@@ -89,6 +89,11 @@ pub const OPUS_BANDWIDTH_WIDE: &str = "wide";
 /// character on upgrade.
 pub const DEFAULT_OPUS_BANDWIDTH: &str = OPUS_BANDWIDTH_WIDE;
 
+/// Default for the capture-side RNNoise noise-suppression toggle. Off so
+/// the recording pipeline is unchanged on upgrade and headless builds
+/// (where the `denoise` feature may be disabled) don't surprise users.
+pub const DEFAULT_VOICE_DENOISE_ENABLED: bool = false;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -141,6 +146,14 @@ pub struct AppSettings {
     /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_opus_bandwidth: Option<String>,
+
+    /// When `Some(true)`, capture runs through the RNNoise-based
+    /// denoiser before the encoder. `None` falls back to
+    /// [`DEFAULT_VOICE_DENOISE_ENABLED`]. On builds without the
+    /// `voicetastic-core/denoise` feature, the setting persists but the
+    /// runtime is a passthrough.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_denoise_enabled: Option<bool>,
 }
 
 impl AppSettings {
@@ -201,6 +214,12 @@ impl AppSettings {
             Some(OPUS_BANDWIDTH_WIDE) => OPUS_BANDWIDTH_WIDE,
             _ => DEFAULT_OPUS_BANDWIDTH,
         }
+    }
+
+    /// Effective capture-side noise-suppression toggle.
+    pub fn voice_denoise_enabled(&self) -> bool {
+        self.voice_denoise_enabled
+            .unwrap_or(DEFAULT_VOICE_DENOISE_ENABLED)
     }
 
     /// Load from the config path, or return defaults if the file is missing

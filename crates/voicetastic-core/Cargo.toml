@@ -32,6 +32,10 @@ tokio-serial = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
 codec2 = { workspace = true, optional = true }
 
+# Optional RNNoise-based denoiser, runs on 48 kHz mono f32 frames just
+# before `Encoder::push`. Pure Rust — adds no native deps.
+nnnoiseless = { workspace = true, optional = true }
+
 # Linux-only DBus client for the in-process BlueZ pairing agent. Always
 # compiled on Linux (no opt-in needed); the `pairing` module is also gated
 # on `feature = "ble-btleplug"` so a serial-only Linux build does not pull
@@ -50,6 +54,10 @@ serial-tokio = ["dep:tokio-serial"]
 # Codec encode/decode for Opus, Codec2, and AMR-NB. Enabled by GUI's `audio`
 # feature; not enabled by default so headless/embedded consumers stay lean.
 codecs = ["dep:opus", "dep:codec2"]
+# RNNoise-based capture-side noise suppression. Pulled in by the GUI's
+# `audio` feature so the runtime toggle in voice settings actually denoises;
+# without it, the toggle is a no-op (the Denoiser type is still present).
+denoise = ["dep:nnnoiseless"]
 
 [build-dependencies]
 prost-build = { workspace = true }

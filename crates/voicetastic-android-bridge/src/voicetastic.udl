@@ -422,6 +422,7 @@ enum SettingKey {
     "VoiceAmrnbMode",
     "VoiceOpusBitrateKbps",
     "VoiceOpusBandwidth",
+    "VoiceDenoiseEnabled",
 };
 
 /// Typed mirror of the `voice.codec` value.
@@ -437,6 +438,7 @@ interface SettingKind {
     OptionalString();
     IntRange(u32 min, u32 max);
     EnumVariants(sequence<string> variants);
+    Bool();
 };
 
 /// Static + dynamic metadata about one setting.
@@ -490,6 +492,10 @@ interface SettingsApi {
     u8 voice_amrnb_mode();
     [Throws=SettingsError]
     void set_voice_amrnb_mode(u8 mode);
+
+    boolean voice_denoise_enabled();
+    [Throws=SettingsError]
+    void set_voice_denoise_enabled(boolean enabled);
 };
 
 // -----------------------------------------------------------------------------

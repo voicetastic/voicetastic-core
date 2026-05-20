@@ -51,7 +51,9 @@ mod imp {
     use cpal::{SampleFormat, SupportedStreamConfig};
     use parking_lot::Mutex;
 
-    use voicetastic_core::codec::{self, Encoder, Resampler, SAMPLE_RATE_HZ};
+    use voicetastic_core::codec::{
+        self, DENOISE_FRAME_SIZE, Denoiser, Encoder, Resampler, SAMPLE_RATE_HZ,
+    };
 
     // ------------------------------------------------------------------
     // Input helpers
@@ -137,6 +139,7 @@ mod imp {
         codec_id: VoiceCodec,
         codec_param: u8,
         opus_bw: OpusBandwidth,
+        denoise: bool,
         ready: mpsc::SyncSender<Result<(), AudioError>>,
     ) -> Result<RecordedClip, AudioError> {
         let host = cpal::default_host();
@@ -160,6 +163,7 @@ mod imp {
             format = ?cfg.sample_format(),
             codec = ?codec_id,
             codec_param,
+            denoise,
             "opening capture device"
         );
 
@@ -181,6 +185,8 @@ mod imp {
         let _ = ready.send(Ok(()));
 
         let mut enc = Encoder::new(codec_id, codec_param, opus_bw)?;
+        let mut denoiser = if denoise { Some(Denoiser::new()) } else { None };
+        let mut clean = Vec::<f32>::with_capacity(SAMPLE_RATE_HZ as usize / 50);
         let mut total_48k_samples: usize = 0;
         let started = Instant::now();
 
@@ -191,8 +197,18 @@ mod imp {
                 std::mem::take(&mut *b)
             };
             if !drained.is_empty() {
-                total_48k_samples += drained.len();
-                enc.push(&drained)?;
+                let frame = match &mut denoiser {
+                    Some(d) => {
+                        clean.clear();
+                        d.process(&drained, &mut clean);
+                        clean.as_slice()
+                    }
+                    None => drained.as_slice(),
+                };
+                if !frame.is_empty() {
+                    total_48k_samples += frame.len();
+                    enc.push(frame)?;
+                }
             }
         }
 
@@ -201,9 +217,18 @@ mod imp {
             let mut b = buffer.lock();
             std::mem::take(&mut *b)
         };
-        if !tail.is_empty() {
-            total_48k_samples += tail.len();
-            enc.push(&tail)?;
+        let tail_frame: Vec<f32> = match &mut denoiser {
+            Some(d) => {
+                let mut out = Vec::with_capacity(tail.len() + DENOISE_FRAME_SIZE);
+                d.process(&tail, &mut out);
+                d.flush(&mut out);
+                out
+            }
+            None => tail,
+        };
+        if !tail_frame.is_empty() {
+            total_48k_samples += tail_frame.len();
+            enc.push(&tail_frame)?;
         }
 
         let payload = enc.finish()?;
@@ -237,6 +262,7 @@ mod imp {
             codec_id: VoiceCodec,
             codec_param: u8,
             opus_bw: OpusBandwidth,
+            denoise: bool,
         ) -> Result<Self, AudioError> {
             let max = Duration::from_secs(max_secs.max(1) as u64);
             let stop = Arc::new(AtomicBool::new(false));
@@ -246,7 +272,15 @@ mod imp {
             let thread = std::thread::Builder::new()
                 .name("voicetastic-rec".into())
                 .spawn(move || {
-                    run_capture(stop_thread, max, codec_id, codec_param, opus_bw, ready_tx)
+                    run_capture(
+                        stop_thread,
+                        max,
+                        codec_id,
+                        codec_param,
+                        opus_bw,
+                        denoise,
+                        ready_tx,
+                    )
                 })
                 .map_err(backend)?;
 
@@ -523,6 +557,7 @@ mod imp {
             _codec: VoiceCodec,
             _codec_param: u8,
             _opus_bw: OpusBandwidth,
+            _denoise: bool,
         ) -> Result<Self, AudioError> {
             Err(AudioError::FeatureDisabled)
         }

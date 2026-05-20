@@ -783,6 +783,7 @@ pub enum SettingKey {
     VoiceAmrnbMode,
     VoiceOpusBitrateKbps,
     VoiceOpusBandwidth,
+    VoiceDenoiseEnabled,
 }
 
 impl From<SettingKey> for s::SettingKey {
@@ -796,6 +797,7 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
             SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
+            SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
         }
     }
 }
@@ -811,6 +813,7 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceAmrnbMode => Self::VoiceAmrnbMode,
             s::SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             s::SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
+            s::SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
         }
     }
 }
@@ -847,6 +850,7 @@ pub enum SettingKind {
     OptionalString,
     IntRange { min: u32, max: u32 },
     EnumVariants { variants: Vec<String> },
+    Bool,
 }
 
 impl From<s::SettingKind> for SettingKind {
@@ -857,6 +861,7 @@ impl From<s::SettingKind> for SettingKind {
             s::SettingKind::Enum { variants } => Self::EnumVariants {
                 variants: variants.iter().map(|v| (*v).to_string()).collect(),
             },
+            s::SettingKind::Bool => Self::Bool,
         }
     }
 }
@@ -967,6 +972,16 @@ impl SettingsApi {
 
     pub fn set_voice_amrnb_mode(&self, mode: u8) -> Result<(), SettingsError> {
         self.0.set_voice_amrnb_mode(mode).map_err(Into::into)
+    }
+
+    pub fn voice_denoise_enabled(&self) -> bool {
+        self.0.voice_denoise_enabled()
+    }
+
+    pub fn set_voice_denoise_enabled(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.0
+            .set_voice_denoise_enabled(enabled)
+            .map_err(Into::into)
     }
 }
 

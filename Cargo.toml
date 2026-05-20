@@ -79,6 +79,11 @@ egui = "0.34.2"
 opus = "0.3"
 codec2 = "0.3"
 
+# RNNoise-based noise suppression (optional via core's `denoise` feature).
+# `default-features = false` to skip the bundled CLI binary's deps (clap,
+# hound, dasp, ...). Pure Rust — no native deps.
+nnnoiseless = { version = "0.5", default-features = false }
+
 # Android UniFFI bridge
 uniffi = { version = "=0.29.5" }
 

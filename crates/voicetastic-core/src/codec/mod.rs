@@ -33,9 +33,11 @@
 //!   The actual encode/decode work goes through `libopencore-amrnb` over
 //!   raw FFI.
 
+mod denoise;
 mod error;
 mod resampler;
 
+pub use denoise::{DENOISE_FRAME_SIZE, Denoiser, denoise_available};
 pub use error::CodecError;
 pub use resampler::Resampler;
 

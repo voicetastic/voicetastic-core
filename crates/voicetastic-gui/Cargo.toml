@@ -20,7 +20,7 @@ path = "src/main.rs"
 # Note: The "audio" feature depends on "voicetastic-core/codecs". Any changes
 # to the codec feature list in voicetastic-core should be reflected here.
 default = ["audio"]
-audio = ["dep:cpal", "voicetastic-core/codecs"]
+audio = ["dep:cpal", "voicetastic-core/codecs", "voicetastic-core/denoise"]
 
 [dependencies]
 voicetastic-core = { workspace = true }

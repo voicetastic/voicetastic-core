@@ -20,10 +20,10 @@ use crate::voice::VoiceCodec;
 use super::data::{
     AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
     DEFAULT_OPUS_BANDWIDTH, DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
-    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_MAX_SECS, OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE,
-    OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, REASSEMBLY_TIMEOUT_LOWER_SECS,
-    REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS,
-    VOICE_MAX_SECS_UPPER, config_path,
+    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED, DEFAULT_VOICE_MAX_SECS,
+    OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN,
+    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB,
+    VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER, config_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,8 @@ pub enum SettingKey {
     VoiceOpusBitrateKbps,
     /// Opus audio bandwidth (`narrow` | `wide`).
     VoiceOpusBandwidth,
+    /// Capture-side RNNoise noise-suppression toggle.
+    VoiceDenoiseEnabled,
 }
 
 impl SettingKey {
@@ -76,6 +78,7 @@ impl SettingKey {
             Self::VoiceAmrnbMode => "voice.amrnb_mode",
             Self::VoiceOpusBitrateKbps => "voice.opus_bitrate_kbps",
             Self::VoiceOpusBandwidth => "voice.opus_bandwidth",
+            Self::VoiceDenoiseEnabled => "voice.denoise_enabled",
         }
     }
 
@@ -89,6 +92,7 @@ impl SettingKey {
             "voice.amrnb_mode" => Self::VoiceAmrnbMode,
             "voice.opus_bitrate_kbps" => Self::VoiceOpusBitrateKbps,
             "voice.opus_bandwidth" => Self::VoiceOpusBandwidth,
+            "voice.denoise_enabled" => Self::VoiceDenoiseEnabled,
             _ => return None,
         })
     }
@@ -103,6 +107,7 @@ impl SettingKey {
             SettingKey::VoiceAmrnbMode,
             SettingKey::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth,
+            SettingKey::VoiceDenoiseEnabled,
         ]
     }
 }
@@ -142,6 +147,9 @@ pub enum SettingKind {
     IntRange { min: u32, max: u32 },
     /// Enumerated, e.g. codec id. `variants` lists every accepted token.
     Enum { variants: Vec<&'static str> },
+    /// Boolean toggle. `set_str` accepts `"true"`/`"false"` (case-insensitive),
+    /// plus `"1"`/`"0"`, `"yes"`/`"no"`, `"on"`/`"off"`.
+    Bool,
 }
 
 /// Static + dynamic metadata about one setting, suitable for rendering
@@ -357,6 +365,10 @@ impl SettingsApi {
             .unwrap_or(OpusBandwidthKind::Wide)
     }
 
+    pub fn voice_denoise_enabled(&self) -> bool {
+        self.inner.read().voice_denoise_enabled()
+    }
+
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `VoiceCodecParam` the voice protocol layer wants.
     pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
@@ -460,6 +472,11 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceOpusBandwidth)
     }
 
+    pub fn set_voice_denoise_enabled(&self, enabled: bool) -> SettingsResult<()> {
+        self.inner.write().voice_denoise_enabled = Some(enabled);
+        self.persist_and_notify(SettingKey::VoiceDenoiseEnabled)
+    }
+
     /// Clear a single field's override (revert to its default).
     pub fn reset(&self, key: SettingKey) -> SettingsResult<()> {
         {
@@ -473,6 +490,7 @@ impl SettingsApi {
                 SettingKey::VoiceAmrnbMode => g.voice_amrnb_mode = None,
                 SettingKey::VoiceOpusBitrateKbps => g.voice_opus_bitrate_kbps = None,
                 SettingKey::VoiceOpusBandwidth => g.voice_opus_bandwidth = None,
+                SettingKey::VoiceDenoiseEnabled => g.voice_denoise_enabled = None,
             }
         }
         self.persist_and_notify(key)
@@ -504,6 +522,7 @@ impl SettingsApi {
             SettingKey::VoiceAmrnbMode => self.voice_amrnb_mode().to_string(),
             SettingKey::VoiceOpusBitrateKbps => self.voice_opus_bitrate_kbps().to_string(),
             SettingKey::VoiceOpusBandwidth => self.voice_opus_bandwidth().id().to_string(),
+            SettingKey::VoiceDenoiseEnabled => self.voice_denoise_enabled().to_string(),
         }
     }
 
@@ -578,6 +597,10 @@ impl SettingsApi {
                         ),
                     })?;
                 self.set_voice_opus_bandwidth(bw)
+            }
+            SettingKey::VoiceDenoiseEnabled => {
+                let b = parse_bool(key, value)?;
+                self.set_voice_denoise_enabled(b)
             }
         }
     }
@@ -660,6 +683,12 @@ impl SettingsApi {
                 },
                 DEFAULT_OPUS_BANDWIDTH.to_string(),
             ),
+            SettingKey::VoiceDenoiseEnabled => (
+                "Noise suppression",
+                "Run captured audio through an RNNoise-based denoiser before the encoder. Reduces stationary background noise (fans, HVAC, keyboard) at the cost of ~10 ms latency. No effect on builds without the `denoise` feature.",
+                SettingKind::Bool,
+                DEFAULT_VOICE_DENOISE_ENABLED.to_string(),
+            ),
         };
         SettingDescriptor {
             key,
@@ -709,6 +738,18 @@ fn parse_u32(key: SettingKey, value: &str) -> SettingsResult<u32> {
         value: value.to_string(),
         reason: e.to_string(),
     })
+}
+
+fn parse_bool(key: SettingKey, value: &str) -> SettingsResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(SettingsError::Invalid {
+            key: key.id(),
+            value: value.to_string(),
+            reason: "expected true/false (or 1/0, yes/no, on/off)".to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------

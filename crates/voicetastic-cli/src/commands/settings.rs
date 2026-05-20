@@ -20,6 +20,7 @@ pub fn list() -> Result<()> {
             SettingKind::OptionalString => "string?".to_string(),
             SettingKind::IntRange { min, max } => format!("int [{min}..={max}]"),
             SettingKind::Enum { variants } => format!("enum {{{}}}", variants.join("|")),
+            SettingKind::Bool => "bool".to_string(),
         };
         let shown = if d.value.is_empty() {
             "<unset>".to_string()

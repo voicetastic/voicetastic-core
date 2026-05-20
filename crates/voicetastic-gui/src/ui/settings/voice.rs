@@ -9,6 +9,7 @@
 
 use eframe::egui;
 
+use voicetastic_core::codec::denoise_available;
 use voicetastic_core::settings::{
     AMRNB_MODE_475, AMRNB_MODE_515, AMRNB_MODE_590, AMRNB_MODE_670, AMRNB_MODE_740, AMRNB_MODE_795,
     AMRNB_MODE_1020, AMRNB_MODE_1220, CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400,
@@ -245,6 +246,38 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                  ~4.5 kB -- recommended for slow LoRa presets. Received messages are always \
                  decoded with the codec advertised in their header."
             ));
+
+            ui.add_space(6.0);
+            let mut denoise = app.settings.voice_denoise_enabled();
+            let denoise_supported = denoise_available();
+            ui.horizontal(|ui| {
+                let resp = ui.add_enabled(
+                    denoise_supported,
+                    egui::Checkbox::new(&mut denoise, "Noise suppression (RNNoise)"),
+                );
+                if resp.changed()
+                    && let Err(e) = app.settings.set_voice_denoise_enabled(denoise)
+                {
+                    warn("set voice_denoise_enabled", e);
+                }
+                if ui.small_button("Reset").clicked()
+                    && let Err(e) = app.settings.reset(SettingKey::VoiceDenoiseEnabled)
+                {
+                    warn("reset voice_denoise_enabled", e);
+                }
+            });
+            ui.weak(
+                "Cleans steady background noise (fans, HVAC, keyboard) from captured audio \
+                 before it is encoded. Adds ~10 ms of latency. Off by default.",
+            );
+            if !denoise_supported {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 140, 60),
+                    "Noise suppression is disabled in this build. Rebuild the GUI \
+                     with `--features audio` (or core with `--features denoise`) \
+                     to enable it.",
+                );
+            }
 
             if !audio::is_available() {
                 ui.add_space(4.0);
