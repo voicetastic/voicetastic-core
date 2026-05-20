@@ -10,6 +10,33 @@ Release notes for past `vX.Y.Z` tags are available in the project's
 
 ## [Unreleased]
 
+### Added
+
+- **FEC + NACK aggressiveness as settings.** Two new keys on
+  `SettingsApi`:
+  - `voice.fec_mode` (`auto` / `off` / `light` / `medium` / `heavy`).
+    `auto` (default) picks parity by destination and modem preset: 50 %
+    for broadcast, 33 % for long-range unicast, 20 % medium, 0 % short.
+    Manual modes apply a flat percentage of `total_data`. Resolved at
+    `build_message` time via `VoiceFecMode::resolve(broadcast, preset,
+    total_data)`.
+  - `voice.nack_mode` (`auto` / `off` / `conservative` / `aggressive`).
+    `auto` picks `nack_window` + backoff exponent + round cap by modem
+    preset. `aggressive` uses 1.5 s windows + 2× backoff; `conservative`
+    uses 4× preset-pacing windows + 3× backoff; `off` disables NACK
+    emission entirely.
+- **Broadcast suppresses NACK unconditionally.** The assembler's
+  `tick()` short-circuits NACK emission when the in-progress entry's
+  destination is the broadcast address — multiple receivers all NACK'ing
+  the same chunks would flood the sender. Broadcast still benefits from
+  FEC + partial-on-timeout. The `voice.nack_mode` setting cannot
+  re-enable broadcast NACK; the override is silently ignored.
+- `AssemblerConfig.nack_backoff_base`: configurable backoff exponent for
+  NACK rounds (was hardcoded `3`). `2` doubles per round, `3` triples,
+  `0` disables NACK emission entirely (used by the `Off` mode and as
+  the broadcast short-circuit signal).
+- GUI Voice settings card grows dropdowns for both modes.
+
 ### Changed (wire-incompatible)
 
 - **Voice protocol bumped v2 → v3.** Body envelope encryption (AES-256-GCM

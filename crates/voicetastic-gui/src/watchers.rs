@@ -11,6 +11,7 @@ use voicetastic_core::ids::{node_id_to_num, node_num_to_id};
 use voicetastic_core::meshtastic::service::modem_preset_from_proto;
 use voicetastic_core::node::NodeId;
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
+use voicetastic_core::settings::SettingsApi;
 use voicetastic_core::voice::{
     AssemblyEvent, ModemPreset as VoiceModemPreset, PROTOCOL_VERSION, VoiceAssembler,
     VoiceDestination, VoiceMessage, detect_version,
@@ -52,6 +53,7 @@ pub fn spawn_watchers(
     shared: Arc<Mutex<SharedState>>,
     ctx: egui::Context,
     assembler: Arc<VoiceAssembler>,
+    settings: Arc<SettingsApi>,
 ) {
     // Pairing-prompt forwarder (Linux only). Takes ownership of the
     // BlueZ Agent1 receiver and stuffs each prompt into `SharedState`
@@ -116,16 +118,31 @@ pub fn spawn_watchers(
     // the firmware's outbound queue, otherwise a long burst of missed
     // chunks produces a NACK barrage that can itself overflow the radio).
     let current_pacing = Arc::new(Mutex::new(VoiceModemPreset::fallback_pacing()));
+    let current_preset: Arc<Mutex<Option<VoiceModemPreset>>> = Arc::new(Mutex::new(None));
     {
         let mut rx = svc.watch_lora_config();
         let assembler = Arc::clone(&assembler);
         let current_pacing = Arc::clone(&current_pacing);
+        let current_preset = Arc::clone(&current_preset);
+        let settings = Arc::clone(&settings);
         rt.spawn(async move {
             // Apply once with whatever we already know.
-            apply_lora_to_assembler(&assembler, rx.borrow().as_ref(), &current_pacing);
+            apply_lora_to_assembler(
+                &assembler,
+                rx.borrow().as_ref(),
+                &current_pacing,
+                &current_preset,
+                &settings,
+            );
             while rx.changed().await.is_ok() {
                 let cfg = rx.borrow_and_update().clone();
-                apply_lora_to_assembler(&assembler, cfg.as_ref(), &current_pacing);
+                apply_lora_to_assembler(
+                    &assembler,
+                    cfg.as_ref(),
+                    &current_pacing,
+                    &current_preset,
+                    &settings,
+                );
             }
         });
     }
@@ -426,29 +443,38 @@ pub fn spawn_watchers(
 }
 
 /// Reconfigure the voice assembler when the active LoRa preset changes.
-/// We scale `nack_window` to ≈ 4× the preset's recommended inter-frame
-/// pacing (clamped to a minimum) so the receiver doesn't fire NACK
-/// rounds for chunks that are still being paced out by the sender.
-fn apply_lora_to_assembler(
+/// Resolves the `voice.nack_mode` setting against the current preset to
+/// pick concrete (nack_window, backoff_base, max_nack_rounds) values.
+/// Broadcast suppression is enforced inside `tick()` itself, not here.
+pub(crate) fn apply_lora_to_assembler(
     assembler: &VoiceAssembler,
     lora: Option<&voicetastic_core::proto::config::LoRaConfig>,
     current_pacing: &Mutex<Duration>,
+    current_preset: &Mutex<Option<VoiceModemPreset>>,
+    settings: &SettingsApi,
 ) {
-    let pacing = lora
-        .and_then(|l| modem_preset_from_proto(l.modem_preset))
+    let preset = lora.and_then(|l| modem_preset_from_proto(l.modem_preset));
+    let pacing = preset
         .map(VoiceModemPreset::pacing)
         .unwrap_or_else(VoiceModemPreset::fallback_pacing);
     *current_pacing.lock() = pacing;
-    let nack_window = (pacing * 4).max(Duration::from_millis(2_000));
-    // In-place mutation so we don't stomp on `message_timeout` /
-    // `completion_memory` set by `VoicetasticApp::apply_voice_settings`.
-    // Resync the round cap so the new (often larger) `nack_window`
-    // doesn't blow past the configured `message_timeout`.
+    *current_preset.lock() = preset;
+
+    let params = settings.voice_nack_mode().resolve(preset);
+
     if let Err(e) = assembler.update_config(|cfg| {
-        cfg.nack_window = nack_window;
-        cfg.sync_nack_cap_to_timeout();
+        cfg.nack_window = params.nack_window;
+        cfg.nack_backoff_base = params.backoff_base;
+        cfg.max_nack_rounds = params.max_nack_rounds;
+        // Sync the consecutive-silence cap to the user's reassembly
+        // timeout when NACK is enabled; an explicit `Off` (backoff_base
+        // == 0) leaves `max_nack_rounds` at the small value we just set
+        // so the state machine doesn't try to NACK at all.
+        if params.backoff_base != 0 {
+            cfg.sync_nack_cap_to_timeout();
+        }
     }) {
-        warn!("Failed to update assembler nack_window: {}", e);
+        warn!("Failed to update assembler nack params: {}", e);
     }
 }
 

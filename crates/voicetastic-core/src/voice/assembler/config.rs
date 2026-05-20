@@ -23,6 +23,12 @@ pub struct AssemblerConfig {
     pub max_nack_rounds: u16,
     /// Quiet-period after the last seen chunk before issuing a NACK round.
     pub nack_window: Duration,
+    /// Base of the per-round exponential backoff: effective quiet window
+    /// for round `n` is `nack_window × backoff_base.pow(min(n, 4))`.
+    /// `2` doubles, `3` triples. **Special value `0`** disables NACK
+    /// emission entirely — the assembler skips the emission branch. Used
+    /// by the `Off` setting and as a hard override for broadcast messages.
+    pub nack_backoff_base: u32,
     /// How long a `(from, message_id)` pair is remembered as "already
     /// completed" after the receiver finalizes it. Late chunks for that
     /// pair are silently dropped within this window so the sender's
@@ -65,6 +71,9 @@ impl Default for AssemblerConfig {
             // is the real ceiling.
             max_nack_rounds: NACK_MAX_ROUNDS,
             nack_window: Duration::from_millis(NACK_WINDOW_MS),
+            // Default to tripling per round, matching the historical
+            // behaviour before `nack_backoff_base` became configurable.
+            nack_backoff_base: 3,
             dead_sender_timeout: DEAD_SENDER_TIMEOUT,
             // completion_memory must be >= message_timeout so that late
             // chunks from the sender's retain_ttl don't create a fresh

@@ -91,6 +91,13 @@ Recommended cadence: **100–250 ms**. Below that you spin needlessly;
 above that you delay NACK emission past the spec's
 `NACK_WINDOW_MS = 3000`.
 
+**Broadcast messages emit no NACK.** The assembler silently suppresses
+NACK frames when the in-progress entry's destination is the broadcast
+address — multiple receivers would otherwise pile retransmits onto the
+sender with no clear target. Broadcast still gets FEC + timeout-based
+partial finalize. See [Reliability — Broadcast
+suppression](Reliability-FEC-and-NACK.md#broadcast-suppression).
+
 ---
 
 ## Resource bounds

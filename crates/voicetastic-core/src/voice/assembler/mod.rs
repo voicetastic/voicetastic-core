@@ -291,6 +291,7 @@ impl VoiceAssembler {
         let nack_window = cfg.nack_window;
         let timeout = cfg.message_timeout;
         let max_nack_rounds = cfg.max_nack_rounds;
+        let backoff_base = cfg.nack_backoff_base;
 
         // Snapshot keys to satisfy the borrow checker. Cloning each
         // `SenderKey` here is just an `Arc<str>` refcount bump + a `u32`
@@ -303,6 +304,15 @@ impl VoiceAssembler {
             let elapsed_total = now.duration_since(state.started_at);
             let elapsed_quiet = now.duration_since(state.last_chunk_at);
 
+            // NACK is suppressed for broadcast messages (multiple receivers
+            // would all NACK the same chunks, sender has no clear retransmit
+            // target) and when the host config explicitly disables it
+            // (`nack_backoff_base == 0`, set by `VoiceNackMode::Off`).
+            // The state machine still drives timeouts and partial finalize,
+            // it just never emits a NACK frame on the wire.
+            let nack_enabled =
+                backoff_base != 0 && !matches!(state.to, VoiceDestination::Broadcast);
+
             // Hard timeout — give up. The NACK budget bounds *consecutive*
             // rounds without progress so a sender that's still actively
             // servicing NACKs (one retransmit per round) keeps the slot
@@ -312,32 +322,29 @@ impl VoiceAssembler {
                 // Emit one final NACK with `give_up = true` so the sender
                 // knows to stop retransmitting. Without this signal the
                 // sender continues to burn airtime for its entire linger
-                // window (default 10 min) on a message we've already
-                // finalized — visible to the receiver as a long tail of
-                // "late chunk after completion (blacklisted)" entries.
-                // The missing list is included for diagnostics; the
-                // sender's `give_up` branch ignores it and just cleans
-                // up the registry entry.
-                let missing = state.missing_data_indices();
-                let give_up_frame = build_nack(
-                    state.header_template.message_id,
-                    state.header_template.stream_seq,
-                    state.header_template.codec,
-                    state.header_template.codec_param,
-                    state.header_template.total_data,
-                    state.header_template.parity_count,
-                    &missing,
-                    true,
-                );
-                nacks.push(OutboundNack {
-                    from: key.0.to_string(),
-                    channel: state.channel,
-                    frame: give_up_frame,
-                    give_up: true,
-                    message_id: state.header_template.message_id,
-                    missing_count: missing.len(),
-                    round: state.nack_rounds.saturating_add(1),
-                });
+                // window. Skipped when NACK is disabled for this entry.
+                if nack_enabled {
+                    let missing = state.missing_data_indices();
+                    let give_up_frame = build_nack(
+                        state.header_template.message_id,
+                        state.header_template.stream_seq,
+                        state.header_template.codec,
+                        state.header_template.codec_param,
+                        state.header_template.total_data,
+                        state.header_template.parity_count,
+                        &missing,
+                        true,
+                    );
+                    nacks.push(OutboundNack {
+                        from: key.0.to_string(),
+                        channel: state.channel,
+                        frame: give_up_frame,
+                        give_up: true,
+                        message_id: state.header_template.message_id,
+                        missing_count: missing.len(),
+                        round: state.nack_rounds.saturating_add(1),
+                    });
+                }
 
                 // The key came from the snapshot above; the only way it would
                 // be missing here is a concurrent mutation, which can't happen
@@ -354,6 +361,14 @@ impl VoiceAssembler {
                 continue;
             }
 
+            // When NACK is disabled there's nothing else to do this tick:
+            // we let `message_timeout` fire on its own. (Dead-sender
+            // detection is also a NACK-side optimisation — without NACK
+            // there's no storm to suppress.)
+            if !nack_enabled {
+                continue;
+            }
+
             // Dead-sender detection: if no real data (data/parity chunk)
             // arrived for the configured window, the sender is truly gone.
             // Suppress further NACKs and let the hard timeout finalize the
@@ -362,13 +377,15 @@ impl VoiceAssembler {
                 continue;
             }
 
-            // Quiet-period exceeded ⇒ emit a NACK round.
-            // Exponential backoff: each successive round triples the
-            // effective quiet window so a dead sender doesn't trigger
-            // NACK storms (capped at 243× the base window: 3^5).
-            // Round 0: 3s, Round 1: 9s, Round 2: 27s, Round 3: 81s, Round 4+: 243s.
-            let backoff = 3u32.pow((state.nack_rounds.min(4)) as u32);
-            let effective_window = nack_window.saturating_mul(backoff);
+            // Quiet-period exceeded ⇒ emit a NACK round. Backoff multiplier
+            // is `nack_backoff_base.pow(min(round, 4))`. With the default
+            // base of `3`: 1×, 3×, 9×, 27×, 81× — gentle. With `2`
+            // (Aggressive / fast-preset Auto): 1×, 2×, 4×, 8×, 16× —
+            // more retries per unit time.
+            let pow = backoff_base
+                .checked_pow(state.nack_rounds.min(4) as u32)
+                .unwrap_or(u32::MAX);
+            let effective_window = nack_window.saturating_mul(pow);
             if elapsed_quiet >= effective_window
                 && state.received_data < state.header_template.total_data
             {
@@ -395,9 +412,6 @@ impl VoiceAssembler {
                 state.nack_rounds = state.nack_rounds.saturating_add(1);
                 // Advance the quiet timer by the effective window so the
                 // next NACK must wait the full backoff-multiplied window.
-                // Without this, one long `elapsed_quiet` (~seconds after
-                // the burst ends) would trigger every NACK round in quick
-                // succession as the backoff cap is reached.
                 state.last_chunk_at = state
                     .last_chunk_at
                     .checked_add(effective_window)
@@ -607,6 +621,7 @@ mod tests {
     use super::super::nack::parse_nack_body;
     use super::super::types::VoiceCodec;
     use super::*;
+    use crate::node::NodeId;
 
     fn cfg(parity: u8) -> BuildConfig {
         BuildConfig {
@@ -620,12 +635,19 @@ mod tests {
         }
     }
 
+    /// Default test destination — unicast so the NACK emission branches
+    /// fire. Tests that explicitly exercise broadcast suppression use
+    /// `VoiceDestination::Broadcast` directly.
+    fn unicast_dest() -> VoiceDestination {
+        VoiceDestination::Node(NodeId::from_u32(0xDEAD_BEEF))
+    }
+
     #[test]
     fn tick_emits_nack_after_quiet_window() {
         let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
         let enc = build_message(&audio, &cfg(0)).unwrap();
         let asm = VoiceAssembler::new(AssemblerConfig::default());
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
         // Force the in-progress entry's last_chunk_at into the past.
         {
             let mut inner = asm.inner.lock();
@@ -664,7 +686,7 @@ mod tests {
         });
 
         // Deliver chunk 0 to establish the assembly slot.
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
 
         // 5 NACK rounds, each followed by a real shard from the sender.
         // Total > max_nack_rounds, but every round produces progress so
@@ -686,7 +708,7 @@ mod tests {
             // the remaining indices so we can run more rounds than there
             // are missing chunks.
             let idx = ((round as usize) % (enc.frames.len() - 1)) + 1;
-            let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[idx]);
+            let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[idx]);
         }
     }
 
@@ -710,7 +732,7 @@ mod tests {
         let asm = VoiceAssembler::new(AssemblerConfig::default());
 
         // Establish the slot with chunk 0 (DATA).
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
 
         // Force a NACK round.
         {
@@ -732,12 +754,7 @@ mod tests {
         // Deliver a PARITY frame (insufficient for FEC). This must NOT
         // reset nack_rounds, because no DATA progress was made.
         let parity_idx = enc.total_data as usize; // first parity frame
-        let _ = asm.accept(
-            "!cc",
-            VoiceDestination::Broadcast,
-            0,
-            &enc.frames[parity_idx],
-        );
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[parity_idx]);
         let rounds_after_parity = {
             let inner = asm.inner.lock();
             inner.in_progress.values().next().unwrap().nack_rounds
@@ -748,7 +765,7 @@ mod tests {
         );
 
         // Deliver a real DATA chunk — THIS must reset the counter.
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[1]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[1]);
         let rounds_after_data = {
             let inner = asm.inner.lock();
             inner.in_progress.values().next().unwrap().nack_rounds
@@ -772,7 +789,7 @@ mod tests {
         });
 
         // Establish the slot.
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
 
         // Two consecutive NACK rounds with no progress.
         // Each round must set last_chunk_at far enough back to meet the
@@ -831,7 +848,7 @@ mod tests {
         });
 
         // Establish the slot with chunk 0.
-        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
 
         // Force the message past its hard timeout.
         {
@@ -845,5 +862,115 @@ mod tests {
         assert!(out.nacks[0].give_up);
         assert_eq!(out.finalized.len(), 1);
         assert!(!out.finalized[0].is_complete);
+    }
+
+    /// Broadcast messages must NOT emit NACKs — multiple receivers would
+    /// otherwise pile retransmit requests onto the sender, with no way
+    /// for the sender to know which receiver to retransmit to. The state
+    /// machine still drives timeouts and partial-finalize; it just keeps
+    /// the wire silent.
+    #[test]
+    fn broadcast_suppresses_nack_on_quiet_window() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS * 10);
+            }
+        }
+        let out = asm.tick();
+        assert!(
+            out.nacks.is_empty(),
+            "broadcast must never emit a NACK on quiet window"
+        );
+    }
+
+    /// Broadcast also gets no give-up NACK on hard timeout — partial
+    /// finalize fires as usual but no wire frame is emitted.
+    #[test]
+    fn broadcast_suppresses_give_up_nack_on_timeout() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            message_timeout: Duration::from_millis(50),
+            partial_play_on_timeout: true,
+            ..Default::default()
+        });
+        let _ = asm.accept("!cc", VoiceDestination::Broadcast, 0, &enc.frames[0]);
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.started_at = Instant::now() - Duration::from_millis(60);
+            }
+        }
+        let out = asm.tick();
+        assert!(
+            out.nacks.is_empty(),
+            "broadcast timeout must finalize partial but emit no NACK"
+        );
+        assert_eq!(out.finalized.len(), 1, "partial finalize still fires");
+        assert!(!out.finalized[0].is_complete);
+    }
+
+    /// When `nack_backoff_base == 0` (set by `VoiceNackMode::Off`), the
+    /// assembler must skip NACK emission even on unicast.
+    #[test]
+    fn backoff_base_zero_disables_nack() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            nack_backoff_base: 0,
+            ..Default::default()
+        });
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.last_chunk_at = Instant::now() - Duration::from_millis(NACK_WINDOW_MS * 10);
+            }
+        }
+        let out = asm.tick();
+        assert!(
+            out.nacks.is_empty(),
+            "Off mode (backoff_base = 0) must suppress all NACK emission"
+        );
+    }
+
+    /// `backoff_base = 2` doubles the effective quiet window each round
+    /// instead of tripling. Verifies the configurable base wires through.
+    #[test]
+    fn backoff_base_two_doubles_per_round() {
+        let audio: Vec<u8> = (0..(64 * 6)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            nack_window: Duration::from_millis(1_000),
+            nack_backoff_base: 2,
+            max_nack_rounds: 10,
+            ..Default::default()
+        });
+
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+
+        // Round 0: 1× window = 1 s. Round 1: 2× = 2 s. Round 2: 4× = 4 s.
+        // Push last_chunk_at far enough back to clear each round in turn.
+        for round in 0..3u32 {
+            let multiplier = 2u32.pow(round);
+            let ago = Duration::from_millis(1_000 * multiplier as u64 + 100);
+            {
+                let mut inner = asm.inner.lock();
+                for (_, st) in inner.in_progress.iter_mut() {
+                    st.last_chunk_at = Instant::now() - ago;
+                }
+            }
+            let out = asm.tick();
+            assert_eq!(
+                out.nacks.len(),
+                1,
+                "round {round}: expected 1 NACK with backoff_base=2"
+            );
+        }
     }
 }

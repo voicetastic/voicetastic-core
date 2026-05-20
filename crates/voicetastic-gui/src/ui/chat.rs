@@ -10,8 +10,7 @@ use voicetastic_core::proto::{
     Channel, NodeInfo, channel::Role, config::LoRaConfig, config::lo_ra_config::ModemPreset,
 };
 use voicetastic_core::voice::{
-    MAX_BODY_SIZE, MAX_PARITY_PER_MESSAGE, ModemPreset as VoiceModemPreset, SendRequest,
-    SendStatus, VoiceCodec,
+    MAX_BODY_SIZE, ModemPreset as VoiceModemPreset, SendRequest, SendStatus, VoiceCodec,
 };
 
 use crate::app::{PlaybackSource, VoicetasticApp};
@@ -603,17 +602,17 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         .map(VoiceModemPreset::recommended_chunk_size)
         .unwrap_or(MAX_BODY_SIZE);
 
-    // Scale FEC parity to message size. At 50 % per-chunk loss on
-    // LongFast, half of (total_data + parity) shards arrive — RS needs
-    // at least total_data.  Setting parity ≈ total_data (up to the
-    // protocol max of 128) guarantees Reed-Solomon recovery at up to
-    // 50 % loss so the NACK + retransmit path only has to cover the
-    // (rare) tail beyond the RS correction capacity.
+    // FEC parity is resolved by the `voice.fec_mode` setting against the
+    // destination (broadcast vs unicast) and the modem preset. `Auto`
+    // picks 50 % on broadcast, 33 % on long-range unicast, 20 % medium,
+    // 0 % on short-range. Manual modes (`Off`/`Light`/`Medium`/`Heavy`)
+    // ignore the preset and apply a flat percentage of `total_data`.
     let total_data = clip.payload.len().div_ceil(chunk_size).max(1);
-    let parity_count = {
-        let cap = MAX_PARITY_PER_MESSAGE.min(255usize.saturating_sub(total_data));
-        cap.min(u8::MAX as usize) as u8
-    };
+    let broadcast = dest.is_none();
+    let parity_count = app
+        .settings
+        .voice_fec_mode()
+        .resolve(broadcast, preset, total_data);
 
     // Hand the whole pipeline (build → register → burst → NACK →
     // retransmit → linger) to the shared `VoiceSender`. The GUI just

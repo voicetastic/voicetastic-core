@@ -171,6 +171,42 @@ registry entry expired while the sender is still alive).
 
 ---
 
+## Broadcast suppression
+
+Receivers MUST NOT emit NACKs for broadcast messages. With multiple
+listeners on the same channel, every receiver NACK'ing the same missing
+chunks would saturate the sender's radio, and the sender has no way to
+pick a single retransmit target — broadcast is point-to-multipoint by
+definition. The reference receiver short-circuits the NACK emission
+branch in `tick()` when the in-progress entry's `to` is the broadcast
+address; the state machine still drives timeouts and partial finalize.
+
+Broadcast voice relies on **FEC + partial-on-timeout**: pre-pay the
+airtime for extra parity shards (the default `voice.fec_mode = auto`
+picks 50 % for broadcast), and accept that the message either completes
+via Reed-Solomon recovery or finalises as partial.
+
+## NACK aggressiveness
+
+The reference receiver schedules NACK rounds at
+`nack_window × backoff_base^min(round, 4)`. Both fields are
+host-configurable on `AssemblerConfig` and are typically set via the
+`voice.nack_mode` setting:
+
+| Mode           | `nack_window` base   | `backoff_base` | `max_rounds` |
+|----------------|----------------------|----------------|--------------|
+| `Off`          | (NACK disabled)      | `0`            | `0`          |
+| `Auto` short/med fast | 1.5 s          | `2`            | `800`        |
+| `Auto` med slow / LongFast | 3 s       | `2`            | `400`        |
+| `Auto` long-range / unknown | `pacing × 4` min 4 s | `3` | `200`     |
+| `Conservative` | `pacing × 4` min 4 s | `3`            | `200`        |
+| `Aggressive`   | 1.5 s                | `2`            | `800`        |
+
+`backoff_base = 0` is the disabled signal; the assembler skips both the
+quiet-window and give-up NACK branches when it sees a zero base. The
+broadcast short-circuit above is independent — broadcasts get no NACK
+regardless of the configured `backoff_base`.
+
 ## NACK trust model
 
 This protocol does not authenticate NACK frames; like DATA / PARITY, any

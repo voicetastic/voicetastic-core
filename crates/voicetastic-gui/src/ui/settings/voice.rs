@@ -15,9 +15,10 @@ use voicetastic_core::settings::{
     AMRNB_MODE_1020, AMRNB_MODE_1220, CODEC2_MODE_1200, CODEC2_MODE_1300, CODEC2_MODE_1400,
     CODEC2_MODE_1600, CODEC2_MODE_2400, CODEC2_MODE_3200, DEFAULT_OPUS_BANDWIDTH,
     DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS, DEFAULT_VOICE_CODEC,
-    DEFAULT_VOICE_MAX_SECS, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, OpusBandwidthKind,
-    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER,
-    VoiceCodecKind,
+    DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE, OPUS_BITRATE_KBPS_MAX,
+    OPUS_BITRATE_KBPS_MIN, OpusBandwidthKind, REASSEMBLY_TIMEOUT_LOWER_SECS,
+    REASSEMBLY_TIMEOUT_UPPER_SECS, SettingKey, VOICE_MAX_SECS_UPPER, VoiceCodecKind, VoiceFecMode,
+    VoiceNackMode,
 };
 
 use crate::app::VoicetasticApp;
@@ -245,6 +246,74 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                 "Default codec: {DEFAULT_VOICE_CODEC}. Codec2 at 1200 bps fits a 30 s clip in \
                  ~4.5 kB -- recommended for slow LoRa presets. Received messages are always \
                  decoded with the codec advertised in their header."
+            ));
+
+            ui.add_space(6.0);
+            ui.label("FEC parity policy (sender):");
+            let fec_current = app.settings.voice_fec_mode();
+            let mut fec_next = fec_current;
+            let fec_label = |m: VoiceFecMode| match m {
+                VoiceFecMode::Auto => "Auto (by destination + preset, default)",
+                VoiceFecMode::Off => "Off (rely on NACK only)",
+                VoiceFecMode::Light => "Light (~10 %)",
+                VoiceFecMode::Medium => "Medium (~25 %)",
+                VoiceFecMode::Heavy => "Heavy (~50 %)",
+            };
+            egui::ComboBox::from_id_salt("voice_fec_mode_select")
+                .selected_text(fec_label(fec_current))
+                .show_ui(ui, |ui| {
+                    for m in [
+                        VoiceFecMode::Auto,
+                        VoiceFecMode::Off,
+                        VoiceFecMode::Light,
+                        VoiceFecMode::Medium,
+                        VoiceFecMode::Heavy,
+                    ] {
+                        ui.selectable_value(&mut fec_next, m, fec_label(m));
+                    }
+                });
+            if fec_next != fec_current
+                && let Err(e) = app.settings.set_voice_fec_mode(fec_next)
+            {
+                warn("set voice_fec_mode", e);
+            }
+            ui.weak(format!(
+                "Default: {DEFAULT_VOICE_FEC_MODE}. Reed-Solomon parity overhead. Auto picks 50 % \
+                 for broadcast, 33 % for long-range unicast, 20 % medium, 0 % short. Higher parity \
+                 = more airtime per message but fewer NACK round-trips on lossy links."
+            ));
+
+            ui.add_space(6.0);
+            ui.label("NACK aggressiveness (receiver):");
+            let nack_current = app.settings.voice_nack_mode();
+            let mut nack_next = nack_current;
+            let nack_label = |m: VoiceNackMode| match m {
+                VoiceNackMode::Auto => "Auto (by modem preset, default)",
+                VoiceNackMode::Off => "Off (FEC only, no NACK)",
+                VoiceNackMode::Conservative => "Conservative (long windows, 3× backoff)",
+                VoiceNackMode::Aggressive => "Aggressive (1.5 s windows, 2× backoff)",
+            };
+            egui::ComboBox::from_id_salt("voice_nack_mode_select")
+                .selected_text(nack_label(nack_current))
+                .show_ui(ui, |ui| {
+                    for m in [
+                        VoiceNackMode::Auto,
+                        VoiceNackMode::Off,
+                        VoiceNackMode::Conservative,
+                        VoiceNackMode::Aggressive,
+                    ] {
+                        ui.selectable_value(&mut nack_next, m, nack_label(m));
+                    }
+                });
+            if nack_next != nack_current
+                && let Err(e) = app.settings.set_voice_nack_mode(nack_next)
+            {
+                warn("set voice_nack_mode", e);
+            }
+            ui.weak(format!(
+                "Default: {DEFAULT_VOICE_NACK_MODE}. Controls the quiet window, backoff exponent \
+                 and round cap of the NACK loop. Broadcast messages are always handled as `off` \
+                 regardless — the override only applies to unicast."
             ));
 
             ui.add_space(6.0);

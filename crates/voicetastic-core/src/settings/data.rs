@@ -94,6 +94,28 @@ pub const DEFAULT_OPUS_BANDWIDTH: &str = OPUS_BANDWIDTH_WIDE;
 /// (where the `denoise` feature may be disabled) don't surprise users.
 pub const DEFAULT_VOICE_DENOISE_ENABLED: bool = false;
 
+/// FEC parity policy id strings. Persisted as text so the TOML file is
+/// human-editable and forward-compatible with new variants.
+pub const VOICE_FEC_MODE_AUTO: &str = "auto";
+pub const VOICE_FEC_MODE_OFF: &str = "off";
+pub const VOICE_FEC_MODE_LIGHT: &str = "light";
+pub const VOICE_FEC_MODE_MEDIUM: &str = "medium";
+pub const VOICE_FEC_MODE_HEAVY: &str = "heavy";
+/// Default FEC mode: pick parity by destination (broadcast/unicast) +
+/// modem preset. See [`VoiceFecMode`] in the api layer for the policy.
+pub const DEFAULT_VOICE_FEC_MODE: &str = VOICE_FEC_MODE_AUTO;
+
+/// NACK aggressiveness policy id strings. Affects receive-side behaviour:
+/// quiet-window, backoff exponent, and consecutive-round cap. Broadcast
+/// messages **always** behave as `Off` regardless of this setting — the
+/// override is silently ignored when `state.to == Broadcast`.
+pub const VOICE_NACK_MODE_AUTO: &str = "auto";
+pub const VOICE_NACK_MODE_OFF: &str = "off";
+pub const VOICE_NACK_MODE_CONSERVATIVE: &str = "conservative";
+pub const VOICE_NACK_MODE_AGGRESSIVE: &str = "aggressive";
+/// Default NACK mode: pick window/backoff by modem preset.
+pub const DEFAULT_VOICE_NACK_MODE: &str = VOICE_NACK_MODE_AUTO;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -154,6 +176,21 @@ pub struct AppSettings {
     /// runtime is a passthrough.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_denoise_enabled: Option<bool>,
+
+    /// Sender-side FEC parity policy id. One of
+    /// [`VOICE_FEC_MODE_AUTO`] (default) / `_OFF` / `_LIGHT` / `_MEDIUM` /
+    /// `_HEAVY`. Resolved against destination + modem preset at send time
+    /// to pick the actual `parity_count`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_fec_mode: Option<String>,
+
+    /// Receive-side NACK aggressiveness id. One of
+    /// [`VOICE_NACK_MODE_AUTO`] (default) / `_OFF` / `_CONSERVATIVE` /
+    /// `_AGGRESSIVE`. **Always overridden to `Off` for broadcast
+    /// messages** at the assembler tick — broadcast NACKs are never
+    /// useful (multiple receivers, no clear retransmit target).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_nack_mode: Option<String>,
 }
 
 impl AppSettings {
@@ -220,6 +257,31 @@ impl AppSettings {
     pub fn voice_denoise_enabled(&self) -> bool {
         self.voice_denoise_enabled
             .unwrap_or(DEFAULT_VOICE_DENOISE_ENABLED)
+    }
+
+    /// Effective FEC mode id (validated). Unknown values fall back to
+    /// [`DEFAULT_VOICE_FEC_MODE`].
+    pub fn voice_fec_mode(&self) -> &'static str {
+        match self.voice_fec_mode.as_deref() {
+            Some(VOICE_FEC_MODE_AUTO) => VOICE_FEC_MODE_AUTO,
+            Some(VOICE_FEC_MODE_OFF) => VOICE_FEC_MODE_OFF,
+            Some(VOICE_FEC_MODE_LIGHT) => VOICE_FEC_MODE_LIGHT,
+            Some(VOICE_FEC_MODE_MEDIUM) => VOICE_FEC_MODE_MEDIUM,
+            Some(VOICE_FEC_MODE_HEAVY) => VOICE_FEC_MODE_HEAVY,
+            _ => DEFAULT_VOICE_FEC_MODE,
+        }
+    }
+
+    /// Effective NACK mode id (validated). Unknown values fall back to
+    /// [`DEFAULT_VOICE_NACK_MODE`].
+    pub fn voice_nack_mode(&self) -> &'static str {
+        match self.voice_nack_mode.as_deref() {
+            Some(VOICE_NACK_MODE_AUTO) => VOICE_NACK_MODE_AUTO,
+            Some(VOICE_NACK_MODE_OFF) => VOICE_NACK_MODE_OFF,
+            Some(VOICE_NACK_MODE_CONSERVATIVE) => VOICE_NACK_MODE_CONSERVATIVE,
+            Some(VOICE_NACK_MODE_AGGRESSIVE) => VOICE_NACK_MODE_AGGRESSIVE,
+            _ => DEFAULT_VOICE_NACK_MODE,
+        }
     }
 
     /// Load from the config path, or return defaults if the file is missing

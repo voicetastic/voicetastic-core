@@ -100,6 +100,7 @@ impl VoicetasticApp {
             assembler: Arc::clone(&voice_assembler),
             voice_sender: Arc::clone(&voice_sender),
             settings: Arc::clone(&settings),
+            service: service.clone(),
         }));
         spawn_watchers(
             &rt,
@@ -107,6 +108,7 @@ impl VoicetasticApp {
             Arc::clone(&shared),
             cc.egui_ctx.clone(),
             Arc::clone(&voice_assembler),
+            Arc::clone(&settings),
         );
 
         let device_addr = settings.last_device().unwrap_or_default();
@@ -143,31 +145,60 @@ struct VoiceRuntimeListener {
     assembler: Arc<VoiceAssembler>,
     voice_sender: Arc<VoiceSender>,
     settings: Arc<SettingsApi>,
+    service: MeshtasticService,
 }
 
 impl SettingsListener for VoiceRuntimeListener {
     fn on_change(&self, key: SettingKey) {
-        if !matches!(key, SettingKey::VoiceReassemblyTimeoutSecs) {
-            return;
+        match key {
+            SettingKey::VoiceReassemblyTimeoutSecs => {
+                let timeout =
+                    std::time::Duration::from_secs(self.settings.reassembly_timeout_secs() as u64);
+                // Mutate in place — do NOT use `set_config(... ..default())`
+                // here, because [`watchers::apply_lora_to_assembler`] writes
+                // the preset-derived `nack_window` and would clobber it (and
+                // vice versa). See `VoiceAssembler::update_config` rustdoc.
+                if let Err(e) = self.assembler.update_config(|cfg| {
+                    cfg.message_timeout = timeout;
+                    // Keep the consecutive-silence budget aligned with the
+                    // new timeout so the round cap doesn't trip first.
+                    cfg.sync_nack_cap_to_timeout();
+                }) {
+                    error!("Failed to update assembler config: {}", e);
+                }
+                // Keep the sender-side retransmit registry's retention
+                // aligned with the receiver's reassembly window so a NACK
+                // can never arrive for a frame we've already forgotten.
+                self.voice_sender.set_retain_ttl(timeout);
+            }
+            SettingKey::VoiceNackMode => {
+                // Re-resolve the NACK aggressiveness policy against the
+                // current modem preset and push the new window /
+                // backoff / round cap into the assembler.
+                let preset = self
+                    .service
+                    .watch_lora_config()
+                    .borrow()
+                    .as_ref()
+                    .and_then(|l| {
+                        voicetastic_core::meshtastic::service::modem_preset_from_proto(
+                            l.modem_preset,
+                        )
+                    });
+                let params = self.settings.voice_nack_mode().resolve(preset);
+                if let Err(e) = self.assembler.update_config(|cfg| {
+                    cfg.nack_window = params.nack_window;
+                    cfg.nack_backoff_base = params.backoff_base;
+                    cfg.max_nack_rounds = params.max_nack_rounds;
+                    if params.backoff_base != 0 {
+                        cfg.sync_nack_cap_to_timeout();
+                    }
+                }) {
+                    error!("Failed to update assembler nack params: {}", e);
+                }
+            }
+            _ => {}
         }
-        let timeout =
-            std::time::Duration::from_secs(self.settings.reassembly_timeout_secs() as u64);
-        // Mutate in place — do NOT use `set_config(... ..default())`
-        // here, because [`watchers::apply_lora_to_assembler`] writes the
-        // preset-derived `nack_window` and would clobber it (and vice
-        // versa). See `VoiceAssembler::update_config` rustdoc.
-        if let Err(e) = self.assembler.update_config(|cfg| {
-            cfg.message_timeout = timeout;
-            // Keep the consecutive-silence budget aligned with the
-            // new timeout so the round cap doesn't trip first.
-            cfg.sync_nack_cap_to_timeout();
-        }) {
-            error!("Failed to update assembler config: {}", e);
-        }
-        // Keep the sender-side retransmit registry's retention aligned
-        // with the receiver's reassembly window so a NACK can never
-        // arrive for a frame we've already forgotten.
-        self.voice_sender.set_retain_ttl(timeout);
     }
 }
 

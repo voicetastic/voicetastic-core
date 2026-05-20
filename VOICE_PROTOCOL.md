@@ -241,6 +241,22 @@ for this message.
 NACKs are not retransmitted (the loss-recovery loop is itself the
 retransmission), and SHOULD be sent with `want_ack=false`.
 
+**Broadcast suppression.** Receivers MUST NOT emit NACKs for messages
+addressed to the broadcast address. With multiple listeners on the same
+channel, every receiver NACK'ing the same missing chunks would flood
+the sender, and the sender has no way to choose a retransmit target.
+Broadcast voice relies on FEC (`parity_count`) and the
+partial-on-timeout fallback. The reference receiver short-circuits the
+NACK emission branch when `to == broadcast`.
+
+**NACK backoff is host-tunable.** The reference receiver schedules NACK
+rounds at `nack_window × backoff_base^min(round, 4)`. The base is
+selected by the `voice.nack_mode` setting: typically `2` for
+short/medium presets (doubling — faster retries), `3` for long-range
+presets (tripling — gentler). `backoff_base = 0` disables NACK
+emission entirely (used by `voice.nack_mode = off` and by the
+broadcast short-circuit above).
+
 ---
 
 ## 4. Chunk size

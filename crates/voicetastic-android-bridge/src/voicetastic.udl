@@ -423,6 +423,8 @@ enum SettingKey {
     "VoiceOpusBitrateKbps",
     "VoiceOpusBandwidth",
     "VoiceDenoiseEnabled",
+    "VoiceFecMode",
+    "VoiceNackMode",
 };
 
 /// Typed mirror of the `voice.codec` value.

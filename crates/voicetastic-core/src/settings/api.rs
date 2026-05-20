@@ -20,10 +20,13 @@ use crate::voice::VoiceCodec;
 use super::data::{
     AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
     DEFAULT_OPUS_BANDWIDTH, DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
-    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED, DEFAULT_VOICE_MAX_SECS,
-    OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN,
-    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB,
-    VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_MAX_SECS_UPPER, config_path,
+    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED, DEFAULT_VOICE_FEC_MODE,
+    DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE, OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE,
+    OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, REASSEMBLY_TIMEOUT_LOWER_SECS,
+    REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS,
+    VOICE_FEC_MODE_AUTO, VOICE_FEC_MODE_HEAVY, VOICE_FEC_MODE_LIGHT, VOICE_FEC_MODE_MEDIUM,
+    VOICE_FEC_MODE_OFF, VOICE_MAX_SECS_UPPER, VOICE_NACK_MODE_AGGRESSIVE, VOICE_NACK_MODE_AUTO,
+    VOICE_NACK_MODE_CONSERVATIVE, VOICE_NACK_MODE_OFF, config_path,
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +67,10 @@ pub enum SettingKey {
     VoiceOpusBandwidth,
     /// Capture-side RNNoise noise-suppression toggle.
     VoiceDenoiseEnabled,
+    /// Sender-side FEC parity policy.
+    VoiceFecMode,
+    /// Receive-side NACK aggressiveness policy.
+    VoiceNackMode,
 }
 
 impl SettingKey {
@@ -79,6 +86,8 @@ impl SettingKey {
             Self::VoiceOpusBitrateKbps => "voice.opus_bitrate_kbps",
             Self::VoiceOpusBandwidth => "voice.opus_bandwidth",
             Self::VoiceDenoiseEnabled => "voice.denoise_enabled",
+            Self::VoiceFecMode => "voice.fec_mode",
+            Self::VoiceNackMode => "voice.nack_mode",
         }
     }
 
@@ -93,6 +102,8 @@ impl SettingKey {
             "voice.opus_bitrate_kbps" => Self::VoiceOpusBitrateKbps,
             "voice.opus_bandwidth" => Self::VoiceOpusBandwidth,
             "voice.denoise_enabled" => Self::VoiceDenoiseEnabled,
+            "voice.fec_mode" => Self::VoiceFecMode,
+            "voice.nack_mode" => Self::VoiceNackMode,
             _ => return None,
         })
     }
@@ -108,6 +119,8 @@ impl SettingKey {
             SettingKey::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth,
             SettingKey::VoiceDenoiseEnabled,
+            SettingKey::VoiceFecMode,
+            SettingKey::VoiceNackMode,
         ]
     }
 }
@@ -254,6 +267,337 @@ pub fn opus_bandwidth_kind_from_id(s: &str) -> Option<OpusBandwidthKind> {
 }
 
 // ---------------------------------------------------------------------------
+// FEC parity policy (sender-side)
+// ---------------------------------------------------------------------------
+
+/// Sender-side parity policy. Resolved to an actual `parity_count` at
+/// `build_message` time via [`VoiceFecMode::resolve`], which takes the
+/// destination (broadcast vs unicast) and the modem preset into account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceFecMode {
+    /// Pick parity by destination + preset (the recommended default).
+    Auto,
+    /// Disable FEC. Rely on NACK retransmits (or accept partial on
+    /// broadcast). Saves airtime upfront, costs round-trips on loss.
+    Off,
+    /// ~10 % of `total_data`, capped to [`MAX_PARITY_PER_MESSAGE`].
+    Light,
+    /// ~25 % of `total_data`.
+    Medium,
+    /// ~50 % of `total_data`. Recommended for broadcast or high-loss
+    /// long-range presets where NACK round-trips are expensive.
+    Heavy,
+}
+
+impl VoiceFecMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => VOICE_FEC_MODE_AUTO,
+            Self::Off => VOICE_FEC_MODE_OFF,
+            Self::Light => VOICE_FEC_MODE_LIGHT,
+            Self::Medium => VOICE_FEC_MODE_MEDIUM,
+            Self::Heavy => VOICE_FEC_MODE_HEAVY,
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Some(match s {
+            VOICE_FEC_MODE_AUTO => Self::Auto,
+            VOICE_FEC_MODE_OFF => Self::Off,
+            VOICE_FEC_MODE_LIGHT => Self::Light,
+            VOICE_FEC_MODE_MEDIUM => Self::Medium,
+            VOICE_FEC_MODE_HEAVY => Self::Heavy,
+            _ => return None,
+        })
+    }
+
+    /// Resolve this mode + context to a concrete `parity_count`.
+    ///
+    /// `broadcast` flips the `Auto` branch to 50 % since broadcast cannot
+    /// rely on NACK recovery. `preset` is consulted only for `Auto` on
+    /// unicast; manual modes ignore it.
+    ///
+    /// Returned value is clamped to `[0, min(total_data, MAX_PARITY_PER_MESSAGE)]`
+    /// so callers never need to re-check the protocol cap.
+    pub fn resolve(
+        self,
+        broadcast: bool,
+        preset: Option<crate::voice::ModemPreset>,
+        total_data: usize,
+    ) -> u8 {
+        use crate::voice::{MAX_PARITY_PER_MESSAGE, ModemPreset};
+        let pct = match (self, broadcast) {
+            (Self::Off, _) => 0,
+            (Self::Light, _) => 10,
+            (Self::Medium, _) => 25,
+            (Self::Heavy, _) => 50,
+            (Self::Auto, true) => 50,
+            (Self::Auto, false) => match preset {
+                Some(
+                    ModemPreset::LongFast
+                    | ModemPreset::LongModerate
+                    | ModemPreset::LongSlow
+                    | ModemPreset::VeryLongSlow,
+                ) => 33,
+                Some(ModemPreset::MediumFast | ModemPreset::MediumSlow) => 20,
+                Some(ModemPreset::ShortTurbo | ModemPreset::ShortFast | ModemPreset::ShortSlow) => {
+                    0
+                }
+                None => 20, // unknown preset: assume mid-range
+            },
+        };
+        let raw = (total_data * pct).div_ceil(100);
+        let cap = total_data.min(MAX_PARITY_PER_MESSAGE).min(u8::MAX as usize);
+        raw.min(cap) as u8
+    }
+}
+
+pub fn voice_fec_mode_to_id(m: VoiceFecMode) -> &'static str {
+    m.id()
+}
+
+pub fn voice_fec_mode_from_id(s: &str) -> Option<VoiceFecMode> {
+    VoiceFecMode::from_id(s)
+}
+
+// ---------------------------------------------------------------------------
+// NACK aggressiveness policy (receiver-side)
+// ---------------------------------------------------------------------------
+
+/// Receiver-side NACK policy. Resolved to concrete `(nack_window,
+/// backoff_pow, max_nack_rounds)` at the assembler tick via
+/// [`VoiceNackMode::resolve`].
+///
+/// Broadcast messages are **always** treated as `Off` regardless of this
+/// setting — the assembler short-circuits the NACK emission branch when
+/// `state.to == VoiceDestination::Broadcast` so the override is silently
+/// ignored. This keeps a chatty channel from being flooded with NACKs
+/// from every listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceNackMode {
+    /// Pick window/backoff/cap by preset (the recommended default).
+    Auto,
+    /// Never emit a NACK. Receiver falls back to FEC + partial-on-timeout.
+    Off,
+    /// Long quiet windows, fast (3^n) backoff growth, low round cap.
+    /// Use when retransmits are expensive (slow presets, low SNR).
+    Conservative,
+    /// Short quiet windows, slow (2^n) backoff growth, high round cap.
+    /// Use when retransmits are cheap (fast presets, good SNR).
+    Aggressive,
+}
+
+/// Concrete parameters resolved from a [`VoiceNackMode`] + preset.
+/// `nack_window` is the base quiet period; the assembler multiplies by
+/// `backoff_base.pow(round)` for the effective window of round `n`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackParams {
+    pub nack_window: std::time::Duration,
+    /// Backoff base used as `nack_window × base^round`. `2` doubles each
+    /// round; `3` triples. Special value `0` means "NACK disabled" — the
+    /// assembler skips emission entirely.
+    pub backoff_base: u32,
+    pub max_nack_rounds: u16,
+}
+
+impl NackParams {
+    /// `Off`: NACK suppressed; backoff/round cap fields are inert. The
+    /// assembler checks `backoff_base == 0` and short-circuits.
+    pub const fn disabled() -> Self {
+        Self {
+            nack_window: std::time::Duration::from_secs(3_600),
+            backoff_base: 0,
+            max_nack_rounds: 0,
+        }
+    }
+}
+
+impl VoiceNackMode {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => VOICE_NACK_MODE_AUTO,
+            Self::Off => VOICE_NACK_MODE_OFF,
+            Self::Conservative => VOICE_NACK_MODE_CONSERVATIVE,
+            Self::Aggressive => VOICE_NACK_MODE_AGGRESSIVE,
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Some(match s {
+            VOICE_NACK_MODE_AUTO => Self::Auto,
+            VOICE_NACK_MODE_OFF => Self::Off,
+            VOICE_NACK_MODE_CONSERVATIVE => Self::Conservative,
+            VOICE_NACK_MODE_AGGRESSIVE => Self::Aggressive,
+            _ => return None,
+        })
+    }
+
+    /// Resolve to concrete `NackParams`. `preset` is consulted for
+    /// `Auto`; manual modes use a flat policy independent of preset.
+    pub fn resolve(self, preset: Option<crate::voice::ModemPreset>) -> NackParams {
+        use crate::voice::ModemPreset;
+        use std::time::Duration;
+
+        let pacing = preset
+            .map(ModemPreset::pacing)
+            .unwrap_or_else(ModemPreset::fallback_pacing);
+
+        match self {
+            Self::Off => NackParams::disabled(),
+            Self::Conservative => NackParams {
+                nack_window: (pacing * 4).max(Duration::from_millis(4_000)),
+                backoff_base: 3,
+                max_nack_rounds: 200,
+            },
+            Self::Aggressive => NackParams {
+                nack_window: Duration::from_millis(1_500),
+                backoff_base: 2,
+                max_nack_rounds: 800,
+            },
+            Self::Auto => match preset {
+                Some(
+                    ModemPreset::ShortTurbo
+                    | ModemPreset::ShortFast
+                    | ModemPreset::ShortSlow
+                    | ModemPreset::MediumFast,
+                ) => NackParams {
+                    nack_window: Duration::from_millis(1_500),
+                    backoff_base: 2,
+                    max_nack_rounds: 800,
+                },
+                Some(ModemPreset::MediumSlow | ModemPreset::LongFast) => NackParams {
+                    nack_window: Duration::from_millis(3_000),
+                    backoff_base: 2,
+                    max_nack_rounds: 400,
+                },
+                Some(
+                    ModemPreset::LongModerate | ModemPreset::LongSlow | ModemPreset::VeryLongSlow,
+                )
+                | None => NackParams {
+                    nack_window: (pacing * 4).max(Duration::from_millis(4_000)),
+                    backoff_base: 3,
+                    max_nack_rounds: 200,
+                },
+            },
+        }
+    }
+}
+
+pub fn voice_nack_mode_to_id(m: VoiceNackMode) -> &'static str {
+    m.id()
+}
+
+pub fn voice_nack_mode_from_id(s: &str) -> Option<VoiceNackMode> {
+    VoiceNackMode::from_id(s)
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::voice::ModemPreset;
+
+    #[test]
+    fn fec_auto_broadcast_uses_50pct_regardless_of_preset() {
+        for preset in [
+            None,
+            Some(ModemPreset::ShortFast),
+            Some(ModemPreset::LongSlow),
+        ] {
+            let p = VoiceFecMode::Auto.resolve(true, preset, 10);
+            assert_eq!(
+                p, 5,
+                "broadcast must always force 50% parity (preset={preset:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn fec_auto_unicast_scales_with_preset() {
+        // Short-range presets get no FEC: NACK round-trips are cheap.
+        assert_eq!(
+            VoiceFecMode::Auto.resolve(false, Some(ModemPreset::ShortFast), 10),
+            0
+        );
+        // Medium presets get ~20%.
+        assert_eq!(
+            VoiceFecMode::Auto.resolve(false, Some(ModemPreset::MediumFast), 10),
+            2
+        );
+        // Long-range presets get ~33%.
+        assert_eq!(
+            VoiceFecMode::Auto.resolve(false, Some(ModemPreset::LongFast), 10),
+            4
+        );
+        assert_eq!(
+            VoiceFecMode::Auto.resolve(false, Some(ModemPreset::VeryLongSlow), 10),
+            4
+        );
+    }
+
+    #[test]
+    fn fec_manual_modes_ignore_preset() {
+        let preset = Some(ModemPreset::ShortFast);
+        assert_eq!(VoiceFecMode::Off.resolve(false, preset, 10), 0);
+        assert_eq!(VoiceFecMode::Light.resolve(false, preset, 10), 1);
+        assert_eq!(VoiceFecMode::Medium.resolve(false, preset, 10), 3); // div_ceil(10*25, 100) = 3
+        assert_eq!(VoiceFecMode::Heavy.resolve(false, preset, 10), 5);
+    }
+
+    #[test]
+    fn fec_resolve_clamps_to_total_data() {
+        // Heavy on a tiny message must not exceed total_data.
+        assert_eq!(VoiceFecMode::Heavy.resolve(false, None, 2), 1);
+        assert_eq!(VoiceFecMode::Heavy.resolve(false, None, 1), 1);
+    }
+
+    #[test]
+    fn fec_resolve_caps_at_max_parity() {
+        // 50% of 255 (max total_data) ceils to 128 — exactly the protocol
+        // cap. Any larger total_data is impossible (u8 wraps), so this is
+        // the edge that exercises the cap clamp.
+        let p = VoiceFecMode::Heavy.resolve(false, None, 255);
+        assert_eq!(p as usize, crate::voice::MAX_PARITY_PER_MESSAGE);
+    }
+
+    #[test]
+    fn nack_off_disables_emission_via_backoff_base_zero() {
+        let p = VoiceNackMode::Off.resolve(Some(ModemPreset::LongFast));
+        assert_eq!(
+            p.backoff_base, 0,
+            "Off mode must signal disabled via backoff_base == 0"
+        );
+    }
+
+    #[test]
+    fn nack_aggressive_uses_2x_backoff_and_short_window() {
+        let p = VoiceNackMode::Aggressive.resolve(Some(ModemPreset::LongSlow));
+        assert_eq!(p.backoff_base, 2);
+        assert_eq!(p.nack_window, std::time::Duration::from_millis(1_500));
+        assert!(p.max_nack_rounds >= 400);
+    }
+
+    #[test]
+    fn nack_conservative_uses_3x_backoff_and_long_window() {
+        let p = VoiceNackMode::Conservative.resolve(Some(ModemPreset::ShortFast));
+        assert_eq!(p.backoff_base, 3);
+        assert!(p.nack_window >= std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn nack_auto_picks_aggressive_on_fast_preset() {
+        let p = VoiceNackMode::Auto.resolve(Some(ModemPreset::ShortFast));
+        assert_eq!(p.backoff_base, 2);
+        assert!(p.nack_window <= std::time::Duration::from_millis(2_000));
+    }
+
+    #[test]
+    fn nack_auto_picks_conservative_on_slow_preset() {
+        let p = VoiceNackMode::Auto.resolve(Some(ModemPreset::LongSlow));
+        assert_eq!(p.backoff_base, 3);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Settings API
 // ---------------------------------------------------------------------------
 
@@ -369,6 +713,14 @@ impl SettingsApi {
         self.inner.read().voice_denoise_enabled()
     }
 
+    pub fn voice_fec_mode(&self) -> VoiceFecMode {
+        VoiceFecMode::from_id(self.inner.read().voice_fec_mode()).unwrap_or(VoiceFecMode::Auto)
+    }
+
+    pub fn voice_nack_mode(&self) -> VoiceNackMode {
+        VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or(VoiceNackMode::Auto)
+    }
+
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `VoiceCodecParam` the voice protocol layer wants.
     pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
@@ -477,6 +829,16 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceDenoiseEnabled)
     }
 
+    pub fn set_voice_fec_mode(&self, mode: VoiceFecMode) -> SettingsResult<()> {
+        self.inner.write().voice_fec_mode = Some(mode.id().to_string());
+        self.persist_and_notify(SettingKey::VoiceFecMode)
+    }
+
+    pub fn set_voice_nack_mode(&self, mode: VoiceNackMode) -> SettingsResult<()> {
+        self.inner.write().voice_nack_mode = Some(mode.id().to_string());
+        self.persist_and_notify(SettingKey::VoiceNackMode)
+    }
+
     /// Clear a single field's override (revert to its default).
     pub fn reset(&self, key: SettingKey) -> SettingsResult<()> {
         {
@@ -491,6 +853,8 @@ impl SettingsApi {
                 SettingKey::VoiceOpusBitrateKbps => g.voice_opus_bitrate_kbps = None,
                 SettingKey::VoiceOpusBandwidth => g.voice_opus_bandwidth = None,
                 SettingKey::VoiceDenoiseEnabled => g.voice_denoise_enabled = None,
+                SettingKey::VoiceFecMode => g.voice_fec_mode = None,
+                SettingKey::VoiceNackMode => g.voice_nack_mode = None,
             }
         }
         self.persist_and_notify(key)
@@ -523,6 +887,8 @@ impl SettingsApi {
             SettingKey::VoiceOpusBitrateKbps => self.voice_opus_bitrate_kbps().to_string(),
             SettingKey::VoiceOpusBandwidth => self.voice_opus_bandwidth().id().to_string(),
             SettingKey::VoiceDenoiseEnabled => self.voice_denoise_enabled().to_string(),
+            SettingKey::VoiceFecMode => self.voice_fec_mode().id().to_string(),
+            SettingKey::VoiceNackMode => self.voice_nack_mode().id().to_string(),
         }
     }
 
@@ -601,6 +967,26 @@ impl SettingsApi {
             SettingKey::VoiceDenoiseEnabled => {
                 let b = parse_bool(key, value)?;
                 self.set_voice_denoise_enabled(b)
+            }
+            SettingKey::VoiceFecMode => {
+                let mode = VoiceFecMode::from_id(value).ok_or_else(|| SettingsError::Invalid {
+                    key: key.id(),
+                    value: value.to_string(),
+                    reason: format!(
+                        "expected one of {VOICE_FEC_MODE_AUTO}, {VOICE_FEC_MODE_OFF}, {VOICE_FEC_MODE_LIGHT}, {VOICE_FEC_MODE_MEDIUM}, {VOICE_FEC_MODE_HEAVY}"
+                    ),
+                })?;
+                self.set_voice_fec_mode(mode)
+            }
+            SettingKey::VoiceNackMode => {
+                let mode = VoiceNackMode::from_id(value).ok_or_else(|| SettingsError::Invalid {
+                    key: key.id(),
+                    value: value.to_string(),
+                    reason: format!(
+                        "expected one of {VOICE_NACK_MODE_AUTO}, {VOICE_NACK_MODE_OFF}, {VOICE_NACK_MODE_CONSERVATIVE}, {VOICE_NACK_MODE_AGGRESSIVE}"
+                    ),
+                })?;
+                self.set_voice_nack_mode(mode)
             }
         }
     }
@@ -688,6 +1074,33 @@ impl SettingsApi {
                 "Run captured audio through an RNNoise-based denoiser before the encoder. Reduces stationary background noise (fans, HVAC, keyboard) at the cost of ~10 ms latency. No effect on builds without the `denoise` feature.",
                 SettingKind::Bool,
                 DEFAULT_VOICE_DENOISE_ENABLED.to_string(),
+            ),
+            SettingKey::VoiceFecMode => (
+                "FEC parity policy (sender)",
+                "Reed-Solomon parity overhead. `auto` picks 50% for broadcast, 33% for long-range unicast, 20% medium, 0% short. Manual modes set a flat percentage of `total_data`.",
+                SettingKind::Enum {
+                    variants: vec![
+                        VOICE_FEC_MODE_AUTO,
+                        VOICE_FEC_MODE_OFF,
+                        VOICE_FEC_MODE_LIGHT,
+                        VOICE_FEC_MODE_MEDIUM,
+                        VOICE_FEC_MODE_HEAVY,
+                    ],
+                },
+                DEFAULT_VOICE_FEC_MODE.to_string(),
+            ),
+            SettingKey::VoiceNackMode => (
+                "NACK aggressiveness (receiver)",
+                "Quiet-window, backoff exponent, and round cap for the NACK loop. `auto` picks by modem preset. Broadcast messages always behave as `off` regardless — they cannot use NACK reliably.",
+                SettingKind::Enum {
+                    variants: vec![
+                        VOICE_NACK_MODE_AUTO,
+                        VOICE_NACK_MODE_OFF,
+                        VOICE_NACK_MODE_CONSERVATIVE,
+                        VOICE_NACK_MODE_AGGRESSIVE,
+                    ],
+                },
+                DEFAULT_VOICE_NACK_MODE.to_string(),
             ),
         };
         SettingDescriptor {

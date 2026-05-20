@@ -98,13 +98,16 @@ fn loopback_nack_retransmit_completes_message() {
         ..AssemblerConfig::default()
     });
 
+    // Unicast: broadcasts suppress NACK emission by design, so the
+    // retransmit round-trip path can only be exercised on a DM.
+    let dest = VoiceDestination::Node(voicetastic_core::node::NodeId::from_u32(0xABCD_EF01));
     let lost: HashSet<usize> = [2, 5].into_iter().collect();
     let mut completed = None;
     for (i, f) in enc.frames.iter().enumerate() {
         if lost.contains(&i) {
             continue;
         }
-        match asm.accept(FROM, VoiceDestination::Broadcast, CHANNEL, f) {
+        match asm.accept(FROM, dest, CHANNEL, f) {
             AssemblyEvent::Pending { .. } => {}
             AssemblyEvent::Complete(m) => completed = Some(m),
             e => panic!("unexpected event during initial burst: {e:?}"),
@@ -130,7 +133,7 @@ fn loopback_nack_retransmit_completes_message() {
 
     for idx in info.missing.iter().copied() {
         let f = &enc.frames[idx as usize];
-        match asm.accept(FROM, VoiceDestination::Broadcast, CHANNEL, f) {
+        match asm.accept(FROM, dest, CHANNEL, f) {
             AssemblyEvent::Pending { .. } => {}
             AssemblyEvent::Complete(m) => completed = Some(m),
             e => panic!("unexpected event during retransmit: {e:?}"),

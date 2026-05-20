@@ -411,6 +411,11 @@ impl From<AssemblerConfig> for v::AssemblerConfig {
             partial_play_on_timeout: c.partial_play_on_timeout,
             max_nack_rounds: c.max_nack_rounds,
             nack_window: Duration::from_millis(c.nack_window_ms),
+            // Bridge surface doesn't expose the backoff multiplier yet —
+            // Android hosts are expected to drive it through the
+            // `voice.nack_mode` setting on `SettingsApi` instead. Keep
+            // the historical `3^n` behaviour as a safe default.
+            nack_backoff_base: 3,
             completion_memory: Duration::from_millis(c.completion_memory_ms),
             // Bridge surface doesn't expose a codec allowlist yet (the
             // Android UI hasn't grown a "which codecs do we play back?"
@@ -784,6 +789,8 @@ pub enum SettingKey {
     VoiceOpusBitrateKbps,
     VoiceOpusBandwidth,
     VoiceDenoiseEnabled,
+    VoiceFecMode,
+    VoiceNackMode,
 }
 
 impl From<SettingKey> for s::SettingKey {
@@ -798,6 +805,8 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
             SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
+            SettingKey::VoiceFecMode => Self::VoiceFecMode,
+            SettingKey::VoiceNackMode => Self::VoiceNackMode,
         }
     }
 }
@@ -814,6 +823,8 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             s::SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
             s::SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
+            s::SettingKey::VoiceFecMode => Self::VoiceFecMode,
+            s::SettingKey::VoiceNackMode => Self::VoiceNackMode,
         }
     }
 }
