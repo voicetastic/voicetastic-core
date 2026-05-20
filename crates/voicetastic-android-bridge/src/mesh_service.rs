@@ -487,10 +487,11 @@ impl MeshService {
         channel: u32,
         dest: Option<u32>,
         want_ack: bool,
+        want_response: bool,
     ) -> Result<u32, MeshServiceError> {
         let svc = self.core.clone();
         let id = runtime().block_on(async move {
-            svc.send_data(portnum, payload, channel, dest, want_ack)
+            svc.send_data(portnum, payload, channel, dest, want_ack, want_response)
                 .await
         })?;
         Ok(id)

@@ -60,6 +60,11 @@ impl MeshtasticService {
     }
 
     /// Send a raw application data packet (e.g. voice chunks via [`PRIVATE_APP`]).
+    ///
+    /// `want_ack` is on the transport layer (next-hop ACK). `want_response`
+    /// is on the application Data field — set it to ask the destination app
+    /// to reply in kind (e.g. NodeInfo discovery: a broadcast NodeInfo with
+    /// `want_response = true` prompts peers to send back their own NodeInfo).
     pub async fn send_data(
         &self,
         portnum: i32,
@@ -67,6 +72,7 @@ impl MeshtasticService {
         channel: u32,
         to: Option<u32>,
         want_ack: bool,
+        want_response: bool,
     ) -> Result<u32> {
         let id = self.next_id().await;
         let pkt = MeshPacket {
@@ -80,6 +86,7 @@ impl MeshtasticService {
             payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
                 portnum,
                 payload,
+                want_response,
                 ..Default::default()
             })),
             ..Default::default()

@@ -43,6 +43,46 @@ namespace voicetastic {
     /// Parse a `!aabbccdd` text id back into a node number; returns
     /// `null` for any malformed id (or the broadcast address).
     u32? node_id_to_num(string id);
+
+    /// Decode a complete Codec2 payload (concatenated packed frames) to
+    /// 16-bit PCM samples at 8 kHz mono. `mode` mirrors `Codec2Mode`
+    /// (0=3200, 1=2400, 2=1600, 3=1400, 4=1300, 5=1200).
+    [Throws=Codec2Error]
+    sequence<i16> codec2_decode(bytes payload, u8 mode);
+};
+
+// -----------------------------------------------------------------------------
+// Codec2 encoder (PCM 8 kHz mono → packed Codec2 frames)
+// -----------------------------------------------------------------------------
+
+/// Errors raised by the Codec2 encode/decode bridge helpers.
+[Error]
+enum Codec2Error {
+    "BadMode",
+    "BadPcmLen",
+    "BadPayloadLen",
+};
+
+/// Stateful Codec2 encoder. Push whole-frame PCM buffers and get back
+/// packed bytes. Frame sizes are mode-dependent — read `samples_per_frame`
+/// and `bytes_per_frame` after `new(...)` to size the recording buffer.
+interface Codec2Encoder {
+    [Throws=Codec2Error]
+    constructor(u8 mode);
+
+    /// Samples (i16) consumed per Codec2 frame at the configured mode.
+    /// 160 for modes 0/1, 320 for modes 2..=5.
+    u32 samples_per_frame();
+
+    /// Packed bytes produced per Codec2 frame at the configured mode.
+    /// 8/6/8/7/7/6 for modes 0..=5.
+    u32 bytes_per_frame();
+
+    /// Encode a buffer of 16-bit PCM samples. Length must be a multiple
+    /// of `samples_per_frame()`. Output length is
+    /// `(pcm.len() / samples_per_frame) * bytes_per_frame`.
+    [Throws=Codec2Error]
+    bytes encode(sequence<i16> pcm);
 };
 
 /// Configuration for `build_nack`.
@@ -610,7 +650,7 @@ interface MeshService {
     u32 send_text(string text, u32 channel, u32? dest);
 
     [Throws=MeshServiceError]
-    u32 send_data(i32 portnum, bytes payload, u32 channel, u32? dest, boolean want_ack);
+    u32 send_data(i32 portnum, bytes payload, u32 channel, u32? dest, boolean want_ack, boolean want_response);
 
     /// Encode `audio` per `cfg` and push the resulting frames onto the
     /// paced voice TX queue. Returns the per-frame packet ids in send

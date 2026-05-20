@@ -1020,10 +1020,12 @@ impl SettingsApi {
 
 uniffi::include_scaffolding!("voicetastic");
 
+mod codec2_wrapper;
 mod mesh_service;
 mod runtime;
 mod smoke;
 
+pub use codec2_wrapper::{Codec2Encoder, Codec2Error, codec2_decode};
 pub use mesh_service::{
     IncomingDataMsg, IncomingTextMsg, MeshConfigListener, MeshConnectionState, MeshDataListener,
     MeshQueueListener, MeshService, MeshServiceError, MeshStateListener, MeshTextListener,

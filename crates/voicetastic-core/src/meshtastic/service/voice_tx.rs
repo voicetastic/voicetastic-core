@@ -152,6 +152,7 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
                     item.channel,
                     item.to,
                     item.want_ack,
+                    false, // want_response — voice frames are one-shot, no reply expected
                 )
                 .await;
             let send_elapsed = send_start.elapsed();

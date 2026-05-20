@@ -332,6 +332,7 @@ pub fn spawn_watchers(
                                         channel,
                                         Some(to_node),
                                         false,
+                                        false, // want_response
                                     )
                                     .await
                                 {

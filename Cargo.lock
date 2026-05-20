@@ -4252,7 +4252,9 @@ name = "voicetastic-android-bridge"
 version = "0.0.0-git"
 dependencies = [
  "async-trait",
+ "codec2",
  "once_cell",
+ "parking_lot 0.12.5",
  "prost",
  "thiserror 2.0.18",
  "tokio",

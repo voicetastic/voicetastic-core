@@ -28,6 +28,11 @@ once_cell = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 prost = { workspace = true }
+# Codec2: pure-Rust speech codec (no FFI), used by the Codec2Encoder /
+# codec2_decode bridge helpers. Cross-compiles to Android targets without
+# extra NDK toolchain plumbing.
+codec2 = { workspace = true }
+parking_lot = { workspace = true }
 [build-dependencies]
 uniffi = { workspace = true, features = ["build"] }
 [features]
