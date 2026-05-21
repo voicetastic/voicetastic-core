@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Voicetastic launcher icon, ported from the Android adaptive icon at
+  AndroidStudioProjects/voicetastic/app/src/main/res/{drawable,mipmap-anydpi}/
+  ic_launcher_*.xml. Same geometry, same colours:
+
+    - background  = #FFBDA8  (M3 seed used by the Compose theme)
+    - foreground  = #2C2D3C  (high-contrast mark)
+
+  Two glyph paths form a stylised "M" / Λ Λ shape; the outer group is
+  rotated 180° so the points face downward, matching the Android art.
+  Inner group reproduces Android's scale + translate so the foreground
+  occupies the central 72×72 dp "safe zone" of a 108×108 dp adaptive
+  icon.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="#FFBDA8"/>
+  <g transform="rotate(180 54 54)">
+    <g transform="translate(18.36 18.36) scale(2.4944882)">
+      <path fill="#2C2D3C" fill-rule="evenodd"
+            d="m17.5564,11.8482 l-5.208,7.6376 -1.5217,-1.0377 5.9674,-8.7512c0.1714,-0.2513 0.4558,-0.4019 0.76,-0.4022 0.3042,-0.0003 0.5889,0.1497 0.7608,0.4008l5.9811,8.7374 -1.5199,1.0404z"/>
+      <path fill="#2C2D3C" fill-rule="evenodd"
+            d="m5.854,19.4956 l6.3707,-9.3423 -1.5749,-1.0739 -6.3707,9.3423z"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,247 @@
+# Voicetastic design tokens — single source of truth for visual style
+# across the desktop GUI (egui), the Android app (Compose), and any
+# future web client. Each platform consumes these primitives via its
+# own generator/loader.
+#
+# Inspired by Material 3 *static* tokens: we skip motion, springs, and
+# wallpaper-driven dynamic color.
+#
+# Palette is generated from seed `#FFBDA8` using Material 3's
+# `TonalSpot` style (SPEC_2025). The Android app uses the `Neutral` +
+# HighContrast variant of the same seed for accessibility reasons;
+# desktop trades some contrast for chromatic spread (warm terracotta
+# primary, warm brown secondary, olive tertiary in light mode).
+#
+# Regenerate with:
+#   cargo run --example generate_palette -p voicetastic-tokens
+#
+# Edit the `SEED` / style constants in the example to retheme.
+
+# ---------------------------------------------------------------------
+# Color roles. Hex `#RRGGBB`; alpha is not encoded here — surfaces use
+# tonal tints, overlays are derived at render time per-platform.
+# ---------------------------------------------------------------------
+
+[color.light]
+# Primary (warm terracotta — seed hue, high chroma)
+primary                   = "#8F4C35"
+on_primary                = "#FFFFFF"
+primary_container         = "#FFDBD0"
+on_primary_container      = "#390C00"
+inverse_primary           = "#FFB59D"
+# Secondary (desaturated warm brown)
+secondary                 = "#77574D"
+on_secondary              = "#FFFFFF"
+secondary_container       = "#FFDBD0"
+on_secondary_container    = "#2C160E"
+# Tertiary (olive — 60° rotation from primary)
+tertiary                  = "#6A5E2F"
+on_tertiary               = "#FFFFFF"
+tertiary_container        = "#F4E2A7"
+on_tertiary_container     = "#221B00"
+# Error
+error                     = "#BA1A1A"
+on_error                  = "#FFFFFF"
+error_container           = "#FFDAD6"
+on_error_container        = "#410002"
+# Background & surface
+background                = "#FFF8F6"
+on_background             = "#231917"
+surface                   = "#FFF8F6"
+on_surface                = "#231917"
+surface_variant           = "#F5DED7"
+on_surface_variant        = "#53433F"
+surface_tint              = "#8F4C35"
+# Inverse surface (snackbars, tooltips, etc.)
+inverse_surface           = "#392E2B"
+inverse_on_surface        = "#FFEDE8"
+# Surface tonal tiers (M3 expressive surface scale, lowest → highest)
+surface_dim               = "#E8D6D1"
+surface_bright            = "#FFF8F6"
+surface_container_lowest  = "#FFFFFF"
+surface_container_low     = "#FFF1ED"
+surface_container         = "#FCEAE5"
+surface_container_high    = "#F7E4DF"
+surface_container_highest = "#F1DFDA"
+# Outlines
+outline                   = "#85736E"
+outline_variant           = "#D8C2BB"
+scrim                     = "#000000"
+
+[color.dark]
+# Primary (the seed peach itself — most chromatic role in dark mode)
+primary                   = "#FFB59D"
+on_primary                = "#55200C"
+primary_container         = "#723520"
+on_primary_container      = "#FFDBD0"
+inverse_primary           = "#8F4C35"
+# Secondary (warm pink-peach)
+secondary                 = "#E7BDB1"
+on_secondary              = "#442A21"
+secondary_container       = "#5D4036"
+on_secondary_container    = "#FFDBD0"
+# Tertiary (warm gold)
+tertiary                  = "#D7C68D"
+on_tertiary               = "#3A3005"
+tertiary_container        = "#51461A"
+on_tertiary_container     = "#F4E2A7"
+# Error
+error                     = "#FFB4AB"
+on_error                  = "#690005"
+error_container           = "#93000A"
+on_error_container        = "#FFDAD6"
+# Background & surface
+background                = "#1A110F"
+on_background             = "#F1DFDA"
+surface                   = "#1A110F"
+on_surface                = "#F1DFDA"
+surface_variant           = "#53433F"
+on_surface_variant        = "#D8C2BB"
+surface_tint              = "#FFB59D"
+# Inverse surface
+inverse_surface           = "#F1DFDA"
+inverse_on_surface        = "#392E2B"
+# Surface tonal tiers (lowest → highest)
+surface_dim               = "#1A110F"
+surface_bright            = "#423733"
+surface_container_lowest  = "#140C0A"
+surface_container_low     = "#231917"
+surface_container         = "#271D1B"
+surface_container_high    = "#322825"
+surface_container_highest = "#3D322F"
+# Outlines
+outline                   = "#A08D87"
+outline_variant           = "#53433F"
+scrim                     = "#000000"
+
+# "Fixed" colors are mode-independent: same hex in light and dark.
+
+[color.fixed]
+primary_fixed              = "#FFDBD0"
+primary_fixed_dim          = "#FFB59D"
+on_primary_fixed           = "#390C00"
+on_primary_fixed_variant   = "#723520"
+secondary_fixed            = "#FFDBD0"
+secondary_fixed_dim        = "#E7BDB1"
+on_secondary_fixed         = "#2C160E"
+on_secondary_fixed_variant = "#5D4036"
+tertiary_fixed             = "#F4E2A7"
+tertiary_fixed_dim         = "#D7C68D"
+on_tertiary_fixed          = "#221B00"
+on_tertiary_fixed_variant  = "#51461A"
+
+# ---------------------------------------------------------------------
+# Typography. `size_dp` is the rendered size at 1× density; platforms
+# scale by their own DPI factor. `weight` is the OpenType weight (400 =
+# regular, 500 = medium). `line_height_dp` is the recommended leading.
+# ---------------------------------------------------------------------
+
+[typography.display_large]
+size_dp = 57
+weight = 400
+line_height_dp = 64
+
+[typography.display_medium]
+size_dp = 45
+weight = 400
+line_height_dp = 52
+
+[typography.headline_large]
+size_dp = 32
+weight = 400
+line_height_dp = 40
+
+[typography.headline_medium]
+size_dp = 28
+weight = 400
+line_height_dp = 36
+
+[typography.title_large]
+size_dp = 22
+weight = 400
+line_height_dp = 28
+
+[typography.title_medium]
+size_dp = 16
+weight = 500
+line_height_dp = 24
+
+[typography.body_large]
+size_dp = 16
+weight = 400
+line_height_dp = 24
+
+[typography.body_medium]
+size_dp = 14
+weight = 400
+line_height_dp = 20
+
+[typography.label_large]
+size_dp = 14
+weight = 500
+line_height_dp = 20
+
+[typography.label_medium]
+size_dp = 12
+weight = 500
+line_height_dp = 16
+
+# ---------------------------------------------------------------------
+# Spacing scale. Multiples of `step_dp`. Components reference these by
+# name (xs/sm/md/lg/xl/xxl) so platform overrides don't need to know
+# pixel values.
+# ---------------------------------------------------------------------
+
+[spacing]
+step_dp = 4
+xs   = 4
+sm   = 8
+md   = 12
+lg   = 16
+xl   = 24
+xxl  = 32
+
+# ---------------------------------------------------------------------
+# Shape (corner radii) tokens.
+# ---------------------------------------------------------------------
+
+[shape]
+none        = 0
+extra_small = 4
+small       = 8
+medium      = 12
+large       = 16
+extra_large = 28
+full        = 9999
+
+# ---------------------------------------------------------------------
+# Elevation. egui & monochrome firmware can't draw real shadows, so we
+# emulate M3's "surface tint" model: each level is a tonal mix between
+# `surface` and `primary`, opacity rising with elevation. Platforms
+# that support real shadows (web, Compose) MAY also draw a shadow with
+# the elevation's `dp` value.
+# ---------------------------------------------------------------------
+
+[elevation.level0]
+dp = 0
+tint_opacity = 0.00
+
+[elevation.level1]
+dp = 1
+tint_opacity = 0.05
+
+[elevation.level2]
+dp = 3
+tint_opacity = 0.08
+
+[elevation.level3]
+dp = 6
+tint_opacity = 0.11
+
+[elevation.level4]
+dp = 8
+tint_opacity = 0.12
+
+[elevation.level5]
+dp = 12
+tint_opacity = 0.14

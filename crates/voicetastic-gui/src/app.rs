@@ -65,6 +65,28 @@ impl VoicetasticApp {
         rt: Arc<Runtime>,
         service: MeshtasticService,
     ) -> Self {
+        // Install the shared design-token-driven theme. Static M3 tokens
+        // (no motion / no dynamic color) parsed from
+        // [`tokens/design.toml`](../../../tokens/design.toml) by the
+        // `voicetastic-tokens` crate. `egui_style` returns a full
+        // [`egui::Style`] (visuals + spacing + type scale) so colours,
+        // padding rhythm, and the M3 type ramp all switch together.
+        //
+        // Both theme slots get populated so egui's system-theme follow
+        // mode renders our palette regardless of which side it lands
+        // on; we then pin the preference to Dark explicitly so the
+        // initial frame is deterministic. Switching to Light/System
+        // at runtime is a one-liner once a user preference exists.
+        cc.egui_ctx.set_style_of(
+            egui::Theme::Light,
+            voicetastic_tokens::egui_style(voicetastic_tokens::ColorMode::Light),
+        );
+        cc.egui_ctx.set_style_of(
+            egui::Theme::Dark,
+            voicetastic_tokens::egui_style(voicetastic_tokens::ColorMode::Dark),
+        );
+        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+
         let shared = Arc::new(Mutex::new(SharedState::default()));
         let settings = SettingsApi::open();
         // NB: the `..AssemblerConfig::default()` spread is safe here because

@@ -1,0 +1,27 @@
+[package]
+name = "voicetastic-tokens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Single source of truth for Voicetastic design tokens (colors, typography, spacing, shape, elevation). Platform-agnostic; thin per-target emitters live behind feature flags."
+
+[features]
+default = []
+# Emit `egui::Visuals` from a parsed `Theme`. Off by default so the
+# Android bridge / future web client / firmware tooling don't drag in
+# the desktop UI stack.
+egui = ["dep:egui"]
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+once_cell = { workspace = true }
+egui = { workspace = true, optional = true }
+
+# Reproducible regeneration of `tokens/design.toml` from a seed colour.
+# Only used by the `generate_palette` example — never compiled into the
+# library itself, hence dev-dependency.
+[dev-dependencies]
+material-colors = "0.4"

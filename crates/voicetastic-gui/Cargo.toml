@@ -24,6 +24,7 @@ audio = ["dep:cpal", "voicetastic-core/codecs", "voicetastic-core/denoise"]
 
 [dependencies]
 voicetastic-core = { workspace = true }
+voicetastic-tokens = { workspace = true, features = ["egui"] }
 tokio = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
@@ -32,3 +33,7 @@ tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
 cpal = { version = "0.16", optional = true }
+# PNG-only image decode for the window icon. `default-features = false`
+# skips JPEG/GIF/TIFF/etc decoders and their transitive deps — we only
+# ever hand it the bundled `assets/icon-256.png`.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -5,6 +5,7 @@ members = [
     "crates/voicetastic-cli",
     "crates/voicetastic-gui",
     "crates/voicetastic-android-bridge",
+    "crates/voicetastic-tokens",
 ]
 
 [workspace.package]
@@ -20,6 +21,7 @@ repository = "https://git.cha-sam.re/acarteron/voicetastic-desktop"
 
 [workspace.dependencies]
 voicetastic-core = { path = "crates/voicetastic-core" }
+voicetastic-tokens = { path = "crates/voicetastic-tokens" }
 
 # Async runtime
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "io-std", "fs", "signal"] }
