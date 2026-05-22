@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use voicetastic_core::ble::DiscoveredDevice;
 use voicetastic_core::meshtastic::service::ConnectionState;
@@ -92,7 +92,11 @@ pub struct SharedState {
     pub conn_state: ConnectionState,
     pub my_info: Option<MyNodeInfo>,
     pub nodes: HashMap<u32, NodeInfo>,
-    pub chat_log: Vec<ChatEntry>,
+    /// Append-only chat scrollback. Stored as a `VecDeque` so the
+    /// FIFO eviction in [`Self::push_chat`] is O(1) `pop_front` rather
+    /// than the O(n) shift `Vec::drain(..excess)` paid every time the
+    /// log filled up.
+    pub chat_log: VecDeque<ChatEntry>,
     pub scan_results: Vec<DiscoveredDevice>,
     pub scanning: bool,
     pub status_msg: Option<String>,
@@ -183,11 +187,9 @@ impl SharedState {
     /// in-place (e.g. upgrading a "receiving …" placeholder) don't need to
     /// go through this helper.
     pub fn push_chat(&mut self, entry: ChatEntry) {
-        self.chat_log.push(entry);
-        let len = self.chat_log.len();
-        if len > MAX_CHAT_LOG_ENTRIES {
-            let excess = len - MAX_CHAT_LOG_ENTRIES;
-            self.chat_log.drain(..excess);
+        self.chat_log.push_back(entry);
+        while self.chat_log.len() > MAX_CHAT_LOG_ENTRIES {
+            self.chat_log.pop_front();
         }
     }
 }
@@ -198,7 +200,7 @@ impl Default for SharedState {
             conn_state: ConnectionState::Disconnected,
             my_info: None,
             nodes: HashMap::new(),
-            chat_log: Vec::new(),
+            chat_log: VecDeque::new(),
             scan_results: Vec::new(),
             scanning: false,
             status_msg: None,

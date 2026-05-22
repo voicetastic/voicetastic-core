@@ -248,7 +248,13 @@ pub fn spawn_watchers(
                         c.request_repaint();
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // A missed `config_complete` would leave the UI
+                        // stuck showing "Configuring…" — surface the drop
+                        // so it's not invisible if the broadcast channel
+                        // backs up.
+                        tracing::warn!(skipped = n, "config_complete broadcast lagged");
+                    }
                 }
             }
         });

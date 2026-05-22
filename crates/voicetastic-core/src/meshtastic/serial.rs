@@ -143,7 +143,14 @@ impl SerialConnection {
         let mut shutdown_rx = self.shutdown.subscribe();
 
         tokio::spawn(async move {
-            let mut reader = reader;
+            // Wrap the raw serial reader in a `BufReader` so the frame
+            // scanner's per-byte `read_exact` calls hit a userspace
+            // buffer instead of the serial fd. Each underlying read is
+            // a real syscall (no kernel-side buffering on a tty), so
+            // looking for START1 byte-by-byte previously cost ~one
+            // syscall per byte of noise; with the buffer we refill a
+            // chunk at a time and `read_byte` becomes a memcpy.
+            let mut reader = tokio::io::BufReader::new(reader);
             let mut read_errors: u32 = 0;
             loop {
                 tokio::select! {

@@ -14,6 +14,13 @@ impl Resampler {
         }
     }
 
+    /// Resample `input` and *append* the output samples to `dst`.
+    ///
+    /// `dst` is appended-to, never cleared: pass the same buffer across
+    /// calls (after draining what was consumed) so steady-state pushes
+    /// don't reallocate. Callers in the codec pipeline construct it once
+    /// with `Vec::with_capacity(samples_per_frame * N)` and reuse it for
+    /// the lifetime of the encode/decode session.
     pub fn push(&mut self, input: &[f32], dst: &mut Vec<f32>) {
         if input.is_empty() {
             return;

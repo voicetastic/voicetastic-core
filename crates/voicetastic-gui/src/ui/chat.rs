@@ -723,7 +723,19 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
                 }
                 Ok(SendStatus::Complete { .. }) => break,
                 Ok(SendStatus::Building { .. }) | Ok(SendStatus::Retransmitting { .. }) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Missing intermediate status events is benign — the
+                    // chat row's progress label may briefly skip ahead.
+                    // Missing a terminal `Complete` / `GaveUp` / `Failed`
+                    // is not: the row would stay on "sending…" forever.
+                    // Log the count so a stuck row points at the cause.
+                    tracing::warn!(
+                        message_id,
+                        skipped = n,
+                        "voice send-status broadcast lagged"
+                    );
+                    continue;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }

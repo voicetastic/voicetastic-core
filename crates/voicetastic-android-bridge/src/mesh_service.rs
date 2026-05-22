@@ -772,7 +772,13 @@ impl MeshService {
                     Ok(_) = metadata.changed() => push_metadata(&listener, &metadata.borrow_and_update()),
                     res = complete.recv() => match res {
                         Ok(nonce) => listener.on_config_complete(nonce),
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            // A missed `config_complete` leaves the
+                            // Kotlin side waiting for an event that will
+                            // never arrive — surface it.
+                            tracing::warn!(skipped = n, "config_complete broadcast lagged");
+                            continue;
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                     else => break,

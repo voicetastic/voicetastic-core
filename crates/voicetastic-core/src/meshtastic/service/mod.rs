@@ -17,7 +17,7 @@ mod voice_tx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
@@ -103,7 +103,11 @@ struct Inner {
     config_complete_tx: broadcast::Sender<u32>,
     incoming_text_tx: broadcast::Sender<IncomingText>,
     incoming_data_tx: broadcast::Sender<IncomingData>,
-    next_packet_id: Mutex<u32>,
+    /// Monotonic packet id, seeded from the OS RNG so flood-routing
+    /// deduplication on the mesh doesn't clash with recently-seen packets.
+    /// `AtomicU32` rather than `Mutex<u32>` so [`outbound::next_id`] can
+    /// allocate ids without taking an async lock on the hot send path.
+    next_packet_id: AtomicU32,
     /// Producer end of the serialized voice TX queue. The worker is
     /// spawned in [`MeshtasticService::new`] and holds a `Weak<Inner>` so it
     /// shuts down when the last external [`MeshtasticService`] clone drops.
@@ -201,7 +205,7 @@ impl MeshtasticService {
             // Meshtastic firmware uses packet id for flood-routing
             // deduplication; tiny sequential ids would clash with
             // recently-seen packets, so seed from the OS RNG.
-            next_packet_id: Mutex::new(
+            next_packet_id: AtomicU32::new(
                 types::rand_u32()
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "OS RNG failed, using fallback packet id seed");

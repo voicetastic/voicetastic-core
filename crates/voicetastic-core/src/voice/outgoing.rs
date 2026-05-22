@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use parking_lot::Mutex;
 
 use super::builder::EncodedMessage;
@@ -79,7 +80,11 @@ pub const MAX_RETRANSMITS_PER_MESSAGE: u16 = 2_400;
 pub struct OutgoingVoice {
     /// Wire frames in the order produced by `build_message`. DATA shards
     /// occupy `[0..total_data]`, parity shards occupy `[total_data..]`.
-    pub frames: Vec<Vec<u8>>,
+    /// Stored as `Bytes` so [`OutgoingVoice::frames_for`] hands out
+    /// refcount-bump clones instead of memcpying every requested frame
+    /// while holding the registry lock — a NACK round can request 30+
+    /// chunks at ~250 B each.
+    pub frames: Vec<Bytes>,
     pub total_data: u8,
     pub parity_count: u8,
     pub channel: u32,
@@ -124,8 +129,10 @@ impl OutgoingVoice {
     /// Collect `(chunk_index, wire_frame)` pairs for chunks listed in
     /// `missing` that are *not* already in flight. Indices outside
     /// `[0..total_data]` and chunks already present in `pending_chunks`
-    /// are skipped.
-    pub fn frames_for(&self, missing: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    /// are skipped. Each `Bytes::clone` here is a refcount bump; the
+    /// actual byte buffer is shared with the registry until the caller
+    /// materialises it back into a `Vec<u8>` at the wire boundary.
+    pub fn frames_for(&self, missing: &[u8]) -> Vec<(u8, Bytes)> {
         let total = self.total_data as usize;
         missing
             .iter()
@@ -212,7 +219,11 @@ impl OutgoingVoiceRegistry {
         map.insert(
             message_id,
             OutgoingVoice {
-                frames: encoded.frames.clone(),
+                frames: encoded
+                    .frames
+                    .iter()
+                    .map(|f| Bytes::copy_from_slice(f))
+                    .collect(),
                 total_data: encoded.total_data,
                 parity_count: encoded.parity_count,
                 channel,
@@ -285,7 +296,7 @@ impl OutgoingVoiceRegistry {
         message_id: u32,
         missing: &[u8],
         pacing: Duration,
-    ) -> Result<Vec<(u8, Vec<u8>)>, RetransmitSkipReason> {
+    ) -> Result<Vec<(u8, Bytes)>, RetransmitSkipReason> {
         let ttl = self.retain_ttl();
         let mut map = self.inner.lock();
         let entry = map

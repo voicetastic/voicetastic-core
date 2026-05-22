@@ -58,6 +58,10 @@ mod imp {
         /// every complete denoised 10 ms frame to `dst` (same convention).
         /// Tail samples shorter than [`DENOISE_FRAME_SIZE`] stay buffered
         /// until the next call or [`flush`](Self::flush).
+        ///
+        /// `dst` is appended-to, never cleared: callers should reuse the
+        /// same buffer across calls (after consuming what they need) so
+        /// steady-state pushes don't reallocate.
         pub fn process(&mut self, src: &[f32], dst: &mut Vec<f32>) {
             // Scale into i16 range; RNNoise's model was trained on that.
             self.in_buf

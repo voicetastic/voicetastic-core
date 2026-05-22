@@ -1,5 +1,6 @@
 //! Outbound packet construction and `ToRadio` framing helpers.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use prost::Message as _;
@@ -37,7 +38,7 @@ impl MeshtasticService {
                 text.len()
             )));
         }
-        let id = self.next_id().await;
+        let id = self.next_id();
         let want_ack = to.is_some();
         let pkt = MeshPacket {
             from: 0,
@@ -74,7 +75,7 @@ impl MeshtasticService {
         want_ack: bool,
         want_response: bool,
     ) -> Result<u32> {
-        let id = self.next_id().await;
+        let id = self.next_id();
         let pkt = MeshPacket {
             from: 0,
             to: to.unwrap_or(BROADCAST_ADDR),
@@ -129,14 +130,18 @@ impl MeshtasticService {
         Ok(ids)
     }
 
-    async fn next_id(&self) -> u32 {
-        let mut g = self.inner.next_packet_id.lock().await;
-        let id = *g;
-        *g = g.wrapping_add(1);
-        if *g == 0 {
-            *g = 1;
+    fn next_id(&self) -> u32 {
+        // Atomically reserve the next id. `fetch_add` returns the
+        // previous value; if a wrap-around produced `0` we retry so the
+        // reserved value is `1` instead. Two concurrent callers landing
+        // on the wrap each retry independently and then take consecutive
+        // post-wrap ids, so no caller ever observes `0`.
+        loop {
+            let id = self.inner.next_packet_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
         }
-        id
     }
 
     /// Send an [`AdminMessage`] payload to the local node on
@@ -158,7 +163,7 @@ impl MeshtasticService {
         };
         let mut bytes = Vec::with_capacity(admin.encoded_len());
         admin.encode(&mut bytes)?;
-        let id = self.next_id().await;
+        let id = self.next_id();
         let pkt = MeshPacket {
             from: 0,
             to,

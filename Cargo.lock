@@ -4234,6 +4234,7 @@ version = "0.0.0-git"
 dependencies = [
  "async-trait",
  "btleplug",
+ "bytes",
  "chrono",
  "codec2",
  "futures",

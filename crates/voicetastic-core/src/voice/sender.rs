@@ -664,32 +664,38 @@ async fn nack_listener_task(
 async fn dispatch_retransmit_batch(
     svc: &MeshtasticService,
     registry: &OutgoingVoiceRegistry,
-    plan: Vec<(u8, Vec<u8>)>,
+    plan: Vec<(u8, bytes::Bytes)>,
     message_id: u32,
     channel: u32,
     to: Option<u32>,
     pacing: Duration,
 ) {
     let want_ack = to.is_some();
-    for batch_idx in 0..plan.len() {
-        let (idx, frame) = &plan[batch_idx];
+    // Pre-extract indices so the failure path can release `pending_chunks`
+    // for the un-sent tail after `plan` has been consumed by move.
+    let indices: Vec<u8> = plan.iter().map(|(i, _)| *i).collect();
+    for (batch_idx, (idx, frame)) in plan.into_iter().enumerate() {
+        // `enqueue_voice_frame_with_id` (and ultimately prost) needs an
+        // owned `Vec<u8>`. The deep copy was previously paid inside the
+        // registry lock by `frames_for`; moving it here keeps the lock
+        // hold time at O(N atomic increments) instead of O(N memcpy).
         let r = svc
-            .enqueue_voice_frame_with_id(frame.clone(), channel, to, want_ack, pacing)
+            .enqueue_voice_frame_with_id(frame.to_vec(), channel, to, want_ack, pacing)
             .await;
         if let Err(e) = r {
             warn!(message_id, idx, ?e, "voice retransmit enqueue failed");
             // Mark the failed chunk as sent so it can be retried on the next NACK.
             // Without this, failed chunks stay stuck in `pending_chunks` forever.
-            registry.mark_chunk_sent(message_id, *idx);
+            registry.mark_chunk_sent(message_id, idx);
             // Also clear pending for the un-sent tail of this batch so
             // a subsequent NACK round can retry them.
-            for (idx, _) in &plan[(batch_idx + 1)..] {
-                registry.mark_chunk_sent(message_id, *idx);
+            for tail_idx in &indices[(batch_idx + 1)..] {
+                registry.mark_chunk_sent(message_id, *tail_idx);
             }
-            break;
+            return;
         }
         // P0: Only mark sent after successful enqueue (was bug: marked before check)
-        registry.mark_chunk_sent(message_id, *idx);
+        registry.mark_chunk_sent(message_id, idx);
     }
 }
 

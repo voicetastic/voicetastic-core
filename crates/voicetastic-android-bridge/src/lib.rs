@@ -521,7 +521,13 @@ impl OutgoingVoiceRegistry {
             .take_retransmit(message_id, &missing, Duration::from_millis(pacing_ms))
             .unwrap_or_default()
             .into_iter()
-            .map(|(chunk_index, frame)| RetransmitChunk { chunk_index, frame })
+            .map(|(chunk_index, frame)| RetransmitChunk {
+                chunk_index,
+                // UniFFI doesn't carry `bytes::Bytes` across the FFI
+                // boundary; materialise to an owned `Vec<u8>` here, at
+                // the wire boundary, instead of inside the registry.
+                frame: frame.to_vec(),
+            })
             .collect()
     }
 
@@ -733,7 +739,18 @@ impl VoiceSender {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Missing a terminal status would leave the
+                        // Kotlin listener parked forever; warn so the
+                        // Android side can correlate stuck rows with
+                        // backed-up status broadcasts.
+                        tracing::warn!(
+                            message_id,
+                            skipped = n,
+                            "voice send-status broadcast lagged"
+                        );
+                        continue;
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
