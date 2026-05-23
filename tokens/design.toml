@@ -12,6 +12,14 @@
 # desktop trades some contrast for chromatic spread (warm terracotta
 # primary, warm brown secondary, olive tertiary in light mode).
 #
+# A second pair — `[color.light_hc]` / `[color.dark_hc]` — holds the
+# `TonalSpot` palette regenerated at `contrast_level = 1.0`. This
+# mirrors the HighContrast scheme that the firmware-side
+# `meshtastic-device-ui` ships in `source/graphics/TFT/Themes.cpp`, so
+# desktop can opt into the same near-black-on-near-white look (and
+# its dark inverse) for parity tests, small-display previews, or as
+# an accessibility theme. Select via `voicetastic_tokens::Contrast`.
+#
 # Regenerate with:
 #   cargo run --example generate_palette -p voicetastic-tokens
 #
@@ -112,6 +120,103 @@ surface_container_highest = "#3D322F"
 # Outlines
 outline                   = "#A08D87"
 outline_variant           = "#53433F"
+scrim                     = "#000000"
+
+# HighContrast variants (`contrast_level = 1.0`). Same seed, same
+# `TonalSpot` hue ring; surfaces are pushed to the extremes and every
+# `on_*` role lands at pure black or pure white. Use for the
+# meshtastic-device-ui parity theme or as an accessibility mode.
+
+[color.light_hc]
+# Primary (deep terracotta — pushed toward black for contrast)
+primary                   = "#501B08"
+on_primary                = "#FFFFFF"
+primary_container         = "#753722"
+on_primary_container      = "#FFFFFF"
+inverse_primary           = "#FFB59D"
+# Secondary (deep warm brown)
+secondary                 = "#3F261D"
+on_secondary              = "#FFFFFF"
+secondary_container       = "#604239"
+on_secondary_container    = "#FFFFFF"
+# Tertiary (deep olive)
+tertiary                  = "#352B02"
+on_tertiary               = "#FFFFFF"
+tertiary_container        = "#54491C"
+on_tertiary_container     = "#FFFFFF"
+# Error
+error                     = "#600004"
+on_error                  = "#FFFFFF"
+error_container           = "#98000A"
+on_error_container        = "#FFFFFF"
+# Background & surface
+background                = "#FFF8F6"
+on_background             = "#231917"
+surface                   = "#FFF8F6"
+on_surface                = "#000000"
+surface_variant           = "#F5DED7"
+on_surface_variant        = "#000000"
+surface_tint              = "#8F4C35"
+# Inverse surface
+inverse_surface           = "#392E2B"
+inverse_on_surface        = "#FFFFFF"
+# Surface tonal tiers (lowest → highest)
+surface_dim               = "#C6B5B1"
+surface_bright            = "#FFF8F6"
+surface_container_lowest  = "#FFFFFF"
+surface_container_low     = "#FFEDE8"
+surface_container         = "#F1DFDA"
+surface_container_high    = "#E2D1CC"
+surface_container_highest = "#D4C3BE"
+# Outlines (heavier so dividers register on small TFTs)
+outline                   = "#362925"
+outline_variant           = "#554641"
+scrim                     = "#000000"
+
+[color.dark_hc]
+# Primary (near-white peach for max contrast on dark)
+primary                   = "#FFECE7"
+on_primary                = "#000000"
+primary_container         = "#FFAF95"
+on_primary_container      = "#000000"
+inverse_primary           = "#733621"
+# Secondary
+secondary                 = "#FFECE7"
+on_secondary              = "#000000"
+secondary_container       = "#E3BAAD"
+on_secondary_container    = "#000000"
+# Tertiary
+tertiary                  = "#FFEFBF"
+on_tertiary               = "#000000"
+tertiary_container        = "#D3C28A"
+on_tertiary_container     = "#000000"
+# Error
+error                     = "#FFECE9"
+on_error                  = "#000000"
+error_container           = "#FFAEA4"
+on_error_container        = "#000000"
+# Background & surface
+background                = "#1A110F"
+on_background             = "#F1DFDA"
+surface                   = "#1A110F"
+on_surface                = "#FFFFFF"
+surface_variant           = "#53433F"
+on_surface_variant        = "#FFFFFF"
+surface_tint              = "#FFB59D"
+# Inverse surface
+inverse_surface           = "#F1DFDA"
+inverse_on_surface        = "#000000"
+# Surface tonal tiers (lowest → highest)
+surface_dim               = "#1A110F"
+surface_bright            = "#5A4D4A"
+surface_container_lowest  = "#000000"
+surface_container_low     = "#271D1B"
+surface_container         = "#392E2B"
+surface_container_high    = "#443936"
+surface_container_highest = "#504441"
+# Outlines (high-tint so they read against dark surfaces)
+outline                   = "#FFECE7"
+outline_variant           = "#D4BEB8"
 scrim                     = "#000000"
 
 # "Fixed" colors are mode-independent: same hex in light and dark.

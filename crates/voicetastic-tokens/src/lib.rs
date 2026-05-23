@@ -36,7 +36,9 @@ use serde::Deserialize;
 pub mod egui_emitter;
 
 #[cfg(feature = "egui")]
-pub use egui_emitter::{egui_style, egui_visuals};
+pub use egui_emitter::{
+    egui_style, egui_style_with_contrast, egui_visuals, egui_visuals_with_contrast,
+};
 
 /// Verbatim TOML source. Embedded so consumers don't need filesystem
 /// access at runtime.
@@ -56,6 +58,13 @@ pub struct Tokens {
 pub struct ColorSchemes {
     pub light: ColorScheme,
     pub dark: ColorScheme,
+    /// HighContrast variant of `light` (same seed, `contrast_level = 1.0`).
+    /// Mirrors the palette shipped by `meshtastic-device-ui` so the desktop
+    /// can render the firmware look (or an a11y theme) without forking the
+    /// brand. Selected via [`Contrast::High`].
+    pub light_hc: ColorScheme,
+    /// HighContrast variant of `dark` — see [`Self::light_hc`].
+    pub dark_hc: ColorScheme,
     pub fixed: FixedColors,
 }
 
@@ -296,11 +305,32 @@ pub enum ColorMode {
     Dark,
 }
 
+/// Which contrast tier of the palette to draw from. `Standard` is the
+/// default desktop look (warm peach surfaces, moderate text contrast);
+/// `High` mirrors the meshtastic-device-ui firmware theme — same seed,
+/// surfaces pushed to the extremes, `on_*` roles at pure black/white.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Contrast {
+    #[default]
+    Standard,
+    High,
+}
+
 /// Convenience: pick the right [`ColorScheme`] given a [`ColorMode`].
+/// Returns the `Standard`-contrast palette; for the HighContrast
+/// variant call [`scheme_with_contrast`].
 pub fn scheme(mode: ColorMode) -> &'static ColorScheme {
-    match mode {
-        ColorMode::Light => &tokens().color.light,
-        ColorMode::Dark => &tokens().color.dark,
+    scheme_with_contrast(mode, Contrast::Standard)
+}
+
+/// Pick the [`ColorScheme`] for a given mode at a given contrast tier.
+pub fn scheme_with_contrast(mode: ColorMode, contrast: Contrast) -> &'static ColorScheme {
+    let c = &tokens().color;
+    match (mode, contrast) {
+        (ColorMode::Light, Contrast::Standard) => &c.light,
+        (ColorMode::Dark, Contrast::Standard) => &c.dark,
+        (ColorMode::Light, Contrast::High) => &c.light_hc,
+        (ColorMode::Dark, Contrast::High) => &c.dark_hc,
     }
 }
 
@@ -399,9 +429,41 @@ mod tests {
                 b: 0xD0
             }
         );
+        // HighContrast variant mirrors the meshtastic-device-ui firmware
+        // theme: light surface stays warm but `on_surface` clamps to pure
+        // black, and the inverse holds in dark mode. Spot one of each so
+        // a regen of `design.toml` can't silently drop the HC blocks.
+        assert_eq!(t.color.light_hc.surface, t.color.light.surface);
+        assert_eq!(
+            t.color.light_hc.on_surface,
+            Rgb {
+                r: 0x00,
+                g: 0x00,
+                b: 0x00
+            }
+        );
+        assert_eq!(
+            t.color.dark_hc.on_surface,
+            Rgb {
+                r: 0xFF,
+                g: 0xFF,
+                b: 0xFF
+            }
+        );
         assert_eq!(t.spacing.md, 12);
         assert_eq!(t.shape.large, 16);
         assert!(t.elevation.contains_key("level3"));
+    }
+
+    #[test]
+    fn scheme_with_contrast_selects_table() {
+        let std_light = scheme_with_contrast(ColorMode::Light, Contrast::Standard);
+        let hc_light = scheme_with_contrast(ColorMode::Light, Contrast::High);
+        // The standard light primary is the seed-derived terracotta;
+        // the HC variant pushes it darker toward black.
+        assert_ne!(std_light.primary, hc_light.primary);
+        // `scheme(mode)` is sugar for the Standard tier.
+        assert_eq!(std_light as *const _, scheme(ColorMode::Light) as *const _);
     }
 
     #[test]

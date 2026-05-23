@@ -20,12 +20,14 @@ use crate::voice::VoiceCodec;
 use super::data::{
     AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
     DEFAULT_OPUS_BANDWIDTH, DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
-    DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED, DEFAULT_VOICE_FEC_MODE,
-    DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE, OPUS_BANDWIDTH_NARROW, OPUS_BANDWIDTH_WIDE,
-    OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN, REASSEMBLY_TIMEOUT_LOWER_SECS,
-    REASSEMBLY_TIMEOUT_UPPER_SECS, VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS,
-    VOICE_FEC_MODE_AUTO, VOICE_FEC_MODE_HEAVY, VOICE_FEC_MODE_LIGHT, VOICE_FEC_MODE_MEDIUM,
-    VOICE_FEC_MODE_OFF, VOICE_MAX_SECS_UPPER, VOICE_NACK_MODE_AGGRESSIVE, VOICE_NACK_MODE_AUTO,
+    DEFAULT_THEME_CONTRAST, DEFAULT_THEME_MODE, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED,
+    DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE, OPUS_BANDWIDTH_NARROW,
+    OPUS_BANDWIDTH_WIDE, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN,
+    REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, THEME_CONTRAST_HIGH,
+    THEME_CONTRAST_STANDARD, THEME_MODE_DARK, THEME_MODE_LIGHT, THEME_MODE_SYSTEM,
+    VOICE_CODEC_AMRNB, VOICE_CODEC_CODEC2, VOICE_CODEC_OPUS, VOICE_FEC_MODE_AUTO,
+    VOICE_FEC_MODE_HEAVY, VOICE_FEC_MODE_LIGHT, VOICE_FEC_MODE_MEDIUM, VOICE_FEC_MODE_OFF,
+    VOICE_MAX_SECS_UPPER, VOICE_NACK_MODE_AGGRESSIVE, VOICE_NACK_MODE_AUTO,
     VOICE_NACK_MODE_CONSERVATIVE, VOICE_NACK_MODE_OFF, config_path,
 };
 
@@ -71,6 +73,10 @@ pub enum SettingKey {
     VoiceFecMode,
     /// Receive-side NACK aggressiveness policy.
     VoiceNackMode,
+    /// Desktop theme mode (`system`/`light`/`dark`).
+    ThemeMode,
+    /// Desktop theme contrast tier (`standard`/`high`).
+    ThemeContrast,
 }
 
 impl SettingKey {
@@ -88,6 +94,8 @@ impl SettingKey {
             Self::VoiceDenoiseEnabled => "voice.denoise_enabled",
             Self::VoiceFecMode => "voice.fec_mode",
             Self::VoiceNackMode => "voice.nack_mode",
+            Self::ThemeMode => "theme.mode",
+            Self::ThemeContrast => "theme.contrast",
         }
     }
 
@@ -104,6 +112,8 @@ impl SettingKey {
             "voice.denoise_enabled" => Self::VoiceDenoiseEnabled,
             "voice.fec_mode" => Self::VoiceFecMode,
             "voice.nack_mode" => Self::VoiceNackMode,
+            "theme.mode" => Self::ThemeMode,
+            "theme.contrast" => Self::ThemeContrast,
             _ => return None,
         })
     }
@@ -121,6 +131,8 @@ impl SettingKey {
             SettingKey::VoiceDenoiseEnabled,
             SettingKey::VoiceFecMode,
             SettingKey::VoiceNackMode,
+            SettingKey::ThemeMode,
+            SettingKey::ThemeContrast,
         ]
     }
 }
@@ -491,6 +503,83 @@ pub fn voice_nack_mode_from_id(s: &str) -> Option<VoiceNackMode> {
     VoiceNackMode::from_id(s)
 }
 
+// ---------------------------------------------------------------------------
+// Theme mode + contrast (desktop GUI only — Android has its own theme path)
+// ---------------------------------------------------------------------------
+
+/// Typed mirror of the `theme.mode` string id. Drives egui's
+/// [`ThemePreference`] on the desktop GUI; the bridge layer ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeModeKind {
+    /// Follow the host (OS / desktop environment) preference.
+    System,
+    /// Force light scheme regardless of host preference.
+    Light,
+    /// Force dark scheme regardless of host preference.
+    Dark,
+}
+
+impl ThemeModeKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::System => THEME_MODE_SYSTEM,
+            Self::Light => THEME_MODE_LIGHT,
+            Self::Dark => THEME_MODE_DARK,
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Some(match s {
+            THEME_MODE_SYSTEM => Self::System,
+            THEME_MODE_LIGHT => Self::Light,
+            THEME_MODE_DARK => Self::Dark,
+            _ => return None,
+        })
+    }
+}
+
+pub fn theme_mode_kind_to_id(k: ThemeModeKind) -> &'static str {
+    k.id()
+}
+
+pub fn theme_mode_kind_from_id(s: &str) -> Option<ThemeModeKind> {
+    ThemeModeKind::from_id(s)
+}
+
+/// Typed mirror of the `theme.contrast` string id. `Standard` uses the
+/// M3 TonalSpot palette; `High` opts into the HighContrast variant that
+/// mirrors the firmware `meshtastic-device-ui` theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeContrastKind {
+    Standard,
+    High,
+}
+
+impl ThemeContrastKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Standard => THEME_CONTRAST_STANDARD,
+            Self::High => THEME_CONTRAST_HIGH,
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        Some(match s {
+            THEME_CONTRAST_STANDARD => Self::Standard,
+            THEME_CONTRAST_HIGH => Self::High,
+            _ => return None,
+        })
+    }
+}
+
+pub fn theme_contrast_kind_to_id(k: ThemeContrastKind) -> &'static str {
+    k.id()
+}
+
+pub fn theme_contrast_kind_from_id(s: &str) -> Option<ThemeContrastKind> {
+    ThemeContrastKind::from_id(s)
+}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -721,6 +810,15 @@ impl SettingsApi {
         VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or(VoiceNackMode::Auto)
     }
 
+    pub fn theme_mode(&self) -> ThemeModeKind {
+        ThemeModeKind::from_id(self.inner.read().theme_mode()).unwrap_or(ThemeModeKind::Dark)
+    }
+
+    pub fn theme_contrast(&self) -> ThemeContrastKind {
+        ThemeContrastKind::from_id(self.inner.read().theme_contrast())
+            .unwrap_or(ThemeContrastKind::Standard)
+    }
+
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `VoiceCodecParam` the voice protocol layer wants.
     pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
@@ -839,6 +937,16 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceNackMode)
     }
 
+    pub fn set_theme_mode(&self, mode: ThemeModeKind) -> SettingsResult<()> {
+        self.inner.write().theme_mode = Some(mode.id().to_string());
+        self.persist_and_notify(SettingKey::ThemeMode)
+    }
+
+    pub fn set_theme_contrast(&self, contrast: ThemeContrastKind) -> SettingsResult<()> {
+        self.inner.write().theme_contrast = Some(contrast.id().to_string());
+        self.persist_and_notify(SettingKey::ThemeContrast)
+    }
+
     /// Clear a single field's override (revert to its default).
     pub fn reset(&self, key: SettingKey) -> SettingsResult<()> {
         {
@@ -855,6 +963,8 @@ impl SettingsApi {
                 SettingKey::VoiceDenoiseEnabled => g.voice_denoise_enabled = None,
                 SettingKey::VoiceFecMode => g.voice_fec_mode = None,
                 SettingKey::VoiceNackMode => g.voice_nack_mode = None,
+                SettingKey::ThemeMode => g.theme_mode = None,
+                SettingKey::ThemeContrast => g.theme_contrast = None,
             }
         }
         self.persist_and_notify(key)
@@ -889,6 +999,8 @@ impl SettingsApi {
             SettingKey::VoiceDenoiseEnabled => self.voice_denoise_enabled().to_string(),
             SettingKey::VoiceFecMode => self.voice_fec_mode().id().to_string(),
             SettingKey::VoiceNackMode => self.voice_nack_mode().id().to_string(),
+            SettingKey::ThemeMode => self.theme_mode().id().to_string(),
+            SettingKey::ThemeContrast => self.theme_contrast().id().to_string(),
         }
     }
 
@@ -987,6 +1099,27 @@ impl SettingsApi {
                     ),
                 })?;
                 self.set_voice_nack_mode(mode)
+            }
+            SettingKey::ThemeMode => {
+                let mode = ThemeModeKind::from_id(value).ok_or_else(|| SettingsError::Invalid {
+                    key: key.id(),
+                    value: value.to_string(),
+                    reason: format!(
+                        "expected one of {THEME_MODE_SYSTEM}, {THEME_MODE_LIGHT}, {THEME_MODE_DARK}"
+                    ),
+                })?;
+                self.set_theme_mode(mode)
+            }
+            SettingKey::ThemeContrast => {
+                let contrast =
+                    ThemeContrastKind::from_id(value).ok_or_else(|| SettingsError::Invalid {
+                        key: key.id(),
+                        value: value.to_string(),
+                        reason: format!(
+                            "expected one of {THEME_CONTRAST_STANDARD}, {THEME_CONTRAST_HIGH}"
+                        ),
+                    })?;
+                self.set_theme_contrast(contrast)
             }
         }
     }
@@ -1101,6 +1234,22 @@ impl SettingsApi {
                     ],
                 },
                 DEFAULT_VOICE_NACK_MODE.to_string(),
+            ),
+            SettingKey::ThemeMode => (
+                "Desktop theme mode",
+                "`system` follows the host OS preference; `light` / `dark` pin the scheme. Applies immediately on the desktop GUI.",
+                SettingKind::Enum {
+                    variants: vec![THEME_MODE_SYSTEM, THEME_MODE_LIGHT, THEME_MODE_DARK],
+                },
+                DEFAULT_THEME_MODE.to_string(),
+            ),
+            SettingKey::ThemeContrast => (
+                "Desktop theme contrast",
+                "`standard` uses the M3 TonalSpot palette; `high` mirrors the meshtastic-device-ui firmware look (near-black on near-white, and its inverse) as an a11y option.",
+                SettingKind::Enum {
+                    variants: vec![THEME_CONTRAST_STANDARD, THEME_CONTRAST_HIGH],
+                },
+                DEFAULT_THEME_CONTRAST.to_string(),
             ),
         };
         SettingDescriptor {
@@ -1232,5 +1381,39 @@ mod tests {
         api.set_voice_max_secs(20).unwrap();
         api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
         assert_eq!(c.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn theme_settings_round_trip() {
+        let api = SettingsApi::in_memory();
+        // Defaults: Dark / Standard (matches the historical startup pin).
+        assert_eq!(api.theme_mode(), ThemeModeKind::Dark);
+        assert_eq!(api.theme_contrast(), ThemeContrastKind::Standard);
+
+        api.set_theme_mode(ThemeModeKind::Light).unwrap();
+        api.set_theme_contrast(ThemeContrastKind::High).unwrap();
+        assert_eq!(api.theme_mode(), ThemeModeKind::Light);
+        assert_eq!(api.theme_contrast(), ThemeContrastKind::High);
+
+        // Stringified access (CLI / bridge surface).
+        assert_eq!(api.get_str(SettingKey::ThemeMode), THEME_MODE_LIGHT);
+        assert_eq!(api.get_str(SettingKey::ThemeContrast), THEME_CONTRAST_HIGH);
+
+        // Reset clears the override; effective value returns to the default.
+        api.reset(SettingKey::ThemeMode).unwrap();
+        assert_eq!(api.theme_mode(), ThemeModeKind::Dark);
+    }
+
+    #[test]
+    fn theme_set_str_rejects_garbage() {
+        let api = SettingsApi::in_memory();
+        let err = api
+            .set_str(SettingKey::ThemeMode, "neon")
+            .expect_err("garbage theme mode must be rejected");
+        assert!(matches!(err, SettingsError::Invalid { .. }));
+        let err = api
+            .set_str(SettingKey::ThemeContrast, "extra-high")
+            .expect_err("garbage contrast must be rejected");
+        assert!(matches!(err, SettingsError::Invalid { .. }));
     }
 }

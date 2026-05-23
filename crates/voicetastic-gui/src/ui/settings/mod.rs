@@ -9,6 +9,7 @@
 //! Each editable settings section lives in its own submodule so this entry
 //! point stays small and the sections can evolve independently.
 
+mod appearance;
 mod bluetooth;
 mod channels;
 mod connection;
@@ -57,6 +58,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
     egui::ScrollArea::vertical().show(ui, |ui| {
         // Client-side preferences first — these don't need a device
         // connection and have no dirty-tracking complications.
+        appearance::section(ui, app);
         voice::section(ui, app);
         ui.add_space(4.0);
 

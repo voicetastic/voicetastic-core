@@ -7,8 +7,11 @@ use tracing::error;
 
 use voicetastic_core::MeshtasticService;
 use voicetastic_core::meshtastic::service::ConnectionState;
-use voicetastic_core::settings::{SettingKey, SettingsApi, SettingsListener};
+use voicetastic_core::settings::{
+    SettingKey, SettingsApi, SettingsListener, ThemeContrastKind, ThemeModeKind,
+};
 use voicetastic_core::voice::{AssemblerConfig, VoiceAssembler, VoiceSender};
+use voicetastic_tokens::{ColorMode, Contrast};
 
 use crate::state::{SharedState, Tab};
 use crate::ui;
@@ -72,23 +75,22 @@ impl VoicetasticApp {
         // [`egui::Style`] (visuals + spacing + type scale) so colours,
         // padding rhythm, and the M3 type ramp all switch together.
         //
-        // Both theme slots get populated so egui's system-theme follow
-        // mode renders our palette regardless of which side it lands
-        // on; we then pin the preference to Dark explicitly so the
-        // initial frame is deterministic. Switching to Light/System
-        // at runtime is a one-liner once a user preference exists.
-        cc.egui_ctx.set_style_of(
-            egui::Theme::Light,
-            voicetastic_tokens::egui_style(voicetastic_tokens::ColorMode::Light),
-        );
-        cc.egui_ctx.set_style_of(
-            egui::Theme::Dark,
-            voicetastic_tokens::egui_style(voicetastic_tokens::ColorMode::Dark),
-        );
-        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+        // The mode (light/dark/system) and contrast tier (standard/high)
+        // both come from `SettingsApi`; default is Dark + Standard which
+        // matches the historical hard-coded startup pin. Changes via the
+        // Appearance settings panel route back through `ThemeListener`
+        // which re-runs `apply_theme` on the egui context.
+        let settings = SettingsApi::open();
+        apply_theme(&cc.egui_ctx, &settings);
+        // Subscribe a listener so any later change (this UI, CLI, or
+        // another front-end sharing the config file) re-applies the
+        // egui styles + theme preference and requests a repaint.
+        settings.subscribe(Arc::new(ThemeListener {
+            ctx: cc.egui_ctx.clone(),
+            settings: Arc::clone(&settings),
+        }));
 
         let shared = Arc::new(Mutex::new(SharedState::default()));
-        let settings = SettingsApi::open();
         // NB: the `..AssemblerConfig::default()` spread is safe here because
         // this is the single writer of the config at construction time. Do
         // NOT copy this pattern into `apply_voice_settings` / `apply_lora_*`
@@ -157,6 +159,58 @@ impl VoicetasticApp {
     /// suitable for [`Recorder::start`] and the voice protocol header.
     pub fn outgoing_voice_codec(&self) -> voicetastic_core::settings::VoiceCodecParam {
         self.settings.voice_codec_for_protocol()
+    }
+}
+
+/// Install the current theme on the egui context: both [`egui::Style`]
+/// slots (Light & Dark) get the token-driven style at the selected
+/// contrast tier, and [`egui::ThemePreference`] is pinned according to
+/// the user's mode (`system` defers to the host).
+///
+/// Cheap enough to call on every theme change (~one BTreeMap allocation
+/// per slot — egui caches the style internally).
+fn apply_theme(ctx: &egui::Context, settings: &SettingsApi) {
+    let contrast = match settings.theme_contrast() {
+        ThemeContrastKind::Standard => Contrast::Standard,
+        ThemeContrastKind::High => Contrast::High,
+    };
+    // Populate both slots regardless of mode so an OS that flips
+    // light/dark mid-session (System mode) is already styled correctly
+    // on the next frame.
+    ctx.set_style_of(
+        egui::Theme::Light,
+        voicetastic_tokens::egui_style_with_contrast(ColorMode::Light, contrast),
+    );
+    ctx.set_style_of(
+        egui::Theme::Dark,
+        voicetastic_tokens::egui_style_with_contrast(ColorMode::Dark, contrast),
+    );
+    let pref = match settings.theme_mode() {
+        ThemeModeKind::System => egui::ThemePreference::System,
+        ThemeModeKind::Light => egui::ThemePreference::Light,
+        ThemeModeKind::Dark => egui::ThemePreference::Dark,
+    };
+    ctx.set_theme(pref);
+}
+
+/// Bridges theme-related [`SettingsApi`] events to the egui context.
+/// Stays in `app.rs` rather than `watchers.rs` because it never touches
+/// the voice runtime — only the UI presentation.
+struct ThemeListener {
+    ctx: egui::Context,
+    settings: Arc<SettingsApi>,
+}
+
+impl SettingsListener for ThemeListener {
+    fn on_change(&self, key: SettingKey) {
+        // Filter early — listeners get every key, but only two of them
+        // affect rendering. Re-applying styles is cheap, but issuing a
+        // repaint for every voice-codec tweak would be wasteful.
+        if !matches!(key, SettingKey::ThemeMode | SettingKey::ThemeContrast) {
+            return;
+        }
+        apply_theme(&self.ctx, &self.settings);
+        self.ctx.request_repaint();
     }
 }
 

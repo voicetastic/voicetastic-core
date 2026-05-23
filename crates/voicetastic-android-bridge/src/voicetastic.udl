@@ -425,6 +425,8 @@ enum SettingKey {
     "VoiceDenoiseEnabled",
     "VoiceFecMode",
     "VoiceNackMode",
+    "ThemeMode",
+    "ThemeContrast",
 };
 
 /// Typed mirror of the `voice.codec` value.

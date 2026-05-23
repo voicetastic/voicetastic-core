@@ -116,6 +116,29 @@ pub const VOICE_NACK_MODE_AGGRESSIVE: &str = "aggressive";
 /// Default NACK mode: pick window/backoff by modem preset.
 pub const DEFAULT_VOICE_NACK_MODE: &str = VOICE_NACK_MODE_AUTO;
 
+/// Theme-mode identifiers persisted in [`AppSettings::theme_mode`]. The
+/// `system` value defers to whatever the host (OS / desktop environment)
+/// reports through egui's system-theme follow path; `light` / `dark`
+/// pin the preference unconditionally.
+pub const THEME_MODE_SYSTEM: &str = "system";
+pub const THEME_MODE_LIGHT: &str = "light";
+pub const THEME_MODE_DARK: &str = "dark";
+/// Default theme mode. Dark matches the historical hard-coded
+/// `ThemePreference::Dark` startup pin so an upgrade does not flip the
+/// look on existing users.
+pub const DEFAULT_THEME_MODE: &str = THEME_MODE_DARK;
+
+/// Theme-contrast identifiers persisted in [`AppSettings::theme_contrast`].
+/// `standard` uses the M3 TonalSpot palette (warm peach surfaces);
+/// `high` opts into the HighContrast variant that mirrors the firmware
+/// `meshtastic-device-ui` theme — near-black on near-white in light mode
+/// and the inverse in dark mode. Useful as an a11y theme.
+pub const THEME_CONTRAST_STANDARD: &str = "standard";
+pub const THEME_CONTRAST_HIGH: &str = "high";
+/// Default contrast tier (Standard). HighContrast is opt-in via the
+/// Appearance settings panel.
+pub const DEFAULT_THEME_CONTRAST: &str = THEME_CONTRAST_STANDARD;
+
 /// Persistent app preferences.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppSettings {
@@ -191,6 +214,22 @@ pub struct AppSettings {
     /// useful (multiple receivers, no clear retransmit target).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_nack_mode: Option<String>,
+
+    /// Desktop GUI theme mode. One of [`THEME_MODE_SYSTEM`],
+    /// [`THEME_MODE_LIGHT`], [`THEME_MODE_DARK`]. `None` falls back to
+    /// [`DEFAULT_THEME_MODE`]. Read by the GUI on startup and on each
+    /// `SettingKey::ThemeMode` listener event to drive egui's
+    /// `ThemePreference`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_mode: Option<String>,
+
+    /// Desktop GUI theme contrast tier. One of
+    /// [`THEME_CONTRAST_STANDARD`], [`THEME_CONTRAST_HIGH`]. `None`
+    /// falls back to [`DEFAULT_THEME_CONTRAST`]. Selects between the
+    /// TonalSpot palette and the HighContrast variant that mirrors the
+    /// `meshtastic-device-ui` firmware theme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme_contrast: Option<String>,
 }
 
 impl AppSettings {
@@ -281,6 +320,27 @@ impl AppSettings {
             Some(VOICE_NACK_MODE_CONSERVATIVE) => VOICE_NACK_MODE_CONSERVATIVE,
             Some(VOICE_NACK_MODE_AGGRESSIVE) => VOICE_NACK_MODE_AGGRESSIVE,
             _ => DEFAULT_VOICE_NACK_MODE,
+        }
+    }
+
+    /// Effective theme mode id (validated). Unknown values fall back to
+    /// [`DEFAULT_THEME_MODE`].
+    pub fn theme_mode(&self) -> &'static str {
+        match self.theme_mode.as_deref() {
+            Some(THEME_MODE_SYSTEM) => THEME_MODE_SYSTEM,
+            Some(THEME_MODE_LIGHT) => THEME_MODE_LIGHT,
+            Some(THEME_MODE_DARK) => THEME_MODE_DARK,
+            _ => DEFAULT_THEME_MODE,
+        }
+    }
+
+    /// Effective theme contrast id (validated). Unknown values fall back
+    /// to [`DEFAULT_THEME_CONTRAST`].
+    pub fn theme_contrast(&self) -> &'static str {
+        match self.theme_contrast.as_deref() {
+            Some(THEME_CONTRAST_STANDARD) => THEME_CONTRAST_STANDARD,
+            Some(THEME_CONTRAST_HIGH) => THEME_CONTRAST_HIGH,
+            _ => DEFAULT_THEME_CONTRAST,
         }
     }
 

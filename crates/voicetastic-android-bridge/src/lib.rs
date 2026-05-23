@@ -808,6 +808,8 @@ pub enum SettingKey {
     VoiceDenoiseEnabled,
     VoiceFecMode,
     VoiceNackMode,
+    ThemeMode,
+    ThemeContrast,
 }
 
 impl From<SettingKey> for s::SettingKey {
@@ -824,6 +826,8 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
             SettingKey::VoiceFecMode => Self::VoiceFecMode,
             SettingKey::VoiceNackMode => Self::VoiceNackMode,
+            SettingKey::ThemeMode => Self::ThemeMode,
+            SettingKey::ThemeContrast => Self::ThemeContrast,
         }
     }
 }
@@ -842,6 +846,8 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
             s::SettingKey::VoiceFecMode => Self::VoiceFecMode,
             s::SettingKey::VoiceNackMode => Self::VoiceNackMode,
+            s::SettingKey::ThemeMode => Self::ThemeMode,
+            s::SettingKey::ThemeContrast => Self::ThemeContrast,
         }
     }
 }

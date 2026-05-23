@@ -44,16 +44,22 @@ use egui::{
 };
 
 use super::{
-    ColorMode, ColorScheme, Rgb, Shape, Spacing as TokenSpacing, TypeStyle, scheme,
-    surface_at_elevation, tokens,
+    ColorMode, ColorScheme, Contrast, Rgb, Shape, Spacing as TokenSpacing, TypeStyle,
+    scheme_with_contrast, surface_at_elevation, tokens,
 };
 
 /// Build a full [`egui::Style`] (visuals + spacing + text styles)
-/// for the requested [`ColorMode`]. Apply with
+/// for the requested [`ColorMode`] at standard contrast. Apply with
 /// [`egui::Context::set_style_of`].
 pub fn egui_style(mode: ColorMode) -> Style {
+    egui_style_with_contrast(mode, Contrast::Standard)
+}
+
+/// As [`egui_style`] but selectable contrast tier. Use [`Contrast::High`]
+/// to render the meshtastic-device-ui parity palette.
+pub fn egui_style_with_contrast(mode: ColorMode, contrast: Contrast) -> Style {
     let mut style = Style {
-        visuals: egui_visuals(mode),
+        visuals: egui_visuals_with_contrast(mode, contrast),
         spacing: spacing_from_tokens(tokens().spacing),
         ..Style::default()
     };
@@ -65,7 +71,12 @@ pub fn egui_style(mode: ColorMode) -> Style {
 /// callers that want to keep egui's default spacing / typography but
 /// swap colours. Most code should prefer [`egui_style`].
 pub fn egui_visuals(mode: ColorMode) -> Visuals {
-    let s = scheme(mode);
+    egui_visuals_with_contrast(mode, Contrast::Standard)
+}
+
+/// As [`egui_visuals`] but selectable contrast tier.
+pub fn egui_visuals_with_contrast(mode: ColorMode, contrast: Contrast) -> Visuals {
+    let s = scheme_with_contrast(mode, contrast);
     let dark = matches!(mode, ColorMode::Dark);
     let shape = tokens().shape;
 
@@ -251,7 +262,7 @@ mod tests {
 
     #[test]
     fn window_fill_uses_elevated_tier() {
-        let s = scheme(ColorMode::Light);
+        let s = crate::scheme(ColorMode::Light);
         let v = egui_visuals(ColorMode::Light);
         assert_ne!(v.window_fill, rgb(s.surface));
         assert_eq!(v.window_fill, rgb(surface_at_elevation(s, 2)));
@@ -259,13 +270,23 @@ mod tests {
 
     #[test]
     fn state_layer_is_monotonic() {
-        let s = scheme(ColorMode::Dark);
+        let s = crate::scheme(ColorMode::Dark);
         let base = s.surface_container_high;
         let l8 = state_layer(base, s.on_surface, 0.08);
         let l12 = state_layer(base, s.on_surface, 0.12);
         // Pressing should tint further than hovering.
         assert_ne!(l8, base);
         assert_ne!(l12, l8);
+    }
+
+    #[test]
+    fn hc_variant_builds_and_diverges_from_standard() {
+        let v_std = egui_visuals_with_contrast(ColorMode::Light, Contrast::Standard);
+        let v_hc = egui_visuals_with_contrast(ColorMode::Light, Contrast::High);
+        // HC's on_surface is pure black; standard light is warm dark brown.
+        // Either way the visuals must be distinguishable.
+        assert_ne!(v_std.override_text_color, v_hc.override_text_color);
+        let _ = egui_style_with_contrast(ColorMode::Dark, Contrast::High);
     }
 
     #[test]
