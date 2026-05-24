@@ -12,17 +12,18 @@
 # desktop trades some contrast for chromatic spread (warm terracotta
 # primary, warm brown secondary, olive tertiary in light mode).
 #
-# A second pair — `[color.light_hc]` / `[color.dark_hc]` — holds the
-# `TonalSpot` palette regenerated at `contrast_level = 1.0`. This
-# mirrors the HighContrast scheme that the firmware-side
-# `meshtastic-device-ui` ships in `source/graphics/TFT/Themes.cpp`, so
-# desktop can opt into the same near-black-on-near-white look (and
-# its dark inverse) for parity tests, small-display previews, or as
-# an accessibility theme. Select via `voicetastic_tokens::Contrast`.
+# A second pair — `[color.light_hc]` / `[color.dark_hc]` — mirrors
+# the Android app's palette: MaterialKolor's `Neutral` style at
+# HighContrast, same `#FFBDA8` seed, SPEC_2025. Surfaces are warm-
+# grey near-monochrome with a pale-peach primary, deliberately low
+# chroma so the UI reads cleanly on accessibility settings and the
+# web client. Authoritative source is
+# `voicetastic/app/src/main/java/re/chasam/voicetastic/ui/theme/Color.kt`
+# — refresh the `_hc` blocks here after regenerating Color.kt via
+# MaterialKolor Builder. Select via `voicetastic_tokens::Contrast::High`.
 #
-# Regenerate with:
+# Regenerate the TonalSpot pair (`[color.light]` / `[color.dark]`) with:
 #   cargo run --example generate_palette -p voicetastic-tokens
-#
 # Edit the `SEED` / style constants in the example to retheme.
 
 # ---------------------------------------------------------------------
@@ -122,101 +123,102 @@ outline                   = "#A08D87"
 outline_variant           = "#53433F"
 scrim                     = "#000000"
 
-# HighContrast variants (`contrast_level = 1.0`). Same seed, same
-# `TonalSpot` hue ring; surfaces are pushed to the extremes and every
-# `on_*` role lands at pure black or pure white. Use for the
-# meshtastic-device-ui parity theme or as an accessibility mode.
+# HighContrast pair, mirrored verbatim from the Android app's
+# `ui/theme/Color.kt` (`*LightHighContrast` / `*DarkHighContrast`).
+# MaterialKolor `Neutral` style, SPEC_2025, seed `#FFBDA8`. Surfaces
+# are warm-grey near-monochrome; primary stays a pale peach. Refresh
+# after regenerating Color.kt via MaterialKolor Builder.
 
 [color.light_hc]
-# Primary (deep terracotta — pushed toward black for contrast)
-primary                   = "#501B08"
-on_primary                = "#FFFFFF"
-primary_container         = "#753722"
+# Primary (deep terracotta, near-black for max contrast)
+primary                   = "#3E190C"
+on_primary                = "#FFD0C1"
+primary_container         = "#754636"
 on_primary_container      = "#FFFFFF"
-inverse_primary           = "#FFB59D"
-# Secondary (deep warm brown)
-secondary                 = "#3F261D"
-on_secondary              = "#FFFFFF"
-secondary_container       = "#604239"
+inverse_primary           = "#FFBDA8"
+# Secondary (warm near-black grey)
+secondary                 = "#292220"
+on_secondary              = "#E4D7D4"
+secondary_container       = "#59504E"
 on_secondary_container    = "#FFFFFF"
-# Tertiary (deep olive)
-tertiary                  = "#352B02"
-on_tertiary               = "#FFFFFF"
-tertiary_container        = "#54491C"
+# Tertiary (deep rose-brown)
+tertiary                  = "#381B22"
+on_tertiary               = "#FFCDD7"
+tertiary_container        = "#6D4850"
 on_tertiary_container     = "#FFFFFF"
 # Error
-error                     = "#600004"
-on_error                  = "#FFFFFF"
-error_container           = "#98000A"
+error                     = "#4F0409"
+on_error                  = "#FFCFCB"
+error_container           = "#8E3432"
 on_error_container        = "#FFFFFF"
 # Background & surface
 background                = "#FFF8F6"
-on_background             = "#231917"
+on_background             = "#000000"
 surface                   = "#FFF8F6"
 on_surface                = "#000000"
-surface_variant           = "#F5DED7"
-on_surface_variant        = "#000000"
-surface_tint              = "#8F4C35"
+surface_variant           = "#EBE0DD"
+on_surface_variant        = "#282321"
+surface_tint              = "#3E190C"
 # Inverse surface
-inverse_surface           = "#392E2B"
+inverse_surface           = "#100E0D"
 inverse_on_surface        = "#FFFFFF"
 # Surface tonal tiers (lowest → highest)
-surface_dim               = "#C6B5B1"
+surface_dim               = "#E3D8D4"
 surface_bright            = "#FFF8F6"
 surface_container_lowest  = "#FFFFFF"
-surface_container_low     = "#FFEDE8"
-surface_container         = "#F1DFDA"
-surface_container_high    = "#E2D1CC"
-surface_container_highest = "#D4C3BE"
-# Outlines (heavier so dividers register on small TFTs)
-outline                   = "#362925"
-outline_variant           = "#554641"
+surface_container_low     = "#FAF2F0"
+surface_container         = "#F5ECEA"
+surface_container_high    = "#F0E6E4"
+surface_container_highest = "#EBE0DD"
+# Outlines
+outline                   = "#484140"
+outline_variant           = "#57514F"
 scrim                     = "#000000"
 
 [color.dark_hc]
-# Primary (near-white peach for max contrast on dark)
-primary                   = "#FFECE7"
-on_primary                = "#000000"
-primary_container         = "#FFAF95"
+# Primary (pale peach against warm-black surfaces)
+primary                   = "#FFDFD5"
+on_primary                = "#482113"
+primary_container         = "#D29582"
 on_primary_container      = "#000000"
-inverse_primary           = "#733621"
-# Secondary
-secondary                 = "#FFECE7"
-on_secondary              = "#000000"
-secondary_container       = "#E3BAAD"
+inverse_primary           = "#572D1E"
+# Secondary (near-white warm grey)
+secondary                 = "#F0E3DF"
+on_secondary              = "#312A28"
+secondary_container       = "#ACA19E"
 on_secondary_container    = "#000000"
-# Tertiary
-tertiary                  = "#FFEFBF"
-on_tertiary               = "#000000"
-tertiary_container        = "#D3C28A"
-on_tertiary_container     = "#000000"
+# Tertiary (pale rose)
+tertiary                  = "#FFE1E6"
+on_tertiary               = "#44252C"
+tertiary_container        = "#FFCDD7"
+on_tertiary_container     = "#381B22"
 # Error
-error                     = "#FFECE9"
-on_error                  = "#000000"
-error_container           = "#FFAEA4"
+error                     = "#FFDEDB"
+on_error                  = "#5A0D10"
+error_container           = "#F5827C"
 on_error_container        = "#000000"
 # Background & surface
-background                = "#1A110F"
-on_background             = "#F1DFDA"
-surface                   = "#1A110F"
+background                = "#100E0D"
+on_background             = "#FFFFFF"
+surface                   = "#100E0D"
 on_surface                = "#FFFFFF"
-surface_variant           = "#53433F"
-on_surface_variant        = "#FFFFFF"
-surface_tint              = "#FFB59D"
+surface_variant           = "#2A2523"
+on_surface_variant        = "#EEE3E0"
+surface_tint              = "#FFDFD5"
 # Inverse surface
-inverse_surface           = "#F1DFDA"
+inverse_surface           = "#FFF8F6"
 inverse_on_surface        = "#000000"
 # Surface tonal tiers (lowest → highest)
-surface_dim               = "#1A110F"
-surface_bright            = "#5A4D4A"
+surface_dim               = "#100E0D"
+surface_bright            = "#312B29"
 surface_container_lowest  = "#000000"
-surface_container_low     = "#271D1B"
-surface_container         = "#392E2B"
-surface_container_high    = "#443936"
-surface_container_highest = "#504441"
-# Outlines (high-tint so they read against dark surfaces)
-outline                   = "#FFECE7"
-outline_variant           = "#D4BEB8"
+surface_container_low     = "#161312"
+surface_container         = "#1C1918"
+surface_container_high    = "#231F1D"
+surface_container_highest = "#2A2523"
+# Outlines
+outline                   = "#C0B7B4"
+outline_variant           = "#ABA29F"
 scrim                     = "#000000"
 
 # "Fixed" colors are mode-independent: same hex in light and dark.

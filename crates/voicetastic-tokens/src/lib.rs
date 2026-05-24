@@ -44,6 +44,21 @@ pub use egui_emitter::{
 /// access at runtime.
 pub const TOKENS_TOML: &str = include_str!("../../../tokens/design.toml");
 
+/// Voicetastic launcher mark, SVG source. Same geometry as the Android
+/// adaptive icon and the eframe window icon. Consumers that render
+/// vector (web, eframe with `resvg`) should prefer this over the PNG.
+pub const ICON_SVG: &str = include_str!("../assets/icon.svg");
+
+/// Voicetastic mark, cropped past the adaptive-icon safe zone so the
+/// figure fills the badge. Use for the web nav, favicons, social
+/// previews — anywhere the launcher mask isn't applied.
+pub const ICON_MARK_SVG: &str = include_str!("../assets/icon-mark.svg");
+
+/// Voicetastic launcher mark, pre-rasterised at 256×256 (sRGB, PNG).
+/// Embedded so the GUI binary doesn't need filesystem access for its
+/// window icon; web/Android targets should use [`ICON_SVG`] instead.
+pub const ICON_PNG_256: &[u8] = include_bytes!("../assets/icon-256.png");
+
 /// Parsed root of `tokens/design.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Tokens {
@@ -58,10 +73,12 @@ pub struct Tokens {
 pub struct ColorSchemes {
     pub light: ColorScheme,
     pub dark: ColorScheme,
-    /// HighContrast variant of `light` (same seed, `contrast_level = 1.0`).
-    /// Mirrors the palette shipped by `meshtastic-device-ui` so the desktop
-    /// can render the firmware look (or an a11y theme) without forking the
-    /// brand. Selected via [`Contrast::High`].
+    /// HighContrast variant of `light`, mirrored from the Android app's
+    /// `ui/theme/Color.kt` (MaterialKolor `Neutral` style, SPEC_2025,
+    /// same `#FFBDA8` seed as [`Self::light`]). Surfaces collapse to
+    /// warm-grey near-monochrome with a pale-peach primary, intended
+    /// for accessibility mode and the web client. Selected via
+    /// [`Contrast::High`].
     pub light_hc: ColorScheme,
     /// HighContrast variant of `dark` — see [`Self::light_hc`].
     pub dark_hc: ColorScheme,

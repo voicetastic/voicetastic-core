@@ -50,15 +50,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 /// Decode the bundled launcher icon (PNG embedded at compile time) into
-/// the RGBA buffer eframe expects. Shares its geometry with the Android
-/// adaptive icon — see [`crates/voicetastic-gui/assets/icon.svg`].
+/// the RGBA buffer eframe expects. The asset lives in
+/// [`crates/voicetastic-tokens/assets/`] alongside the SVG source so
+/// every platform (egui, Android, web) consumes the same mark.
 ///
 /// On decode failure we log + fall back to a transparent 1×1 icon
 /// rather than refusing to start the app; the asset is bundled in the
 /// binary so this is effectively unreachable in practice.
 fn load_window_icon() -> egui::IconData {
-    const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
-    match image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png) {
+    match image::load_from_memory_with_format(
+        voicetastic_tokens::ICON_PNG_256,
+        image::ImageFormat::Png,
+    ) {
         Ok(img) => {
             let rgba = img.into_rgba8();
             let (w, h) = (rgba.width(), rgba.height());

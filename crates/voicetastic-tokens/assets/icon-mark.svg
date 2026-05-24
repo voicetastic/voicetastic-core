@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Voicetastic *mark* variant — the same artwork as `icon.svg` but with
+  the viewBox cropped past the Android adaptive-icon safe zone so the
+  figure fills the badge. Use this version for the website nav,
+  favicons, social previews, and anywhere else the launcher mask isn't
+  applied.
+
+  Path data is identical to `icon.svg`; only the viewBox changes. Keep
+  in sync if the geometry is regenerated.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="29 29 50 50">
+  <rect width="108" height="108" fill="#FFBDA8"/>
+  <g transform="translate(8.16 0.25) rotate(180 54 54)">
+    <g transform="translate(18.36 18.36) scale(2.4944882)">
+      <path fill="#2C2D3C" fill-rule="evenodd"
+            d="m17.5564,11.8482 l-5.208,7.6376 -1.5217,-1.0377 5.9674,-8.7512c0.1714,-0.2513 0.4558,-0.4019 0.76,-0.4022 0.3042,-0.0003 0.5889,0.1497 0.7608,0.4008l5.9811,8.7374 -1.5199,1.0404z"/>
+    </g>
+  </g>
+</svg>

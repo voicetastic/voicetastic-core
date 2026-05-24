@@ -35,5 +35,5 @@ thiserror = { workspace = true }
 cpal = { version = "0.16", optional = true }
 # PNG-only image decode for the window icon. `default-features = false`
 # skips JPEG/GIF/TIFF/etc decoders and their transitive deps — we only
-# ever hand it the bundled `assets/icon-256.png`.
+# ever hand it `voicetastic_tokens::ICON_PNG_256`.
 image = { version = "0.25", default-features = false, features = ["png"] }

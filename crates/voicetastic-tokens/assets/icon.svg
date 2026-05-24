@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Voicetastic launcher mark. A single rounded chevron ("V") centered
+  in the 108×108 dp canvas.
+
+    - background  = #FFBDA8  (M3 seed used by the Compose theme)
+    - foreground  = #2C2D3C  (high-contrast mark)
+
+  The outer translate (8.16, 0.25) recenters the figure on the canvas
+  after the 180° rotation flips the chevron to point down. Inner
+  translate + scale preserve Android's 72×72 dp adaptive-icon "safe
+  zone" so the mark stays within the launcher mask radius. The Android
+  drawable at voicetastic/app/src/main/res/drawable/ic_launcher_foreground.xml
+  carries the same geometry — keep them in sync.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <rect width="108" height="108" fill="#FFBDA8"/>
+  <g transform="translate(8.16 0.25) rotate(180 54 54)">
+    <g transform="translate(18.36 18.36) scale(2.4944882)">
+      <path fill="#2C2D3C" fill-rule="evenodd"
+            d="m17.5564,11.8482 l-5.208,7.6376 -1.5217,-1.0377 5.9674,-8.7512c0.1714,-0.2513 0.4558,-0.4019 0.76,-0.4022 0.3042,-0.0003 0.5889,0.1497 0.7608,0.4008l5.9811,8.7374 -1.5199,1.0404z"/>
+    </g>
+  </g>
+</svg>
