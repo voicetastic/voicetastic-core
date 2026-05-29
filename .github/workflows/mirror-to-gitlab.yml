@@ -1,9 +1,16 @@
-# Mirror this repository to GitLab on every push.
+# Mirror `main` from GitHub to GitLab on every push to `main`.
 #
-# GitHub is canonical; GitLab (git.cha-sam.re/voicetastic/voicetastic-core)
-# is a strict read-only mirror — branches divergent on GitLab will be
-# overwritten. Required because GitLab CE doesn't offer pull-mirroring
-# (an EE feature), so we push from GitHub instead.
+# GitHub is canonical for `main`; GitLab
+# (git.cha-sam.re/voicetastic/voicetastic-core) keeps a copy so the
+# existing GitLab pipelines and bookmarks keep working. Required
+# because GitLab CE doesn't offer pull-mirroring (an EE feature), so
+# we push from GitHub instead.
+#
+# Scoped deliberately to `main` only (not `--mirror`): GitLab still
+# holds feature branches, release tags, and other refs that pre-date
+# this migration, and a `push --mirror` would wipe them. If you want
+# to bring more refs across later, push them to GitHub first and then
+# extend the `refspec` array below.
 #
 # Setup checklist (one-time):
 #   1. In GitLab → User Settings → Access Tokens, create a personal
@@ -12,21 +19,15 @@
 #        gh secret set GITLAB_TOKEN --body '<token>' -R voicetastic/voicetastic-core
 #   3. After setting the secret, trigger this workflow once manually
 #      via the Actions tab → "Mirror to GitLab" → Run workflow.
-#
-# Once configured, every subsequent push (and branch/tag deletion)
-# updates the GitLab side automatically.
 name: Mirror to GitLab
 
 on:
   push:
-    branches: ['**']
-    tags: ['**']
-  delete:
+    branches: [main]
   workflow_dispatch:
 
 # One mirror run at a time; don't cancel a run in flight because the
-# next push arrived (each run does a fresh `git clone --mirror` so
-# overlapping runs would just race on the GitLab side).
+# next push arrived.
 concurrency:
   group: mirror-to-gitlab
   cancel-in-progress: false
@@ -35,7 +36,14 @@ jobs:
   mirror:
     runs-on: ubuntu-latest
     steps:
-      - name: Push GitHub → GitLab
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the GitLab side accepts a fast-forward of
+          # the existing `main` ref without complaining about
+          # missing objects.
+          fetch-depth: 0
+
+      - name: Push main → GitLab
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
@@ -43,9 +51,6 @@ jobs:
             echo "::error::GITLAB_TOKEN secret is not set. Create a GitLab personal access token with the write_repository scope and add it as a repo secret named GITLAB_TOKEN (see header comment in this workflow)."
             exit 1
           fi
-          # `git clone --mirror` brings all refs (branches, tags, notes)
-          # in one shot — simpler than reconstructing the ref layout
-          # from a working-tree checkout.
-          git clone --mirror "https://github.com/${GITHUB_REPOSITORY}.git" src.git
-          git -C src.git push --mirror \
-            "https://oauth2:${GITLAB_TOKEN}@git.cha-sam.re/voicetastic/voicetastic-core.git"
+          git push --force \
+            "https://oauth2:${GITLAB_TOKEN}@git.cha-sam.re/voicetastic/voicetastic-core.git" \
+            HEAD:refs/heads/main
