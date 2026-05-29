@@ -19,6 +19,21 @@ pub enum Tab {
     Settings,
 }
 
+/// Delivery state of an outgoing DM. Surfaced as ✓ / ✓✓ / ❌ / ⏱ in
+/// the chat row next to the message. Broadcasts always stay at `None`
+/// — the firmware doesn't ack them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    /// Sent; waiting for the firmware's `Routing` ack.
+    Pending,
+    /// Firmware reported `Routing::Error::None`.
+    Delivered,
+    /// Firmware reported a typed delivery failure.
+    Failed,
+    /// No ack within the deadline.
+    TimedOut,
+}
+
 #[derive(Clone)]
 pub struct ChatEntry {
     pub text: String,
@@ -31,6 +46,14 @@ pub struct ChatEntry {
     pub from_num: u32,
     /// Destination node num. `0xFFFF_FFFF` = broadcast.
     pub to_num: u32,
+    /// Firmware-reported delivery status for outgoing DMs. `None` for
+    /// inbound entries and outgoing broadcasts. The chat UI surfaces
+    /// this as a small icon trailing the message text.
+    pub delivery: Option<DeliveryStatus>,
+    /// Mesh packet id assigned when an outgoing message was sent. Used
+    /// by the ack watcher to locate the right `ChatEntry` once the
+    /// firmware reports delivery. `None` for inbound entries.
+    pub outgoing_packet_id: Option<u32>,
     /// Voice payload (length-prefixed Opus packets) when this entry is a
     /// voice message. `None` for plain text, or for an outgoing voice
     /// entry that hasn't finished sending yet — the payload is attached
@@ -163,9 +186,10 @@ impl Clone for SharedState {
 }
 
 /// A pairing prompt routed from `org.bluez.Agent1` to the GUI modal.
-/// `reply` is consumed when the user clicks OK / Cancel; the dialog
-/// MUST always either send a reply or drop the slot (drop is treated
-/// as cancel by the agent).
+/// `reply` is consumed when the user clicks OK / Cancel; if the slot is
+/// dropped without an explicit reply (e.g. the app exits with the modal
+/// open), the `Drop` impl below sends `Cancel` so the agent task on the
+/// other end doesn't have to rely on `RecvError::Closed` to infer intent.
 #[cfg(target_os = "linux")]
 pub struct PendingPairing {
     pub address: String,
@@ -173,6 +197,15 @@ pub struct PendingPairing {
     pub reply: Option<tokio::sync::oneshot::Sender<PairingResponse>>,
     /// In-progress text input for `Passkey` / `PinCode` kinds.
     pub input: String,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PendingPairing {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(PairingResponse::Cancel);
+        }
+    }
 }
 
 /// Maximum number of entries kept in [`SharedState::chat_log`]. Long-running

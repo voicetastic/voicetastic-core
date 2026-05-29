@@ -17,6 +17,7 @@ use voicetastic_core::voice::{
 };
 
 use crate::connect::connect;
+use crate::util::disconnect_with_timeout;
 
 /// AMR-NB file header — stripped on send, re-prepended on receive.
 const AMR_FILE_HEADER: &[u8] = b"#!AMR\n";
@@ -118,7 +119,7 @@ pub async fn send(
         }
     }
 
-    let _ = svc.disconnect().await;
+    disconnect_with_timeout(&svc).await;
     Ok(())
 }
 
@@ -208,7 +209,7 @@ pub async fn listen(device: &str, out_dir: &Path, format: &str) -> Result<()> {
             },
         }
     }
-    let _ = svc.disconnect().await;
+    disconnect_with_timeout(&svc).await;
     Ok(())
 }
 

@@ -81,6 +81,16 @@ pub enum VoiceDestination {
     Broadcast,
 }
 
+/// Inbound voice frame after protocol filtering (port + version check),
+/// ready to hand to the assembler.
+#[derive(Debug, Clone)]
+pub struct VoiceData {
+    pub from: NodeId,
+    pub to: VoiceDestination,
+    pub channel: u32,
+    pub payload: Vec<u8>,
+}
+
 /// Meshtastic LoRa modem presets, used to pick adaptive pacing and a sane
 /// chunk size. Mirrors the firmware enum order; receivers only read; senders
 /// look up [`Self::pacing`] and [`Self::recommended_chunk_size`].

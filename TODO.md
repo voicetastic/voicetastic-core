@@ -5,51 +5,57 @@ Ordered roughly by user impact / payoff.
 
 ## High impact
 
-- [ ] **Auto-reconnect with backoff**
-  Supervise the BLE/serial connection inside `MeshService`. On disconnect,
-  retry the last-known address/port with exponential backoff (e.g. 1s → 30s,
-  capped) until the user explicitly disconnects. BLE devices flap constantly;
-  long-running `text listen` / `voice listen` and the GUI both suffer today.
-  Touches: `crates/voicetastic-core/src/service/mod.rs`,
-  `crates/voicetastic-core/src/service/transport.rs`.
+- [x] **Auto-reconnect with backoff**
+  Implemented for both serial and BLE in
+  `crates/voicetastic-core/src/meshtastic/service/mod.rs`. A single
+  `ReconnectConfig` enum (Serial/Ble) is captured at first-connect time,
+  cleared by explicit `disconnect()`. The reconnect watcher loop retries
+  the last-known transport with exponential backoff (1 s → 30 s, capped)
+  until the inbound stream is alive again or the user manually
+  disconnects. Triggered both by the silence-probe path (serial USB
+  endpoint stall) and by inbound EOF (BLE link drop). Long-running
+  `text listen` / `voice listen` and the GUI now ride out flaps.
 
-- [ ] **Verify whether the firmware ever delivers `Encrypted` packets
+- [x] **Verify whether the firmware ever delivers `Encrypted` packets
   addressed to us, and decrypt PKC DMs if so**
-  `meshtastic::service::inbound::handle_packet` drops every
-  `MeshPacket` whose `payload_variant` is `Encrypted`. The firmware
-  already handles channel AES-CTR for any channel whose PSK is loaded
-  on the radio — those packets arrive as `Decoded`, which is why the
-  default channel (and any configured custom channels) work today
-  without any decrypt code on the desktop side. Earlier framing of
-  this item as "non-default channels unusable" was wrong.
+  Verified against firmware: yes, the phone-API forwards `Encrypted`
+  packets whose `to == my_node_num` whenever the radio's own decrypt
+  failed — typically a PKC DM whose sender's public key wasn't in the
+  radio's nodeDB at decrypt time. Path: `Router::handleReceived` →
+  `perhapsDecode` (fails) → `MeshModule::callModules` →
+  `RoutingModule::handleReceivedProtobuf` → `service->handleFromRadio`.
+  Implemented host-side rescue in
+  `crates/voicetastic-core/src/meshtastic/pkc.rs`:
+  X25519-ECDH + SHA-256 + AES-256-CCM(8) matching the firmware's
+  `CryptoEngine::decryptCurve25519`. The `Config::Security` event
+  captures `private_key` into `ProtocolState`; `try_pkc_decrypt` in
+  `protocol.rs` is invoked from the `Encrypted` arm of `decode_packet`
+  when `to == my_node_num`. Includes the firmware's own `test_PKC`
+  test vector as a ground-truth integration test. Overheard PKC DMs
+  (not addressed to us) are now dropped at TRACE rather than DEBUG.
 
-  The `Encrypted` arm fires for packets the *radio itself* couldn't
-  decrypt. In practice that's overheard PKC direct messages between
-  two other nodes — we don't hold the recipient's private key and
-  couldn't read them even if we tried. Dropping is correct.
+- [x] **ACK / delivery tracking**
+  Implemented end-to-end. New `crates/voicetastic-core/src/meshtastic/ack.rs`
+  exposes `AckResult` + `AckHandle`; `MeshtasticService` keeps a
+  `pending_acks: HashMap<u32, oneshot::Sender<AckResult>>` swept on
+  every registration. `send_text_tracked` / `send_data_tracked`
+  register a slot before the packet leaves the host so there's no
+  race. The inbound decoder routes ROUTING_APP packets to
+  `InboundEvent::AckOrNak { request_id, result }`; the driver signals
+  the matching slot. CLI `text send --to` waits 30 s for delivery and
+  exits non-zero on Failed / TimedOut. GUI's `ChatEntry` carries a
+  `delivery: Option<DeliveryStatus>` and renders ⏳ / ✓ / ❌ / ⏱
+  next to outgoing DMs.
 
-  Open question worth verifying against firmware: does the phone-API
-  ever hand us an `Encrypted` packet whose `to` matches our own node
-  num? If yes (PKC DM left to the host to decrypt), we need a
-  Curve25519 decrypt path keyed on our node's private key. If no, the
-  item can be closed and the DEBUG log downgraded to TRACE.
-  Touches: `crates/voicetastic-core/src/meshtastic/service/inbound.rs`,
-  possibly a new `crypto` module.
-
-- [ ] **ACK / delivery tracking**
-  `send_text` / `send_data` set `want_ack=true` for DMs but discard the
-  result. Decode `Routing` admin payloads on inbound packets and route them
-  to a `pending_ids: HashMap<u32, oneshot::Sender<AckResult>>`. Surface ✓ /
-  ✓✓ / ❌ in the GUI chat log; let the CLI exit non-zero on undelivered DMs.
-  Touches: `service/inbound.rs`, `service/outbound.rs`,
-  `crates/voicetastic-gui/src/state.rs`, chat UI.
-
-- [ ] **Live audio capture + playback**
-  Today `voice` is `.amr` file in / `.amr` file out. Add `cpal` capture, an
-  AMR-NB encoder/decoder (or Opus behind a feature flag with a wire-
-  incompatible v2 protocol), and a record/play button in the GUI. Biggest
-  user-visible feature; also the most work.
-  New crate or feature: `voicetastic-audio`.
+- [x] **Live audio capture + playback**
+  Shipped behind the GUI's `audio` feature (default-on). `cpal` capture
+  feeds the codec pipeline (AMR-NB / Opus / Codec2 / PCM); the chat UI's
+  `VoiceCompose` state machine drives record / send / play with a Drop-
+  safe `Recorder` and a streaming `PlaybackHandle`. Codec, bitrate,
+  bandwidth, denoise are all settings-driven.
+  Lives in: `crates/voicetastic-gui/src/audio.rs`,
+  `crates/voicetastic-gui/src/ui/chat.rs`,
+  `crates/voicetastic-core/src/codec/`.
 
 ## Medium impact
 
@@ -152,8 +158,7 @@ Ordered roughly by user impact / payoff.
 
 ## Notes
 
-- Picking three for maximum impact: auto-reconnect, channel encryption,
-  ACK tracking. Together they turn the app from "wire-compatible demo" into
-  "daily driver that handles a real mesh".
-- Live audio is the most user-visible feature but also the most work; treat
-  it as its own milestone.
+- The four originally-flagged high-impact items (auto-reconnect, PKC
+  decrypt, ACK tracking, live audio) all shipped. Remaining work is
+  concentrated in the "Medium impact" persistence layer and GUI
+  architecture cleanups, plus the smaller polish items below.

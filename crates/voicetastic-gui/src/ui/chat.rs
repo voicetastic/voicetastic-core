@@ -15,7 +15,7 @@ use voicetastic_core::voice::{
 
 use crate::app::{PlaybackSource, VoicetasticApp};
 use crate::audio::{self, PlaybackHandle, RecordedClip, Recorder};
-use crate::state::{ChatEntry, SharedState, VoicePayload};
+use crate::state::{ChatEntry, DeliveryStatus, SharedState, VoicePayload};
 
 /// Voice-message compose state machine driven by the Chat tab UI.
 ///
@@ -265,6 +265,17 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                     && app.voice_playback.is_some();
                 ui.horizontal(|ui| {
                     ui.label(format!("{prefix}: {}", entry.text));
+                    if let Some(status) = entry.delivery {
+                        let (icon, hover) = match status {
+                            DeliveryStatus::Pending => ("⏳", "Waiting for delivery ack"),
+                            DeliveryStatus::Delivered => ("✓", "Delivered"),
+                            DeliveryStatus::Failed => ("❌", "Delivery failed"),
+                            DeliveryStatus::TimedOut => {
+                                ("⏱", "No ack within 30 s; may still be in flight")
+                            }
+                        };
+                        ui.weak(icon).on_hover_text(hover);
+                    }
                     if let Some(v) = entry.voice.as_ref()
                         && audio::is_available()
                         && matches!(
@@ -331,9 +342,27 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                 };
                 let to_num = dest.unwrap_or(BROADCAST_ADDR);
                 let shared = Arc::clone(&app.shared);
+                let ctx = ui.ctx().clone();
                 app.rt.spawn(async move {
-                    match svc.send_text(&text, ch, dest).await {
-                        Ok(_id) => {
+                    // Broadcasts: fire-and-forget. DMs: register a tracked
+                    // send so the chat UI can show ✓ / ❌ once the
+                    // firmware reports back. Spawning a second task on
+                    // the handle keeps the send response path snappy and
+                    // lets the ack arrive whenever the mesh delivers it.
+                    let send_outcome = match dest {
+                        None => svc.send_text(&text, ch, dest).await.map(|id| (id, None)),
+                        Some(d) => svc
+                            .send_text_tracked(&text, ch, d)
+                            .await
+                            .map(|(id, handle)| (id, Some(handle))),
+                    };
+                    match send_outcome {
+                        Ok((id, ack_handle)) => {
+                            let delivery = if dest.is_some() {
+                                Some(DeliveryStatus::Pending)
+                            } else {
+                                None
+                            };
                             shared.lock().push_chat(ChatEntry {
                                 text,
                                 rx_time: 0,
@@ -341,13 +370,54 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                                 channel: ch,
                                 from_num: 0,
                                 to_num,
+                                delivery,
+                                outgoing_packet_id: Some(id),
                                 voice: None,
                                 outgoing_voice_id: None,
                                 inbound_voice_id: None,
                             });
+                            ctx.request_repaint();
+                            if let Some(handle) = ack_handle {
+                                let shared = Arc::clone(&shared);
+                                let ctx = ctx.clone();
+                                tokio::spawn(async move {
+                                    let result =
+                                        handle.wait(std::time::Duration::from_secs(30)).await;
+                                    let status = match result {
+                                        voicetastic_core::meshtastic::ack::AckResult::Delivered => {
+                                            DeliveryStatus::Delivered
+                                        }
+                                        voicetastic_core::meshtastic::ack::AckResult::Failed(_) => {
+                                            DeliveryStatus::Failed
+                                        }
+                                        voicetastic_core::meshtastic::ack::AckResult::TimedOut => {
+                                            DeliveryStatus::TimedOut
+                                        }
+                                        voicetastic_core::meshtastic::ack::AckResult::Cancelled => {
+                                            // Service dropped; leave the
+                                            // entry as Pending — the user
+                                            // will see the connection drop
+                                            // banner too.
+                                            return;
+                                        }
+                                    };
+                                    let mut st = shared.lock();
+                                    if let Some(entry) = st
+                                        .chat_log
+                                        .iter_mut()
+                                        .rev()
+                                        .find(|e| e.outgoing_packet_id == Some(id))
+                                    {
+                                        entry.delivery = Some(status);
+                                    }
+                                    drop(st);
+                                    ctx.request_repaint();
+                                });
+                            }
                         }
                         Err(e) => {
                             shared.lock().status_msg = Some(format!("Send failed: {e}"));
+                            ctx.request_repaint();
                         }
                     }
                 });
@@ -658,6 +728,12 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
         channel,
         from_num: 0,
         to_num,
+        // Voice deliveries are tracked through the dedicated
+        // SendStatus broadcast (see the burst-status watcher below),
+        // not via the per-packet Routing ack — a voice message is
+        // many packets and we already report progress more granularly.
+        delivery: None,
+        outgoing_packet_id: None,
         voice: None,
         outgoing_voice_id: Some(message_id),
         inbound_voice_id: None,

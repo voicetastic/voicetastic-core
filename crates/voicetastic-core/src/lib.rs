@@ -25,7 +25,6 @@ pub mod voice;
 
 pub mod meshtastic;
 pub mod node;
-pub mod radio_service;
 
 // Backward-compat re-exports (migrate to meshtastic:: prefix over time)
 #[cfg(feature = "ble-btleplug")]

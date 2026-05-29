@@ -31,7 +31,9 @@ const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(feature = "ble-btleplug")]
 use crate::ble::{BleManager, Connection, DiscoveredDevice};
-use crate::error::{Error, Result};
+#[cfg(feature = "ble-btleplug")]
+use crate::error::Error;
+use crate::error::Result;
 use crate::node::NodeId;
 use crate::proto::{
     Channel, DeviceMetadata, MyNodeInfo, NodeInfo, User,
@@ -41,14 +43,11 @@ use crate::proto::{
     },
     to_radio,
 };
-use crate::radio_service::{
-    self, ConnectionState as RadioConnectionState, IncomingText as RadioIncomingText, QueueEvent,
-    VoiceData,
-};
 #[cfg(feature = "serial-tokio")]
 use crate::serial::SerialConnection;
 use crate::transport::Transport;
 use crate::voice::ModemPreset;
+use crate::voice::types::VoiceData;
 
 pub use types::{ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_long_name};
 
@@ -69,12 +68,26 @@ pub fn modem_preset_from_proto(value: i32) -> Option<ModemPreset> {
     })
 }
 
-/// Configuration for serial port auto-reconnection.
+/// What to reconnect to, captured at first-connect time and consumed by
+/// the auto-reconnect watcher after a disconnect. Cleared by an explicit
+/// `disconnect()` so a user-initiated teardown doesn't immediately
+/// bounce back up.
 #[derive(Debug, Clone)]
-struct SerialReconnectConfig {
-    path: String,
-    baud: u32,
+enum ReconnectConfig {
+    #[cfg(feature = "serial-tokio")]
+    Serial { path: String, baud: u32 },
+    #[cfg(feature = "ble-btleplug")]
+    Ble { address: String },
 }
+
+/// Exponential backoff bounds for the auto-reconnect watcher: start at
+/// 1 s after a disconnect, double on each failed retry, cap at 30 s.
+/// Only used by the watcher's spawn block, which is itself gated on
+/// having at least one transport feature compiled in.
+#[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+#[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]
@@ -98,11 +111,6 @@ struct Inner {
     /// source of truth, and the one a non-tokio (browser) driver would read.
     state: parking_lot::Mutex<protocol::ProtocolState>,
     state_tx: watch::Sender<ConnectionState>,
-    /// Mirror of `state_tx` in the protocol-agnostic [`RadioConnectionState`]
-    /// type. A single forwarder task (spawned in [`MeshtasticService::new`])
-    /// keeps it in sync, so [`RadioService::watch_state`] can hand out
-    /// subscribers cheaply instead of spawning a fresh adapter task per call.
-    radio_state_tx: watch::Sender<RadioConnectionState>,
     my_info_tx: watch::Sender<Option<MyNodeInfo>>,
     nodes_tx: watch::Sender<HashMap<u32, NodeInfo>>,
     config_complete_tx: broadcast::Sender<u32>,
@@ -129,15 +137,19 @@ struct Inner {
     /// Consumers (e.g. the chat UI) subscribe to track when individual
     /// outbound packets have actually been transmitted on air.
     pub(super) queue_status_tx: broadcast::Sender<types::QueueStatusEvent>,
-    /// Protocol-agnostic voice data (pre-filtered by port/version).
+    /// Protocol-filtered inbound voice data (port + version checked).
     pub(super) voice_data_tx: broadcast::Sender<VoiceData>,
-    /// Protocol-agnostic queue events.
-    pub(super) queue_event_tx: broadcast::Sender<QueueEvent>,
+    /// Outbound packets awaiting their firmware-reported delivery ack.
+    /// Keyed by the packet id; populated by `send_*_tracked` before the
+    /// send, drained by the inbound `Routing` handler. Entries whose
+    /// `AckHandle` has been dropped without resolving leak until the
+    /// next `register_ack` call sweeps them (see [`Self::register_ack`]).
+    pending_acks: parking_lot::Mutex<
+        HashMap<u32, tokio::sync::oneshot::Sender<crate::meshtastic::ack::AckResult>>,
+    >,
     // Configuration sections, each updated when the device emits its
     // matching `Config` chunk during the want-config burst.
     pub(super) lora_tx: watch::Sender<Option<LoRaConfig>>,
-    /// Modem preset for adaptive pacing (derived from lora_tx).
-    pub(super) modem_preset_tx: watch::Sender<Option<ModemPreset>>,
     pub(super) device_tx: watch::Sender<Option<DeviceConfig>>,
     pub(super) position_tx: watch::Sender<Option<PositionConfig>>,
     pub(super) power_tx: watch::Sender<Option<PowerConfig>>,
@@ -147,11 +159,12 @@ struct Inner {
     pub(super) channels_tx: watch::Sender<Vec<Channel>>,
     pub(super) owner_tx: watch::Sender<Option<User>>,
     pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
-    /// Configuration for serial port auto-reconnection. Set by
-    /// [`MeshtasticService::connect_by_serial_baud`]; `None` = reconnect is not
-    /// configured (e.g. BLE connection). Used by the silence-probe task to
-    /// auto-reconnect when it detects a dead read path.
-    pub(super) reconnect_config: Mutex<Option<SerialReconnectConfig>>,
+    /// What to reconnect to when the inbound stream drops. Set by
+    /// [`MeshtasticService::connect_by_serial_baud`] and
+    /// [`MeshtasticService::connect_by_address`]; cleared by an explicit
+    /// [`MeshtasticService::disconnect`]. `None` means reconnect is not
+    /// configured (e.g. caller used `connect_with_transport` directly).
+    pub(super) reconnect_config: Mutex<Option<ReconnectConfig>>,
     /// Notified when the silence probe triggers a reconnect. A dedicated
     /// watcher task (spawned once in [`MeshtasticService::new`]) consumes this
     /// and calls [`MeshtasticService::connect_by_serial_baud`] so the reconnect
@@ -163,7 +176,6 @@ struct Inner {
 impl MeshtasticService {
     pub async fn new() -> Result<Self> {
         let (state_tx, _) = watch::channel(ConnectionState::Disconnected);
-        let (radio_state_tx, _) = watch::channel(map_conn_state(ConnectionState::Disconnected));
         let (my_info_tx, _) = watch::channel(None);
         let (nodes_tx, _) = watch::channel(HashMap::new());
         let (config_complete_tx, _) = broadcast::channel(8);
@@ -176,9 +188,7 @@ impl MeshtasticService {
         // the ~64 KB worst-case footprint is cheap.
         let (queue_status_tx, _) = broadcast::channel(4096);
         let (voice_data_tx, _) = broadcast::channel(512);
-        let (queue_event_tx, _) = broadcast::channel(256);
         let (lora_tx, _) = watch::channel(None);
-        let (modem_preset_tx, _) = watch::channel(None);
         let (device_tx, _) = watch::channel(None);
         let (position_tx, _) = watch::channel(None);
         let (power_tx, _) = watch::channel(None);
@@ -200,7 +210,6 @@ impl MeshtasticService {
             transport_max_tx_payload: AtomicUsize::new(usize::MAX),
             state: parking_lot::Mutex::new(protocol::ProtocolState::default()),
             state_tx,
-            radio_state_tx,
             my_info_tx,
             nodes_tx,
             radio_queue_free: parking_lot::Mutex::new(u32::MAX),
@@ -222,9 +231,8 @@ impl MeshtasticService {
             voice_tx: voice_tx_send,
             queue_status_tx,
             voice_data_tx,
-            queue_event_tx,
+            pending_acks: parking_lot::Mutex::new(HashMap::new()),
             lora_tx,
-            modem_preset_tx,
             device_tx,
             position_tx,
             power_tx,
@@ -237,60 +245,66 @@ impl MeshtasticService {
             reconnect_config: Mutex::new(None),
             reconnect_request: reconnect_request.clone(),
         });
-        // Auto-reconnect watcher: waits for a notification from
-        // [`try_reconnect_serial`] (fired after the silence probe gives up),
-        // then sleeps 5 s and opens a fresh serial connection. This lives in
-        // a dedicated top-level task rather than being called directly from
-        // the reader task inside [`connect_with_transport`], which would
-        // create a recursive async type chain that the compiler can't prove
-        // `Send` (the inner `tokio::spawn` in [`connect_with_transport`]
-        // would transitively reference itself through the reconnect path).
+        // Auto-reconnect watcher: notified by [`try_reconnect`] after the
+        // inbound stream drops (transport tore down, silence-probe gave up,
+        // BLE link broke). Each notification kicks off an inner backoff
+        // loop that retries until either the user manually reconnects, the
+        // user manually disconnects (clears `reconnect_config`), or the
+        // service is dropped (Weak<Inner> upgrade fails).
+        //
+        // Lives in a dedicated top-level task rather than being called
+        // directly from the reader task inside [`connect_with_transport`],
+        // which would create a recursive async type chain the compiler
+        // can't prove `Send`.
+        //
+        // Gated on the transports that can populate `ReconnectConfig`:
+        // with both off (the wasm build path), the enum has zero variants,
+        // the loop is unreachable, and the spawned task would just block
+        // forever on a notify nothing can fire.
+        #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
         {
             let weak = Arc::downgrade(&inner);
             tokio::spawn(async move {
                 loop {
                     reconnect_request.notified().await;
-                    let inner = match weak.upgrade() {
-                        Some(i) => i,
-                        None => return,
-                    };
-                    // Give the old transport's reader task time to fully
-                    // shut down (drain + close inbound mpsc channel) so we
-                    // don't race on the serial port.
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let cfg = inner.reconnect_config.lock().await.clone();
-                    // Re-check after sleep: user may have manually
-                    // reconnected or disconnected while we waited.
-                    if inner.transport.lock().await.is_some() || cfg.is_none() {
-                        continue;
-                    }
-                    let Some(SerialReconnectConfig { path, baud }) = cfg else {
-                        continue;
-                    };
-                    #[cfg(feature = "serial-tokio")]
-                    {
+                    let Some(inner) = weak.upgrade() else { return };
+                    drop(inner); // grabbed it again each iteration below
+                    let mut delay = RECONNECT_INITIAL_DELAY;
+                    loop {
+                        tokio::time::sleep(delay).await;
+                        let Some(inner) = weak.upgrade() else { return };
+                        // Re-check intent after sleep: the user may have
+                        // manually reconnected (transport now Some) or
+                        // disconnected (config now None).
+                        let cfg = inner.reconnect_config.lock().await.clone();
+                        if inner.transport.lock().await.is_some() {
+                            break;
+                        }
+                        let Some(cfg) = cfg else { break };
                         let svc = MeshtasticService { inner };
-                        if let Err(e) = svc.connect_by_serial_baud(&path, baud).await {
-                            warn!(?e, "auto-reconnect failed");
+                        let result = match cfg {
+                            #[cfg(feature = "serial-tokio")]
+                            ReconnectConfig::Serial { path, baud } => {
+                                svc.connect_by_serial_baud(&path, baud).await
+                            }
+                            #[cfg(feature = "ble-btleplug")]
+                            ReconnectConfig::Ble { address } => {
+                                svc.connect_by_address(&address).await
+                            }
+                        };
+                        match result {
+                            Ok(()) => break,
+                            Err(e) => {
+                                warn!(
+                                    ?e,
+                                    delay_s = delay.as_secs(),
+                                    "auto-reconnect failed; retrying"
+                                );
+                                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+                                // Loop iterates with the new (longer) delay.
+                            }
                         }
                     }
-                    #[cfg(not(feature = "serial-tokio"))]
-                    let _ = (inner, path, baud);
-                }
-            });
-        }
-        // RadioService state forwarder: one long-lived task that maps the
-        // internal `ConnectionState` watch onto the protocol-agnostic
-        // `RadioConnectionState` watch. Holds a `Weak<Inner>` so it shuts
-        // down when the last external `MeshtasticService` clone drops.
-        {
-            let weak = Arc::downgrade(&inner);
-            let mut rx = inner.state_tx.subscribe();
-            tokio::spawn(async move {
-                while rx.changed().await.is_ok() {
-                    let Some(inner) = weak.upgrade() else { return };
-                    let state = *rx.borrow();
-                    let _ = inner.radio_state_tx.send(map_conn_state(state));
                 }
             });
         }
@@ -493,8 +507,8 @@ impl MeshtasticService {
                 .store(usize::MAX, Ordering::Relaxed);
             drop(slot);
             // Auto-reconnect so the user doesn't have to manually
-            // reconnect after a USB CDC ACM endpoint stall.
-            svc.try_reconnect_serial().await;
+            // reconnect after a USB CDC ACM endpoint stall or a BLE drop.
+            svc.try_reconnect().await;
         });
 
         if !settle_delay.is_zero() {
@@ -515,6 +529,11 @@ impl MeshtasticService {
     #[cfg(feature = "ble-btleplug")]
     pub async fn connect_by_address(&self, address: &str) -> Result<()> {
         self.set_state(ConnectionState::Connecting);
+        // Remember the address so the auto-reconnect watcher can bring
+        // the link back up after a BLE drop (devices flap often).
+        *self.inner.reconnect_config.lock().await = Some(ReconnectConfig::Ble {
+            address: address.to_string(),
+        });
         let ble = self.ble().await?;
         let peripheral = ble.peripheral_by_address(address).await?;
         let conn = match Connection::open(peripheral).await {
@@ -557,7 +576,7 @@ impl MeshtasticService {
         self.set_state(ConnectionState::Connecting);
         // Remember the path so the silence-probe task can auto-reconnect
         // when the read path stalls (USB CDC ACM endpoint stall, …).
-        *self.inner.reconnect_config.lock().await = Some(SerialReconnectConfig {
+        *self.inner.reconnect_config.lock().await = Some(ReconnectConfig::Serial {
             path: path.to_string(),
             baud,
         });
@@ -568,9 +587,11 @@ impl MeshtasticService {
             .await
     }
 
-    /// Notify the watcher to auto-reconnect after the silence probe gives up.
-    /// No-op on non-serial transports (no reconnect_config).
-    async fn try_reconnect_serial(&self) {
+    /// Notify the watcher to auto-reconnect after the inbound stream
+    /// drops (silence probe gave up for serial, BLE link broke, …).
+    /// No-op when the user disconnected manually or used
+    /// [`Self::connect_with_transport`] directly (no `reconnect_config`).
+    async fn try_reconnect(&self) {
         if self.inner.reconnect_config.lock().await.is_none() {
             return;
         }
@@ -894,87 +915,6 @@ mod tests {
     }
 }
 
-fn map_conn_state(s: ConnectionState) -> RadioConnectionState {
-    match s {
-        ConnectionState::Disconnected => RadioConnectionState::Disconnected,
-        ConnectionState::Connecting => RadioConnectionState::Connecting,
-        ConnectionState::Connected => RadioConnectionState::Connected,
-        ConnectionState::Configuring => RadioConnectionState::Configuring,
-        ConnectionState::Ready => RadioConnectionState::Ready,
-    }
-}
-
-// RadioService trait implementation
-#[async_trait::async_trait]
-impl radio_service::RadioService for MeshtasticService {
-    async fn connect_with_transport(
-        &self,
-        transport: Arc<dyn Transport>,
-        inbound: mpsc::Receiver<Vec<u8>>,
-        settle_delay: Duration,
-    ) -> Result<()> {
-        Self::connect_with_transport(self, transport, inbound, settle_delay).await
-    }
-
-    async fn disconnect(&self) -> Result<()> {
-        Self::disconnect(self).await
-    }
-
-    fn my_node_id(&self) -> Option<NodeId> {
-        self.my_node_num().map(NodeId::from_u32)
-    }
-
-    fn watch_state(&self) -> watch::Receiver<RadioConnectionState> {
-        self.inner.radio_state_tx.subscribe()
-    }
-
-    fn watch_nodes(&self) -> watch::Receiver<HashMap<NodeId, crate::node::NodeSummary>> {
-        // TODO: Transform watch_nodes() from HashMap<u32, NodeInfo> to HashMap<NodeId, NodeSummary>
-        // For now, return empty - this will be implemented in next phase
-        let (tx, rx) = watch::channel(HashMap::new());
-        let _ = tx; // Suppress unused warning
-        rx
-    }
-
-    fn watch_modem_preset(&self) -> watch::Receiver<Option<ModemPreset>> {
-        self.inner.modem_preset_tx.subscribe()
-    }
-
-    async fn send_text(&self, _text: &str, _channel: u32, _to: Option<NodeId>) -> Result<()> {
-        // TODO: Implement text sending through RadioService interface
-        Err(Error::Other(
-            "send_text not yet implemented via RadioService".into(),
-        ))
-    }
-
-    async fn send_voice_nack(
-        &self,
-        _frame: Vec<u8>,
-        _channel: u32,
-        _to_node: NodeId,
-    ) -> Result<()> {
-        // TODO: Implement NACK sending
-        Err(Error::Other("send_voice_nack not yet implemented".into()))
-    }
-
-    fn subscribe_text(&self) -> broadcast::Receiver<RadioIncomingText> {
-        // TODO: Transform from internal IncomingText to RadioIncomingText (NodeId wrapping)
-        // For now, return empty - this will be implemented in next phase
-        let (tx, rx) = broadcast::channel(64);
-        let _ = tx; // Suppress unused warning
-        rx
-    }
-
-    fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData> {
-        self.inner.voice_data_tx.subscribe()
-    }
-
-    fn subscribe_queue_event(&self) -> broadcast::Receiver<QueueEvent> {
-        self.inner.queue_event_tx.subscribe()
-    }
-}
-
-// VoiceFrameSink trait implementation
 #[async_trait::async_trait]
 impl crate::voice::sink::VoiceFrameSink for MeshtasticService {
     async fn enqueue_voice_frame_with_id(
@@ -991,7 +931,7 @@ impl crate::voice::sink::VoiceFrameSink for MeshtasticService {
     }
 
     fn subscribe_voice_data(&self) -> broadcast::Receiver<VoiceData> {
-        <Self as radio_service::RadioService>::subscribe_voice_data(self)
+        self.inner.voice_data_tx.subscribe()
     }
 
     fn max_voice_body_size(&self) -> usize {

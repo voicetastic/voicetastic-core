@@ -7,6 +7,7 @@ use voicetastic_core::ids::node_num_to_id;
 use voicetastic_core::meshtastic::service::node_long_name;
 
 use crate::connect::connect;
+use crate::util::disconnect_with_timeout;
 
 pub async fn info(device: &str) -> Result<()> {
     let svc = MeshtasticService::new().await?;
@@ -43,7 +44,7 @@ pub async fn info(device: &str) -> Result<()> {
         }
     }
 
-    let _ = svc.disconnect().await;
+    disconnect_with_timeout(&svc).await;
     Ok(())
 }
 
@@ -52,7 +53,7 @@ pub async fn reboot(device: &str, secs: u32) -> Result<()> {
     connect(&svc, device).await?;
     let id = svc.reboot(secs as i32).await?;
     println!("reboot scheduled in {secs}s (admin id={id})");
-    let _ = svc.disconnect().await;
+    disconnect_with_timeout(&svc).await;
     Ok(())
 }
 
@@ -64,6 +65,6 @@ pub async fn factory_reset(device: &str, confirmed: bool) -> Result<()> {
     connect(&svc, device).await?;
     let id = svc.factory_reset().await?;
     println!("factory reset sent (admin id={id})");
-    let _ = svc.disconnect().await;
+    disconnect_with_timeout(&svc).await;
     Ok(())
 }

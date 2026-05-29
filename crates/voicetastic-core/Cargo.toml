@@ -23,6 +23,11 @@ reed-solomon-erasure = { workspace = true }
 sha2 = { workspace = true }
 web-time = { workspace = true }
 
+# Meshtastic PKC decrypt of inbound DMs.
+x25519-dalek = { workspace = true }
+aes = { workspace = true }
+ccm = { workspace = true }
+
 # Optional desktop transports. Off-by-default for Android / embedded
 # consumers that supply their own `Transport` implementation.
 btleplug = { workspace = true, optional = true }
@@ -138,3 +143,4 @@ prost-build = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
+hex = { workspace = true }

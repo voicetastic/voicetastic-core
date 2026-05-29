@@ -7,6 +7,7 @@ use prost::Message as _;
 use tracing::debug;
 
 use crate::error::{Error, Result};
+use crate::meshtastic::ack::{AckHandle, AckResult};
 use crate::proto::{Channel, Config, Position, ToRadio, User, admin_message, config, to_radio};
 
 use super::types::rand_u32;
@@ -31,6 +32,37 @@ impl MeshtasticService {
         self.send_to_radio(protocol::text_packet(id, text, channel, to)?)
             .await?;
         Ok(id)
+    }
+
+    /// Send a UTF-8 text DM and return an [`AckHandle`] that resolves
+    /// once the firmware reports delivery status (typically within a
+    /// few hundred ms over BLE plus the mesh's flood-route latency).
+    /// The ack slot is registered before the packet leaves the host, so
+    /// no race window where the response could arrive before we're
+    /// listening. Use the plain [`Self::send_text`] for broadcasts —
+    /// the firmware does not ack them.
+    pub async fn send_text_tracked(
+        &self,
+        text: &str,
+        channel: u32,
+        to: u32,
+    ) -> Result<(u32, AckHandle)> {
+        let id = self.next_id();
+        let handle = self.register_ack(id);
+        // Build the packet before sending so a `text_packet` validation
+        // failure doesn't leave a registered ack slot behind.
+        let payload = match protocol::text_packet(id, text, channel, Some(to)) {
+            Ok(p) => p,
+            Err(e) => {
+                self.discard_ack(id);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.send_to_radio(payload).await {
+            self.discard_ack(id);
+            return Err(e);
+        }
+        Ok((id, handle))
     }
 
     /// Send a raw application data packet (e.g. voice chunks via [`PRIVATE_APP`]).
@@ -93,6 +125,36 @@ impl MeshtasticService {
             ids.push(id);
         }
         Ok(ids)
+    }
+
+    /// Register a `oneshot` slot for the firmware's delivery ack on
+    /// `packet_id` and return the receiver wrapped in an [`AckHandle`].
+    /// Sweeps any orphaned entries (handle dropped without resolving)
+    /// while the lock is held so the table doesn't grow unboundedly
+    /// across long-running listeners that ignore the handle.
+    fn register_ack(&self, packet_id: u32) -> AckHandle {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut acks = self.inner.pending_acks.lock();
+        acks.retain(|_, sender| !sender.is_closed());
+        acks.insert(packet_id, tx);
+        AckHandle::new(packet_id, rx)
+    }
+
+    /// Tear down a registered ack slot without resolving it. Used when
+    /// the corresponding send failed before the packet went on the wire
+    /// — the firmware won't ack a packet it never saw, so leaving the
+    /// slot in place would just be a leak.
+    fn discard_ack(&self, packet_id: u32) {
+        self.inner.pending_acks.lock().remove(&packet_id);
+    }
+
+    /// Resolve a registered ack slot. No-op if no slot exists (we
+    /// received a `Routing` packet for a packet we didn't track, or the
+    /// handle was already dropped).
+    pub(super) fn signal_ack(&self, packet_id: u32, result: AckResult) {
+        if let Some(tx) = self.inner.pending_acks.lock().remove(&packet_id) {
+            let _ = tx.send(result);
+        }
     }
 
     fn next_id(&self) -> u32 {

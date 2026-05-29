@@ -28,18 +28,20 @@ use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::ids::node_num_to_id;
+use crate::meshtastic::ack::AckResult;
+use crate::meshtastic::pkc;
 use crate::node::NodeId;
 use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, PRIVATE_APP, TEXT_MESSAGE_APP};
 use crate::proto::{
     AdminMessage, Channel, Data, DeviceMetadata, FromRadio, MeshPacket, MyNodeInfo, NodeInfo,
-    PortNum, User, admin_message, config,
+    PortNum, Routing, User, admin_message, config,
     config::{
         BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
         PowerConfig,
     },
-    from_radio, mesh_packet, to_radio,
+    from_radio, mesh_packet, routing, to_radio,
 };
-use crate::radio_service::VoiceData;
+use crate::voice::types::VoiceData;
 use crate::voice::{PROTOCOL_VERSION as VOICE_PROTOCOL_VERSION, VoiceDestination, detect_version};
 
 use super::types::{IncomingData, IncomingText, QueueStatusEvent};
@@ -61,10 +63,20 @@ fn lon_i_in_range(v: i32) -> bool {
 /// Read-only state the decoder needs. Snapshotted by the driver before each
 /// call (there is no intra-message state dependency: one `FromRadio` carries
 /// exactly one variant).
-pub struct InboundCtx {
+pub struct InboundCtx<'a> {
     /// Our own node number, if a prior `MyNodeInfo` established it. Used to
     /// recognise our own `NodeInfo` and surface its `User` as the owner.
     pub my_node_num: Option<u32>,
+    /// Our node's X25519 private key, captured from `Config::Security`.
+    /// Required to decrypt `MeshPacket::Encrypted` PKC DMs whose firmware-
+    /// side decrypt failed (typically because the sender's public key was
+    /// missing from the radio's nodeDB at decrypt time). `None` until the
+    /// config burst has delivered `Security`, or when PKC is disabled on
+    /// the device.
+    pub our_private_key: Option<&'a [u8; 32]>,
+    /// The driver's current node roster — used to look up the sender's
+    /// public key when attempting PKC decrypt.
+    pub nodes: &'a HashMap<u32, NodeInfo>,
 }
 
 /// A decoded inbound effect for the driver to apply to its channels.
@@ -86,6 +98,13 @@ pub enum InboundEvent {
     IncomingData(IncomingData),
     Voice(VoiceData),
     QueueStatus(QueueStatusEvent),
+    /// Firmware delivery report for an outbound packet we sent with
+    /// `want_ack`. `request_id` is the original packet's id;
+    /// `result` carries success or a typed failure.
+    AckOrNak {
+        request_id: u32,
+        result: AckResult,
+    },
 }
 
 impl InboundEvent {
@@ -164,7 +183,7 @@ pub fn decode_inbound(bytes: &[u8], ctx: &InboundCtx) -> Result<Vec<InboundEvent
         from_radio::PayloadVariant::ConfigCompleteId(nonce) => {
             out.push(InboundEvent::ConfigComplete(nonce));
         }
-        from_radio::PayloadVariant::Packet(pkt) => decode_packet(pkt, &mut out),
+        from_radio::PayloadVariant::Packet(pkt) => decode_packet(pkt, ctx, &mut out),
         from_radio::PayloadVariant::QueueStatus(qs) => {
             debug!(
                 free = qs.free,
@@ -185,20 +204,33 @@ pub fn decode_inbound(bytes: &[u8], ctx: &InboundCtx) -> Result<Vec<InboundEvent
     Ok(out)
 }
 
-fn decode_packet(pkt: MeshPacket, out: &mut Vec<InboundEvent>) {
+fn decode_packet(pkt: MeshPacket, ctx: &InboundCtx, out: &mut Vec<InboundEvent>) {
+    // Snapshot the header fields up front: the `match` on `payload_variant`
+    // moves it out of `pkt`, which would prevent further `pkt.field` access
+    // by-reference on the encrypted-arm rescue path.
+    let from = pkt.from;
+    let to = pkt.to;
+    let id = pkt.id;
+    let channel = pkt.channel;
+
     // Destructure `payload_variant` by value so the payload can be moved
     // through this function instead of cloned at entry.
     let data = match pkt.payload_variant {
         Some(mesh_packet::PayloadVariant::Decoded(d)) => d,
         Some(mesh_packet::PayloadVariant::Encrypted(bytes)) => {
-            debug!(
-                from = pkt.from,
-                to = pkt.to,
-                channel = pkt.channel,
-                len = bytes.len(),
-                "dropping encrypted MeshPacket (channel decrypt not yet implemented)"
-            );
-            return;
+            // Channel-encrypted packets always arrive `Decoded` because the
+            // firmware unwraps them locally with the loaded PSK. So an
+            // `Encrypted` arm at this point is the firmware telling us "I
+            // couldn't decrypt this either" — either an overheard PKC DM
+            // between other nodes (we have no way in) or a PKC DM to us
+            // whose sender's public key wasn't in the radio's nodeDB at
+            // decrypt time. The latter we can rescue from the host if the
+            // config burst has delivered our private key and the sender's
+            // public key is in our local nodes table.
+            match try_pkc_decrypt(from, to, id, channel, &bytes, ctx) {
+                Some(d) => d,
+                None => return,
+            }
         }
         None => return,
     };
@@ -222,6 +254,45 @@ fn decode_packet(pkt: MeshPacket, out: &mut Vec<InboundEvent>) {
             }
             _ => {}
         }
+        return;
+    }
+    // Routing-app responses are the firmware's delivery report for an
+    // outbound packet we sent with `want_ack`. `data.request_id` matches
+    // the original outgoing packet id; the inner `Routing.variant`
+    // carries success or a typed failure. We only emit the AckOrNak
+    // event — these don't surface as IncomingText/IncomingData since
+    // they're protocol control, not application payload.
+    if portnum == PortNum::RoutingApp as i32 {
+        if data.request_id == 0 {
+            // Not an ack/nak — could be a route_request / route_reply.
+            return;
+        }
+        let result = match Routing::decode(payload.as_slice()) {
+            Ok(r) => match r.variant {
+                Some(routing::Variant::ErrorReason(e)) => match routing::Error::try_from(e) {
+                    Ok(routing::Error::None) => AckResult::Delivered,
+                    Ok(err) => AckResult::Failed(err),
+                    // Unknown enum value from a newer firmware: treat as
+                    // failed but with a generic NoRoute so callers see a
+                    // non-Delivered result. Better than dropping silently.
+                    Err(_) => AckResult::Failed(routing::Error::NoRoute),
+                },
+                // RouteDiscovery responses, not delivery acks. Ignore.
+                _ => return,
+            },
+            Err(e) => {
+                warn!(
+                    request_id = data.request_id,
+                    error = %e,
+                    "malformed Routing payload on ROUTING_APP; dropping",
+                );
+                return;
+            }
+        };
+        out.push(InboundEvent::AckOrNak {
+            request_id: data.request_id,
+            result,
+        });
         return;
     }
     if portnum == PortNum::TextMessageApp as i32 {
@@ -289,6 +360,66 @@ fn decode_packet(pkt: MeshPacket, out: &mut Vec<InboundEvent>) {
         payload,
         rx_time: pkt.rx_time,
     }));
+}
+
+/// Attempt to PKC-decrypt an `Encrypted` `MeshPacket` whose `to` is us.
+/// Returns the recovered `meshtastic.Data` on success, or `None` if the
+/// packet isn't actually a PKC DM addressed to us, we lack key material,
+/// or the decrypt / inner-protobuf-decode fails. Never panics; never logs
+/// the keys themselves.
+fn try_pkc_decrypt(
+    from: u32,
+    to: u32,
+    id: u32,
+    channel: u32,
+    ciphertext: &[u8],
+    ctx: &InboundCtx,
+) -> Option<Data> {
+    let my = ctx.my_node_num?;
+    if to != my {
+        // Overheard PKC DM between other nodes — we don't have the
+        // recipient's private key and couldn't decrypt even if we tried.
+        // Demoted to trace (was a noisy debug previously).
+        tracing::trace!(
+            from,
+            to,
+            channel,
+            len = ciphertext.len(),
+            "drop encrypted MeshPacket: not addressed to us",
+        );
+        return None;
+    }
+    let our_private = ctx.our_private_key?;
+    let peer_user = ctx.nodes.get(&from).and_then(|n| n.user.as_ref())?;
+    if peer_user.public_key.len() != 32 {
+        // Either PKC disabled on the sender's side, or we haven't seen
+        // their `NodeInfo` yet. Either way nothing the host can do.
+        tracing::debug!(
+            from,
+            "drop PKC DM to us: sender public_key unknown (size={})",
+            peer_user.public_key.len(),
+        );
+        return None;
+    }
+    let mut peer_public = [0u8; 32];
+    peer_public.copy_from_slice(&peer_user.public_key);
+
+    let plaintext = pkc::decrypt(our_private, &peer_public, from, id, ciphertext)?;
+    match Data::decode(plaintext.as_slice()) {
+        Ok(d) => {
+            tracing::debug!(from, id, portnum = d.portnum, "host-decrypted PKC DM",);
+            Some(d)
+        }
+        Err(e) => {
+            tracing::debug!(
+                from,
+                id,
+                error = %e,
+                "PKC decrypt succeeded but inner Data decode failed",
+            );
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +590,13 @@ pub struct ProtocolState {
     pub bluetooth: Option<BluetoothConfig>,
     pub channels: Vec<Channel>,
     pub metadata: Option<DeviceMetadata>,
+    /// Our X25519 private key, captured from `Config::Security`. Held as
+    /// a raw 32-byte array rather than the full `SecurityConfig` proto
+    /// because it must not leak into any of the public watch channels.
+    /// Inbound-only: the desktop client never sends PKC DMs, so this is
+    /// read by [`super::super::pkc::decrypt`] via [`InboundCtx`] and
+    /// nowhere else.
+    our_private_key: Option<[u8; 32]>,
 }
 
 impl ProtocolState {
@@ -479,7 +617,8 @@ impl ProtocolState {
             | InboundEvent::IncomingText(_)
             | InboundEvent::IncomingData(_)
             | InboundEvent::Voice(_)
-            | InboundEvent::QueueStatus(_) => {}
+            | InboundEvent::QueueStatus(_)
+            | InboundEvent::AckOrNak { .. } => {}
         }
     }
 
@@ -492,8 +631,30 @@ impl ProtocolState {
             config::PayloadVariant::Network(c) => self.network = Some(c),
             config::PayloadVariant::Display(c) => self.display = Some(c),
             config::PayloadVariant::Bluetooth(c) => self.bluetooth = Some(c),
+            config::PayloadVariant::Security(c) => {
+                self.our_private_key = match c.private_key.len() {
+                    32 => {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(&c.private_key);
+                        Some(k)
+                    }
+                    // PKC disabled on this device, or firmware didn't
+                    // populate the field — clear any stale key from a
+                    // previous connection. Length-0 is the normal "no
+                    // PKC" signal; other non-32 lengths shouldn't occur
+                    // on real firmware.
+                    _ => None,
+                };
+            }
             _ => {}
         }
+    }
+
+    /// Our X25519 private key snapshot. Available to driver-internal code
+    /// for building an [`InboundCtx`]; intentionally not part of the
+    /// public watch-channel surface.
+    pub(in crate::meshtastic) fn our_private_key(&self) -> Option<&[u8; 32]> {
+        self.our_private_key.as_ref()
     }
 
     /// Insert or replace a channel, keeping the list sorted by index.
@@ -507,7 +668,9 @@ impl ProtocolState {
     }
 
     /// Reset the config sections + channel list (but not identity/nodes), as
-    /// done when re-requesting the config burst.
+    /// done when re-requesting the config burst. The PKC private key is
+    /// part of the config burst (`Config::Security`) so it goes too — a
+    /// fresh burst will reseed it if the device has PKC enabled.
     pub fn clear_config(&mut self) {
         self.lora = None;
         self.device = None;
@@ -517,6 +680,7 @@ impl ProtocolState {
         self.display = None;
         self.bluetooth = None;
         self.channels.clear();
+        self.our_private_key = None;
     }
 }
 
@@ -526,6 +690,17 @@ mod tests {
     //! pulling the decode logic out into a sans-IO function.
     use super::*;
     use crate::proto::{Position, from_radio};
+
+    /// Build an `InboundCtx` for a test that doesn't exercise the PKC
+    /// decrypt path. The caller's `nodes` HashMap must live at least as
+    /// long as the returned context.
+    fn ctx<'a>(my_node_num: Option<u32>, nodes: &'a HashMap<u32, NodeInfo>) -> InboundCtx<'a> {
+        InboundCtx {
+            my_node_num,
+            our_private_key: None,
+            nodes,
+        }
+    }
 
     fn encode(variant: from_radio::PayloadVariant) -> Vec<u8> {
         let msg = FromRadio {
@@ -543,7 +718,8 @@ mod tests {
             my_node_num: 0x1234_5678,
             ..Default::default()
         }));
-        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(None, &nodes)).unwrap();
         assert!(matches!(
             ev.as_slice(),
             [InboundEvent::MyInfo(i)] if i.my_node_num == 0x1234_5678
@@ -561,17 +737,12 @@ mod tests {
             ..Default::default()
         };
         let bytes = encode(from_radio::PayloadVariant::NodeInfo(ni));
+        let nodes = HashMap::new();
         // Without my_node_num: just the NodeInfo event.
-        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        let ev = decode_inbound(&bytes, &ctx(None, &nodes)).unwrap();
         assert!(matches!(ev.as_slice(), [InboundEvent::NodeInfo(_)]));
         // When it's our own node: Owner is emitted before NodeInfo.
-        let ev = decode_inbound(
-            &bytes,
-            &InboundCtx {
-                my_node_num: Some(7),
-            },
-        )
-        .unwrap();
+        let ev = decode_inbound(&bytes, &ctx(Some(7), &nodes)).unwrap();
         assert!(matches!(
             ev.as_slice(),
             [InboundEvent::Owner(u), InboundEvent::NodeInfo(_)] if u.long_name == "me"
@@ -677,10 +848,231 @@ mod tests {
             ..Default::default()
         };
         let bytes = encode(from_radio::PayloadVariant::NodeInfo(ni));
-        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(None, &nodes)).unwrap();
         let [InboundEvent::NodeInfo(ni)] = ev.as_slice() else {
             panic!("expected NodeInfo");
         };
         assert_eq!(ni.position.as_ref().unwrap().latitude_i, None);
+    }
+
+    /// End-to-end PKC integration test: build a `MeshPacket::Encrypted`
+    /// using the firmware's documented test vector, hand it through
+    /// `decode_inbound`, and confirm the decrypted `Data` reaches the
+    /// `IncomingText` event with the right payload. Locks down both the
+    /// inner decrypt and the protocol-level plumbing in one go.
+    #[test]
+    fn host_decrypts_pkc_dm_to_us() {
+        let our_node_num = 0xfeed_face;
+        let sender = 0x0929;
+        let packet_id = 0x13b2_d662_u32;
+        // Firmware crypto test vector (test_PKC in
+        // firmware/test/test_crypto/test_main.cpp): our private key + the
+        // sender's public key + the firmware-encrypted ciphertext.
+        let our_private = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(
+                &hex::decode("a00330633e63522f8a4d81ec6d9d1e6617f6c8ffd3a4c698229537d44e522277")
+                    .unwrap(),
+            );
+            k
+        };
+        let peer_public =
+            hex::decode("db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457")
+                .unwrap();
+        let ciphertext_and_trailer =
+            hex::decode("40df24abfcc30a17a3d9046726099e796a1c036a792b").unwrap();
+        // The 10-byte plaintext is a `meshtastic.Data` proto: portnum=1
+        // (TEXT_MESSAGE_APP), payload="test", want_response=false.
+        // (08 01 12 04 "test" 48 00)
+
+        // Stand up a nodes table that says "we have the sender's public key".
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            sender,
+            NodeInfo {
+                num: sender,
+                user: Some(User {
+                    public_key: peer_public,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let pkt = MeshPacket {
+            from: sender,
+            to: our_node_num,
+            id: packet_id,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Encrypted(
+                ciphertext_and_trailer,
+            )),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+
+        let cx = InboundCtx {
+            my_node_num: Some(our_node_num),
+            our_private_key: Some(&our_private),
+            nodes: &nodes,
+        };
+        let ev = decode_inbound(&bytes, &cx).unwrap();
+
+        // Should produce IncomingText (text channel app) + the generic
+        // IncomingData broadcast. We don't assert on order beyond
+        // "IncomingText is present somewhere", since `decode_packet`
+        // emits both for portnum=TEXT_MESSAGE_APP.
+        let text = ev.iter().find_map(|e| match e {
+            InboundEvent::IncomingText(t) => Some(t),
+            _ => None,
+        });
+        let text = text.expect("expected IncomingText after host-side PKC decrypt");
+        assert_eq!(text.text, "test");
+        assert_eq!(text.channel, 0);
+    }
+
+    /// Encrypted packet not addressed to us → dropped without an attempt.
+    /// This covers the overheard-PKC-DM case (which dominates real-world
+    /// traffic) and ensures we don't even try to decrypt without our
+    /// node number matching.
+    #[test]
+    fn encrypted_not_to_us_is_dropped() {
+        let pkt = MeshPacket {
+            from: 1,
+            to: 2,
+            id: 42,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Encrypted(vec![0u8; 30])),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(Some(0xdead), &nodes)).unwrap();
+        assert!(
+            ev.is_empty(),
+            "encrypted packet to others must not emit events"
+        );
+    }
+
+    /// Inbound `Routing` packet with `error_reason = NONE` and a matching
+    /// `request_id` should surface as `InboundEvent::AckOrNak` carrying
+    /// `AckResult::Delivered`. Locks down the wire-format contract with
+    /// the firmware's `RoutingModule::sendAckNak` path.
+    #[test]
+    fn routing_app_packet_emits_delivered_ack() {
+        use crate::meshtastic::ack::AckResult;
+        use crate::ports::ROUTING_APP;
+
+        let request_id = 0xdead_beef_u32;
+        // Build the inner `Routing` proto with `ErrorReason(None)`.
+        let routing_payload = Routing {
+            variant: Some(routing::Variant::ErrorReason(routing::Error::None as i32)),
+        };
+        let mut buf = Vec::with_capacity(routing_payload.encoded_len());
+        routing_payload.encode(&mut buf).unwrap();
+
+        let pkt = MeshPacket {
+            from: 7,
+            to: 0xfeed_face,
+            id: 1,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(crate::proto::Data {
+                portnum: ROUTING_APP as i32,
+                payload: buf,
+                request_id,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(Some(0xfeed_face), &nodes)).unwrap();
+        let ack = ev
+            .iter()
+            .find_map(|e| match e {
+                InboundEvent::AckOrNak { request_id, result } => Some((*request_id, *result)),
+                _ => None,
+            })
+            .expect("expected AckOrNak event");
+        assert_eq!(ack, (request_id, AckResult::Delivered));
+    }
+
+    /// Inbound `Routing` packet with a typed error surfaces as
+    /// `AckResult::Failed(err)`. Picks `MaxRetransmit` since that's the
+    /// common failure on slow LoRa presets.
+    #[test]
+    fn routing_app_packet_emits_failed_ack() {
+        use crate::meshtastic::ack::AckResult;
+        use crate::ports::ROUTING_APP;
+
+        let request_id = 12345_u32;
+        let routing_payload = Routing {
+            variant: Some(routing::Variant::ErrorReason(
+                routing::Error::MaxRetransmit as i32,
+            )),
+        };
+        let mut buf = Vec::with_capacity(routing_payload.encoded_len());
+        routing_payload.encode(&mut buf).unwrap();
+
+        let pkt = MeshPacket {
+            from: 8,
+            to: 0xfeed_face,
+            id: 99,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(crate::proto::Data {
+                portnum: ROUTING_APP as i32,
+                payload: buf,
+                request_id,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(Some(0xfeed_face), &nodes)).unwrap();
+        let ack = ev
+            .iter()
+            .find_map(|e| match e {
+                InboundEvent::AckOrNak { request_id, result } => Some((*request_id, *result)),
+                _ => None,
+            })
+            .expect("expected AckOrNak event");
+        assert_eq!(
+            ack,
+            (request_id, AckResult::Failed(routing::Error::MaxRetransmit)),
+        );
+    }
+
+    /// Routing packets carrying RouteDiscovery (not an ack) shouldn't
+    /// surface as AckOrNak — those are mesh-routing control messages,
+    /// not delivery reports. Likewise, packets without a `request_id`
+    /// aren't acking anything specific.
+    #[test]
+    fn routing_app_route_discovery_does_not_emit_ack() {
+        use crate::ports::ROUTING_APP;
+
+        // request_id = 0 → not an ack/nak for any of our packets.
+        let routing_payload = Routing {
+            variant: Some(routing::Variant::ErrorReason(routing::Error::None as i32)),
+        };
+        let mut buf = Vec::with_capacity(routing_payload.encoded_len());
+        routing_payload.encode(&mut buf).unwrap();
+        let pkt = MeshPacket {
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(crate::proto::Data {
+                portnum: ROUTING_APP as i32,
+                payload: buf,
+                request_id: 0,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+        let nodes = HashMap::new();
+        let ev = decode_inbound(&bytes, &ctx(Some(1), &nodes)).unwrap();
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, InboundEvent::AckOrNak { .. })),
+            "request_id=0 must not produce an AckOrNak event",
+        );
     }
 }

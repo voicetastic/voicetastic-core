@@ -28,8 +28,9 @@
 //! compiler, and the wire format is the contract anyway.
 
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use prost::Message as _;
 use tokio::sync::mpsc;
@@ -286,7 +287,7 @@ pub trait MeshConfigListener: Send + Sync {
 /// `Disconnected`.
 pub struct MeshTransportSink {
     /// `None` after `shutdown()`; `Some` while inbound is live.
-    sender: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
+    sender: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
 }
 
 impl MeshTransportSink {
@@ -295,7 +296,7 @@ impl MeshTransportSink {
         // closed: blocking the JVM caller would risk an ANR, and the only
         // recoverable cause of a full queue is the inbound task being
         // permanently stalled (in which case we already lost the session).
-        if let Some(tx) = self.sender.lock().expect("sink mutex").as_ref()
+        if let Some(tx) = self.sender.lock().as_ref()
             && let Err(e) = tx.try_send(frame)
         {
             warn!(?e, "inbound sink full or closed; dropping frame");
@@ -303,7 +304,7 @@ impl MeshTransportSink {
     }
 
     pub fn shutdown(&self) {
-        self.sender.lock().expect("sink mutex").take();
+        self.sender.lock().take();
     }
 }
 
@@ -426,7 +427,7 @@ impl Drop for ListenerHandles {
 /// UniFFI-exposed Meshtastic service. One instance per Android process.
 pub struct MeshService {
     core: CoreMeshService,
-    listeners: StdMutex<ListenerHandles>,
+    listeners: Mutex<ListenerHandles>,
     /// Lazily-constructed shared outbound voice pipeline. First call
     /// to `voice_sender()` builds it and spawns its NACK-listener task;
     /// later calls return the same handle.
@@ -441,7 +442,7 @@ impl MeshService {
         let core = runtime().block_on(CoreMeshService::new())?;
         Ok(Self {
             core,
-            listeners: StdMutex::new(ListenerHandles::default()),
+            listeners: Mutex::new(ListenerHandles::default()),
             voice_sender: std::sync::OnceLock::new(),
         })
     }
@@ -458,7 +459,7 @@ impl MeshService {
     ) -> Result<Arc<MeshTransportSink>, MeshServiceError> {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(INBOUND_CHANNEL_CAPACITY);
         let sink = Arc::new(MeshTransportSink {
-            sender: StdMutex::new(Some(tx)),
+            sender: Mutex::new(Some(tx)),
         });
         let adapter = Arc::new(ForeignTransportAdapter { inner: transport }) as Arc<dyn Transport>;
         let svc = self.core.clone();
@@ -574,7 +575,7 @@ impl MeshService {
                 listener.on_state(s);
             }
         });
-        self.listeners.lock().unwrap().replace_state(handle);
+        self.listeners.lock().replace_state(handle);
     }
 
     pub fn set_text_listener(&self, listener: Arc<dyn MeshTextListener>) {
@@ -590,7 +591,7 @@ impl MeshService {
                 }
             }
         });
-        self.listeners.lock().unwrap().replace_text(handle);
+        self.listeners.lock().replace_text(handle);
     }
 
     pub fn set_data_listener(&self, listener: Arc<dyn MeshDataListener>) {
@@ -606,7 +607,7 @@ impl MeshService {
                 }
             }
         });
-        self.listeners.lock().unwrap().replace_data(handle);
+        self.listeners.lock().replace_data(handle);
     }
 
     pub fn set_queue_listener(&self, listener: Arc<dyn MeshQueueListener>) {
@@ -622,7 +623,7 @@ impl MeshService {
                 }
             }
         });
-        self.listeners.lock().unwrap().replace_queue(handle);
+        self.listeners.lock().replace_queue(handle);
     }
 
     pub fn set_config_listener(&self, listener: Arc<dyn MeshConfigListener>) {
@@ -785,7 +786,7 @@ impl MeshService {
                 }
             }
         });
-        self.listeners.lock().unwrap().replace_config(handle);
+        self.listeners.lock().replace_config(handle);
     }
 
     /// Return the shared [`crate::VoiceSender`] bound to this service.
@@ -874,25 +875,24 @@ pub fn node_id_to_num(id: String) -> Option<u32> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex as StdMutex, Mutex};
 
     /// Test-only [`MeshTransport`] that captures everything Rust writes
     /// and lets the test simulate inbound frames via the returned sink.
     struct LoopbackTransport {
-        writes: StdMutex<Vec<Vec<u8>>>,
+        writes: Mutex<Vec<Vec<u8>>>,
         closed: AtomicUsize,
     }
     impl LoopbackTransport {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                writes: StdMutex::new(Vec::new()),
+                writes: Mutex::new(Vec::new()),
                 closed: AtomicUsize::new(0),
             })
         }
     }
     impl MeshTransport for LoopbackTransport {
         fn write_to_radio(&self, bytes: Vec<u8>) {
-            self.writes.lock().unwrap().push(bytes);
+            self.writes.lock().push(bytes);
         }
         fn shutdown(&self) {
             self.closed.fetch_add(1, Ordering::SeqCst);
@@ -902,7 +902,7 @@ mod tests {
     struct StateRecorder(Mutex<Vec<MeshConnectionState>>);
     impl MeshStateListener for StateRecorder {
         fn on_state(&self, state: MeshConnectionState) {
-            self.0.lock().unwrap().push(state);
+            self.0.lock().push(state);
         }
     }
 
@@ -917,7 +917,7 @@ mod tests {
         // settle_delay == 0; with the spawn_blocking hop the write should
         // be observable within a short bounded wait.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while transport.writes.lock().unwrap().is_empty() {
+        while transport.writes.lock().is_empty() {
             if std::time::Instant::now() > deadline {
                 panic!("transport never received WantConfigId");
             }
@@ -936,7 +936,7 @@ mod tests {
         let recorder = Arc::new(StateRecorder(Mutex::new(Vec::new())));
         svc.set_state_listener(recorder.clone() as Arc<dyn MeshStateListener>);
         // The synchronous initial push should already be visible.
-        let states = recorder.0.lock().unwrap().clone();
+        let states = recorder.0.lock().clone();
         assert_eq!(states, vec![MeshConnectionState::Disconnected]);
     }
 

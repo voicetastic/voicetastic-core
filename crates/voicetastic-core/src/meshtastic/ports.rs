@@ -8,6 +8,11 @@ pub const TEXT_MESSAGE_APP: u32 = 1;
 pub const POSITION_APP: u32 = 3;
 /// Node info beacons (read-only).
 pub const NODEINFO_APP: u32 = 4;
+/// Routing / ACK / NACK control packets. The firmware sends an inbound
+/// `meshtastic.Routing` packet on this portnum for every `want_ack`
+/// outbound packet, with `request_id` set to the original packet's id
+/// and the inner `Routing.variant` carrying success or a typed error.
+pub const ROUTING_APP: u32 = 5;
 /// Config / channel / owner writes & device actions.
 pub const ADMIN_APP: u32 = 6;
 /// Voice chunks. See [`crate::voice`].

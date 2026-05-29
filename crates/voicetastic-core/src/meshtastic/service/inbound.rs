@@ -15,10 +15,25 @@ use super::{ConnectionState, MeshtasticService};
 
 impl MeshtasticService {
     pub(super) async fn handle_from_radio(&self, bytes: &[u8]) -> Result<()> {
-        let ctx = InboundCtx {
-            my_node_num: self.my_node_num(),
+        // Snapshot the bits of canonical state the decoder needs. Held
+        // briefly across `decode_inbound` (which is sync / sans-IO and
+        // never awaits); released before `apply_inbound`, which itself
+        // re-acquires the same lock to mutate.
+        //
+        // We read `my_node_num` from the locked snapshot rather than
+        // calling `self.my_node_num()` — that helper takes the same
+        // mutex, and `parking_lot::Mutex` is not reentrant (would
+        // deadlock silently).
+        let events = {
+            let state = self.inner.state.lock();
+            let ctx = InboundCtx {
+                my_node_num: state.my_info.as_ref().map(|i| i.my_node_num),
+                our_private_key: state.our_private_key(),
+                nodes: &state.nodes,
+            };
+            decode_inbound(bytes, &ctx)?
         };
-        for event in decode_inbound(bytes, &ctx)? {
+        for event in events {
             self.apply_inbound(event);
         }
         Ok(())
@@ -119,6 +134,9 @@ impl MeshtasticService {
                 // check-then-wait race. See voice_tx.rs for the full rationale.
                 self.inner.radio_queue_notify.notify_one();
                 let _ = self.inner.queue_status_tx.send(qs);
+            }
+            InboundEvent::AckOrNak { request_id, result } => {
+                self.signal_ack(request_id, result);
             }
             // is_snapshot() routed these above.
             _ => unreachable!("snapshot event in transient branch"),

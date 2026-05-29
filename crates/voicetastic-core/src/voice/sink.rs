@@ -1,8 +1,8 @@
-//! Voice frame transmission interface, decoupled from any concrete radio service.
+//! Voice frame transmission interface.
 //!
 //! `VoiceFrameSink` is the minimal interface `VoiceSender` needs to do its job:
-//! enqueue frames and listen for NACK packets. This lets `VoiceSender` work with
-//! any radio service (Meshtastic, Meshcore, etc.) without depending on its concrete type.
+//! enqueue frames and listen for inbound NACK packets. It exists so the
+//! sender doesn't have to name a concrete service type.
 
 use std::time::Duration;
 
@@ -11,14 +11,13 @@ use tokio::sync::broadcast;
 
 use crate::Result;
 use crate::node::NodeId;
-use crate::radio_service::VoiceData;
 use crate::voice::consts::MAX_BODY_SIZE;
+use crate::voice::types::VoiceData;
 
 /// Minimal interface for voice frame transmission.
 ///
 /// `VoiceSender` uses this to send bursts and retransmits, and to subscribe to
-/// inbound NACK packets. Both `MeshtasticService` and future protocol impls will
-/// implement this.
+/// inbound NACK packets.
 #[async_trait]
 pub trait VoiceFrameSink: Send + Sync {
     /// Enqueue a voice frame for transmission. The service handles protocol-specific
