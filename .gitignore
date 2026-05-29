@@ -5,7 +5,9 @@ Cargo.lock.bak
 .idea/
 *.swp
 .DS_Store
-.cargo/
+.cargo/*
+# but track the wasm32 build cfg (getrandom_backend) needed for browser builds
+!.cargo/config.toml
 target-android/
 .github/copilot-instructions.md
 .github/hooks/

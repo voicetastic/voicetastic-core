@@ -7,22 +7,17 @@ use prost::Message as _;
 use tracing::debug;
 
 use crate::error::{Error, Result};
-use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, TEXT_MESSAGE_APP};
-use crate::proto::{
-    AdminMessage, Channel, Config, Data, MeshPacket, Position, ToRadio, User, admin_message,
-    config, mesh_packet, to_radio,
-};
+use crate::proto::{Channel, Config, Position, ToRadio, User, admin_message, config, to_radio};
 
-use super::MeshtasticService;
 use super::types::rand_u32;
+use super::{MeshtasticService, protocol};
 use crate::transport::Transport;
 
 impl MeshtasticService {
     pub(super) async fn send_want_config(&self) -> Result<()> {
         let nonce: u32 = rand_u32()?;
         debug!(nonce, "sending want_config_id");
-        self.send_to_radio(to_radio::PayloadVariant::WantConfigId(nonce))
-            .await
+        self.send_to_radio(protocol::want_config(nonce)).await
     }
 
     /// Send a UTF-8 text message. `to` defaults to [`BROADCAST_ADDR`].
@@ -30,32 +25,10 @@ impl MeshtasticService {
     /// `want_ack` is enabled only for direct messages; broadcasts are sent
     /// without ACK requests (the firmware would drop them anyway).
     pub async fn send_text(&self, text: &str, channel: u32, to: Option<u32>) -> Result<u32> {
-        // Meshtastic firmware rejects oversized text payloads; fail fast with
-        // a clear error rather than letting the radio silently drop it.
-        if text.len() > MAX_TEXT_BYTES {
-            return Err(Error::Other(format!(
-                "text payload too large: {} > {MAX_TEXT_BYTES} bytes",
-                text.len()
-            )));
-        }
+        // The oversized-payload check (firmware rejects them) lives in
+        // `protocol::text_packet`, so the limit is enforced in one place.
         let id = self.next_id();
-        let want_ack = to.is_some();
-        let pkt = MeshPacket {
-            from: 0,
-            to: to.unwrap_or(BROADCAST_ADDR),
-            channel,
-            id,
-            want_ack,
-            hop_limit: 3,
-            priority: mesh_packet::Priority::Default as i32,
-            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
-                portnum: TEXT_MESSAGE_APP as i32,
-                payload: text.as_bytes().to_vec(),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_to_radio(to_radio::PayloadVariant::Packet(pkt))
+        self.send_to_radio(protocol::text_packet(id, text, channel, to)?)
             .await?;
         Ok(id)
     }
@@ -76,24 +49,16 @@ impl MeshtasticService {
         want_response: bool,
     ) -> Result<u32> {
         let id = self.next_id();
-        let pkt = MeshPacket {
-            from: 0,
-            to: to.unwrap_or(BROADCAST_ADDR),
-            channel,
+        self.send_to_radio(protocol::data_packet(
             id,
+            portnum,
+            payload,
+            channel,
+            to,
             want_ack,
-            hop_limit: 3,
-            priority: mesh_packet::Priority::Default as i32,
-            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
-                portnum,
-                payload,
-                want_response,
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_to_radio(to_radio::PayloadVariant::Packet(pkt))
-            .await?;
+            want_response,
+        ))
+        .await?;
         Ok(id)
     }
 
@@ -157,30 +122,8 @@ impl MeshtasticService {
     /// update.
     pub async fn send_admin(&self, payload: admin_message::PayloadVariant) -> Result<u32> {
         let to = self.my_node_num().ok_or(Error::NotConnected)?;
-        let admin = AdminMessage {
-            payload_variant: Some(payload),
-            ..Default::default()
-        };
-        let mut bytes = Vec::with_capacity(admin.encoded_len());
-        admin.encode(&mut bytes)?;
         let id = self.next_id();
-        let pkt = MeshPacket {
-            from: 0,
-            to,
-            channel: 0,
-            id,
-            want_ack: true,
-            hop_limit: 0,
-            priority: mesh_packet::Priority::Reliable as i32,
-            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
-                portnum: ADMIN_APP as i32,
-                payload: bytes,
-                want_response: false,
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        self.send_to_radio(to_radio::PayloadVariant::Packet(pkt))
+        self.send_to_radio(protocol::admin_packet(id, to, payload)?)
             .await?;
         Ok(id)
     }

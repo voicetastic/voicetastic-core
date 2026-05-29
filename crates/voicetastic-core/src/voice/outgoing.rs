@@ -39,7 +39,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -256,6 +258,17 @@ impl OutgoingVoiceRegistry {
     /// Drop the entry for `message_id`. Idempotent.
     pub fn remove(&self, message_id: u32) {
         self.inner.lock().remove(&message_id);
+    }
+
+    /// Per-message metadata needed to ship retransmits: `(channel, dest,
+    /// total_data)`. `channel` and `dest` reproduce the original send's
+    /// addressing; `total_data` lets the driver gate per-chunk bookkeeping
+    /// (only DATA indices `< total_data` are tracked in `pending_chunks`).
+    pub fn meta(&self, message_id: u32) -> Option<(u32, Option<u32>, u8)> {
+        self.inner
+            .lock()
+            .get(&message_id)
+            .map(|e| (e.channel, e.dest, e.total_data))
     }
 
     /// Prune entries that have exceeded the TTL. Called opportunistically

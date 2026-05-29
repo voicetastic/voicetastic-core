@@ -1,0 +1,6 @@
+# Browser builds of voicetastic-core target wasm32-unknown-unknown.
+# getrandom 0.4 needs this cfg to select its JS-backed RNG backend
+# (paired with the `wasm_js` feature enabled for the wasm32 target in
+# voicetastic-core/Cargo.toml).
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

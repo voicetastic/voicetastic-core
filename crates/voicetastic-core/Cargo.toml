@@ -8,7 +8,6 @@ repository.workspace = true
 description = "Shared core library for voicetastic-desktop: BLE transport, Meshtastic protobuf I/O, voice protocol."
 
 [dependencies]
-tokio = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -22,6 +21,7 @@ toml = { workspace = true }
 getrandom = { workspace = true }
 reed-solomon-erasure = { workspace = true }
 sha2 = { workspace = true }
+web-time = { workspace = true }
 
 # Optional desktop transports. Off-by-default for Android / embedded
 # consumers that supply their own `Transport` implementation.
@@ -32,10 +32,51 @@ tokio-serial = { workspace = true, optional = true }
 # Optional codec support
 opus = { workspace = true, optional = true }
 codec2 = { workspace = true, optional = true }
+opus-decoder = { workspace = true, optional = true }
+# Bindings to the emscripten-built standalone AMR-NB wasm. Only meaningful on
+# wasm32 (the build script in `opencore-amrnb` itself no-ops on native),
+# and the `amrnb_wasm` module that uses it is also wasm32-gated.
+wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen-futures = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+# Sibling repo (`github.com/voicetastic/opencore-amrnb`) carrying the
+# vendored opencore-amr-nb + emscripten build script. Local checkouts use the
+# adjacent path; swap to a pinned git dep or a crates.io version for CI /
+# shipping. The crate only does work on wasm32 (native builds are a no-op),
+# so this dep is wasm32-free of charge on desktop / Android.
+opencore-amrnb = { git = "https://github.com/voicetastic/opencore-amrnb.git", tag = "v0.1.6", optional = true }
+# For local development against an adjacent checkout, swap the line above for:
+#   opencore-amrnb = { path = "../../../opencore-amrnb", optional = true }
+
+# Sibling repo (`github.com/voicetastic/libopus`) carrying the vendored
+# libopus + emscripten build script (FIXED_POINT, DISABLE_FLOAT_API).
+# Wasm-only — native builds are a no-op, so this dep is free of charge
+# on desktop / Android.
+libopus = { git = "https://github.com/voicetastic/libopus.git", tag = "v1.5.2", optional = true }
+# For local development against an adjacent checkout, swap the line above for:
+#   libopus = { path = "../../../libopus", optional = true }
 
 # Optional RNNoise-based denoiser, runs on 48 kHz mono f32 frames just
 # before `Encoder::push`. Pure Rust — adds no native deps.
 nnnoiseless = { workspace = true, optional = true }
+
+# tokio is split per-target: native builds get the full workspace feature set
+# (rt-multi-thread, fs, signal, mio-backed net). wasm32 has no threads/mio, so
+# it gets a current-thread runtime trimmed to the features the protocol layer
+# actually uses. Keep the version in sync with the workspace pin (1.52).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.52", default-features = false, features = ["sync", "macros", "rt", "time", "io-util"] }
+# Browser RNG backend. Also requires the build cfg
+# `getrandom_backend="wasm_js"` (set in .cargo/config.toml).
+getrandom = { version = "0.4.2", features = ["wasm_js"] }
+# `reed-solomon-erasure` pulls old `parking_lot 0.11` -> `instant 0.1`. Without
+# this feature, `instant` emits a bare `env.now` import that the browser can't
+# resolve. Enabling `wasm-bindgen` routes it through Date.now() via js-sys.
+# (Direct dep so cargo unifies the feature on the transitive `instant`.)
+instant = { version = "0.1", features = ["wasm-bindgen"] }
 
 # Linux-only DBus client for the in-process BlueZ pairing agent. Always
 # compiled on Linux (no opt-in needed); the `pairing` module is also gated
@@ -52,9 +93,41 @@ default = ["ble-btleplug", "serial-tokio"]
 ble-btleplug = ["dep:btleplug", "dep:uuid"]
 # USB-serial transport via `tokio-serial` (Unix termios / Win32 COM ports).
 serial-tokio = ["dep:tokio-serial"]
-# Codec encode/decode for Opus, Codec2, and AMR-NB. Enabled by GUI's `audio`
-# feature; not enabled by default so headless/embedded consumers stay lean.
-codecs = ["dep:opus", "dep:codec2"]
+# Full codec encode/decode for Opus, Codec2, and AMR-NB (the native streaming
+# `Encoder`/`decode`). Enabled by GUI's `audio` feature; not on by default so
+# headless/embedded consumers stay lean. Pulls Opus's C/CMake deps, so it does
+# NOT build for wasm — wasm consumers use `codec2` instead (below).
+codecs = ["codec2", "dep:opus"]
+# Codec2 only: the pure-Rust `codec2` crate plus the one-shot
+# `codec2_encode`/`codec2_decode` helpers. Builds for wasm32 (no C deps), so the
+# browser client gets Codec2 from core instead of reimplementing it.
+codec2 = ["dep:codec2"]
+# Opus decode-only via the pure-Rust `opus-decoder` crate (no encode — that's
+# audiopus's native-only path). Builds for wasm32, so the browser client can
+# play back Opus voice messages from desktop/Android.
+opus-decode = ["dep:opus-decoder"]
+# AMR-NB encode/decode in the browser via the standalone wasm artifact built
+# by `opencore-amrnb` (vendored opencore-amr → emscripten). Only useful
+# on wasm32 — the module is target-arch-gated. Pulls wasm-bindgen for the
+# JS-shim extern block.
+amrnb-wasm = [
+    "dep:opencore-amrnb",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+]
+# Opus encode + decode in the browser via the standalone wasm artifact built
+# by `libopus` (vendored libopus → emscripten, FIXED_POINT,
+# DISABLE_FLOAT_API). Only useful on wasm32 — the module is target-arch-gated.
+# Supersedes `opus-decode` (pure-Rust decode-only) by adding encode and
+# matching the native bit-exact behaviour. Pulls wasm-bindgen for the
+# JS-shim extern block.
+opus-wasm = [
+    "dep:libopus",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+]
 # RNNoise-based capture-side noise suppression. Pulled in by the GUI's
 # `audio` feature so the runtime toggle in voice settings actually denoises;
 # without it, the toggle is a no-op (the Denoiser type is still present).

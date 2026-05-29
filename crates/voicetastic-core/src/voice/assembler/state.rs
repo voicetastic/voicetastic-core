@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 use reed_solomon_erasure::galois_8::ReedSolomon;
 

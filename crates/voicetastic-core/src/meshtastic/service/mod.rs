@@ -12,6 +12,7 @@
 
 mod inbound;
 mod outbound;
+pub mod protocol;
 mod types;
 mod voice_tx;
 
@@ -92,6 +93,10 @@ struct Inner {
     /// disconnect site. Defaults to [`usize::MAX`] so the absence of a
     /// transport doesn't artificially throttle chunk sizing in tests.
     transport_max_tx_payload: AtomicUsize,
+    /// Canonical device config/identity snapshot (sans-IO). The watch
+    /// channels below mirror it for the subscriber API; this is the single
+    /// source of truth, and the one a non-tokio (browser) driver would read.
+    state: parking_lot::Mutex<protocol::ProtocolState>,
     state_tx: watch::Sender<ConnectionState>,
     /// Mirror of `state_tx` in the protocol-agnostic [`RadioConnectionState`]
     /// type. A single forwarder task (spawned in [`MeshtasticService::new`])
@@ -193,6 +198,7 @@ impl MeshtasticService {
             ble: tokio::sync::OnceCell::new(),
             transport: Mutex::new(None),
             transport_max_tx_payload: AtomicUsize::new(usize::MAX),
+            state: parking_lot::Mutex::new(protocol::ProtocolState::default()),
             state_tx,
             radio_state_tx,
             my_info_tx,
@@ -261,13 +267,15 @@ impl MeshtasticService {
                     let Some(SerialReconnectConfig { path, baud }) = cfg else {
                         continue;
                     };
-                    let svc = MeshtasticService { inner };
                     #[cfg(feature = "serial-tokio")]
-                    if let Err(e) = svc.connect_by_serial_baud(&path, baud).await {
-                        warn!(?e, "auto-reconnect failed");
+                    {
+                        let svc = MeshtasticService { inner };
+                        if let Err(e) = svc.connect_by_serial_baud(&path, baud).await {
+                            warn!(?e, "auto-reconnect failed");
+                        }
                     }
                     #[cfg(not(feature = "serial-tokio"))]
-                    let _ = (path, baud);
+                    let _ = (inner, path, baud);
                 }
             });
         }
@@ -359,8 +367,9 @@ impl MeshtasticService {
     /// Local node number, if known. Required as `to=` for admin writes.
     pub fn my_node_num(&self) -> Option<u32> {
         self.inner
-            .my_info_tx
-            .borrow()
+            .state
+            .lock()
+            .my_info
             .as_ref()
             .map(|i| i.my_node_num)
     }
@@ -377,7 +386,10 @@ impl MeshtasticService {
             return Err(e);
         }
         // Only clear local snapshots after the request was actually sent, so
-        // a transport failure doesn't blank out the settings UI.
+        // a transport failure doesn't blank out the settings UI. Clear the
+        // canonical state first, then mirror the cleared values to the watch
+        // channels (the subscriber API).
+        self.inner.state.lock().clear_config();
         let _ = self.inner.lora_tx.send(None);
         let _ = self.inner.device_tx.send(None);
         let _ = self.inner.position_tx.send(None);

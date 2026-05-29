@@ -1,0 +1,686 @@
+//! The sans-IO Meshtastic protocol core — the shared driver contract.
+//!
+//! This module holds every piece of Meshtastic protocol handling that does not
+//! touch I/O or a runtime, so there is exactly one implementation across all
+//! clients. A *driver* wires it to a platform: [`super::MeshtasticService`] is
+//! the native (tokio) driver; a browser client drives the same surface with
+//! Web Serial + `spawn_local`. The contract a driver implements against:
+//!
+//! - [`decode_inbound`] — one `FromRadio` frame → [`InboundEvent`]s (pure).
+//! - [`ProtocolState`] — the canonical config/identity snapshot, updated by
+//!   [`ProtocolState::apply`]; the driver decides how to surface it.
+//! - [`want_config`] / [`text_packet`] / [`data_packet`] / [`admin_packet`] —
+//!   build a `to_radio::PayloadVariant` for the driver to encode + write.
+//! - [`crate::voice::tx_policy`] — voice-burst pacing / backpressure decisions.
+//!
+//! The driver supplies the runtime-owned bits (transport read/write, timers,
+//! the packet-id counter, how events reach the UI) and nothing else.
+//!
+//! Tracing calls stay here (tracing is runtime-agnostic — no tokio), so
+//! decode-time observability is unchanged. Effects that depend on *driver*
+//! state (e.g. the config-burst-completeness warning, which reads the native
+//! driver's config channels) live in the driver instead.
+
+use std::collections::HashMap;
+
+use prost::Message as _;
+use tracing::{debug, warn};
+
+use crate::error::{Error, Result};
+use crate::ids::node_num_to_id;
+use crate::node::NodeId;
+use crate::ports::{ADMIN_APP, BROADCAST_ADDR, MAX_TEXT_BYTES, PRIVATE_APP, TEXT_MESSAGE_APP};
+use crate::proto::{
+    AdminMessage, Channel, Data, DeviceMetadata, FromRadio, MeshPacket, MyNodeInfo, NodeInfo,
+    PortNum, User, admin_message, config,
+    config::{
+        BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
+        PowerConfig,
+    },
+    from_radio, mesh_packet, to_radio,
+};
+use crate::radio_service::VoiceData;
+use crate::voice::{PROTOCOL_VERSION as VOICE_PROTOCOL_VERSION, VoiceDestination, detect_version};
+
+use super::types::{IncomingData, IncomingText, QueueStatusEvent};
+
+/// Latitude bounds in fixed-point 1e-7 degrees: [-90°, +90°].
+const LAT_I_MIN: i32 = -900_000_000;
+const LAT_I_MAX: i32 = 900_000_000;
+/// Longitude bounds in fixed-point 1e-7 degrees: [-180°, +180°].
+const LON_I_MIN: i32 = -1_800_000_000;
+const LON_I_MAX: i32 = 1_800_000_000;
+
+fn lat_i_in_range(v: i32) -> bool {
+    (LAT_I_MIN..=LAT_I_MAX).contains(&v)
+}
+fn lon_i_in_range(v: i32) -> bool {
+    (LON_I_MIN..=LON_I_MAX).contains(&v)
+}
+
+/// Read-only state the decoder needs. Snapshotted by the driver before each
+/// call (there is no intra-message state dependency: one `FromRadio` carries
+/// exactly one variant).
+pub struct InboundCtx {
+    /// Our own node number, if a prior `MyNodeInfo` established it. Used to
+    /// recognise our own `NodeInfo` and surface its `User` as the owner.
+    pub my_node_num: Option<u32>,
+}
+
+/// A decoded inbound effect for the driver to apply to its channels.
+///
+/// Mirrors exactly what the old `handle_from_radio` published; the driver's
+/// `apply_inbound` is the inverse mapping back onto the watch/broadcast
+/// senders.
+pub enum InboundEvent {
+    MyInfo(MyNodeInfo),
+    NodeInfo(NodeInfo),
+    /// Owner `User` (our own node's `NodeInfo`, or an admin `GetOwnerResponse`).
+    Owner(User),
+    /// One of the seven tracked config sections.
+    Config(config::PayloadVariant),
+    Channel(Channel),
+    Metadata(DeviceMetadata),
+    ConfigComplete(u32),
+    IncomingText(IncomingText),
+    IncomingData(IncomingData),
+    Voice(VoiceData),
+    QueueStatus(QueueStatusEvent),
+}
+
+impl InboundEvent {
+    /// True if this event updates the canonical config/identity snapshot
+    /// ([`ProtocolState`]); false for transient messages (text/data/voice)
+    /// and queue status, which the driver routes straight to its broadcast /
+    /// notify channels.
+    pub fn is_snapshot(&self) -> bool {
+        matches!(
+            self,
+            Self::MyInfo(_)
+                | Self::NodeInfo(_)
+                | Self::Owner(_)
+                | Self::Config(_)
+                | Self::Channel(_)
+                | Self::Metadata(_)
+        )
+    }
+}
+
+/// Decode one `FromRadio` frame into driver effects. Pure: no I/O, no awaits.
+pub fn decode_inbound(bytes: &[u8], ctx: &InboundCtx) -> Result<Vec<InboundEvent>> {
+    let msg = FromRadio::decode(bytes)?;
+    let mut out = Vec::new();
+    let Some(variant) = msg.payload_variant else {
+        return Ok(out);
+    };
+    match variant {
+        from_radio::PayloadVariant::MyInfo(info) => {
+            debug!(my_node_num = info.my_node_num, "MyNodeInfo");
+            out.push(InboundEvent::MyInfo(info));
+        }
+        from_radio::PayloadVariant::NodeInfo(ni) => {
+            let mut ni = ni;
+            // Sanitise position fields against absurd values from a
+            // misbehaving radio so downstream UI never sees garbage.
+            if let Some(pos) = ni.position.as_mut() {
+                if let Some(lat) = pos.latitude_i
+                    && !lat_i_in_range(lat)
+                {
+                    warn!(node = ni.num, lat, "dropping out-of-range latitude_i");
+                    pos.latitude_i = None;
+                }
+                if let Some(lon) = pos.longitude_i
+                    && !lon_i_in_range(lon)
+                {
+                    warn!(node = ni.num, lon, "dropping out-of-range longitude_i");
+                    pos.longitude_i = None;
+                }
+            }
+            // If this is our own node, surface the User as the "owner".
+            if Some(ni.num) == ctx.my_node_num
+                && let Some(user) = ni.user.as_ref()
+            {
+                out.push(InboundEvent::Owner(user.clone()));
+            }
+            out.push(InboundEvent::NodeInfo(ni));
+        }
+        from_radio::PayloadVariant::Config(cfg) => {
+            if let Some(v) = cfg.payload_variant {
+                // Only the seven sections the service tracks produce events.
+                match v {
+                    config::PayloadVariant::Lora(_)
+                    | config::PayloadVariant::Device(_)
+                    | config::PayloadVariant::Position(_)
+                    | config::PayloadVariant::Power(_)
+                    | config::PayloadVariant::Network(_)
+                    | config::PayloadVariant::Display(_)
+                    | config::PayloadVariant::Bluetooth(_) => out.push(InboundEvent::Config(v)),
+                    _ => {}
+                }
+            }
+        }
+        from_radio::PayloadVariant::Channel(ch) => out.push(InboundEvent::Channel(ch)),
+        from_radio::PayloadVariant::Metadata(meta) => out.push(InboundEvent::Metadata(meta)),
+        from_radio::PayloadVariant::ConfigCompleteId(nonce) => {
+            out.push(InboundEvent::ConfigComplete(nonce));
+        }
+        from_radio::PayloadVariant::Packet(pkt) => decode_packet(pkt, &mut out),
+        from_radio::PayloadVariant::QueueStatus(qs) => {
+            debug!(
+                free = qs.free,
+                maxlen = qs.maxlen,
+                res = qs.res,
+                pkt = qs.mesh_packet_id,
+                "queue_status"
+            );
+            out.push(InboundEvent::QueueStatus(QueueStatusEvent {
+                res: qs.res,
+                free: qs.free,
+                maxlen: qs.maxlen,
+                mesh_packet_id: qs.mesh_packet_id,
+            }));
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+fn decode_packet(pkt: MeshPacket, out: &mut Vec<InboundEvent>) {
+    // Destructure `payload_variant` by value so the payload can be moved
+    // through this function instead of cloned at entry.
+    let data = match pkt.payload_variant {
+        Some(mesh_packet::PayloadVariant::Decoded(d)) => d,
+        Some(mesh_packet::PayloadVariant::Encrypted(bytes)) => {
+            debug!(
+                from = pkt.from,
+                to = pkt.to,
+                channel = pkt.channel,
+                len = bytes.len(),
+                "dropping encrypted MeshPacket (channel decrypt not yet implemented)"
+            );
+            return;
+        }
+        None => return,
+    };
+    let portnum = data.portnum;
+    let mut payload = data.payload;
+    // Admin responses (e.g. get_owner_response) come back as a packet on
+    // ADMIN_APP. Decode them so the settings UI sees the latest values.
+    if portnum == PortNum::AdminApp as i32
+        && let Ok(admin) = AdminMessage::decode(payload.as_slice())
+        && let Some(v) = admin.payload_variant
+    {
+        match v {
+            admin_message::PayloadVariant::GetOwnerResponse(user) => {
+                out.push(InboundEvent::Owner(user));
+            }
+            admin_message::PayloadVariant::GetChannelResponse(ch) => {
+                out.push(InboundEvent::Channel(ch));
+            }
+            admin_message::PayloadVariant::GetDeviceMetadataResponse(meta) => {
+                out.push(InboundEvent::Metadata(meta));
+            }
+            _ => {}
+        }
+        return;
+    }
+    if portnum == PortNum::TextMessageApp as i32 {
+        if payload.len() > MAX_TEXT_BYTES {
+            warn!(
+                from = pkt.from,
+                len = payload.len(),
+                "dropping oversized text payload"
+            );
+            return;
+        }
+        match String::from_utf8(payload) {
+            Ok(text) => {
+                let from_id = node_num_to_id(pkt.from);
+                out.push(InboundEvent::IncomingText(IncomingText {
+                    from: pkt.from,
+                    from_id,
+                    to: pkt.to,
+                    channel: pkt.channel,
+                    text,
+                    rx_time: pkt.rx_time,
+                    rx_snr: pkt.rx_snr,
+                    rx_rssi: pkt.rx_rssi,
+                }));
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    from = pkt.from,
+                    len = e.as_bytes().len(),
+                    "malformed UTF-8 on TextMessageApp; falling through to data fan-out"
+                );
+                payload = e.into_bytes();
+            }
+        }
+    }
+    // Tap PRIVATE_APP voice frames matching our wire version onto the
+    // protocol-agnostic voice channel. Legacy consumers still receive the
+    // same bytes via the IncomingData event below.
+    //
+    // (The old code skipped these emits when nobody was subscribed and used a
+    // take-vs-clone trick to avoid one copy; that's a driver-side optimisation
+    // — the driver still gates the broadcast on `receiver_count`, it just no
+    // longer saves the single clone. Behaviour to subscribers is identical.)
+    let is_voice =
+        portnum == PRIVATE_APP as i32 && detect_version(&payload) == Some(VOICE_PROTOCOL_VERSION);
+    if is_voice {
+        let dest = if pkt.to == BROADCAST_ADDR {
+            VoiceDestination::Broadcast
+        } else {
+            VoiceDestination::Node(NodeId::from_u32(pkt.to))
+        };
+        out.push(InboundEvent::Voice(VoiceData {
+            from: NodeId::from_u32(pkt.from),
+            to: dest,
+            channel: pkt.channel,
+            payload: payload.clone(),
+        }));
+    }
+    out.push(InboundEvent::IncomingData(IncomingData {
+        from: pkt.from,
+        to: pkt.to,
+        channel: pkt.channel,
+        portnum,
+        payload,
+        rx_time: pkt.rx_time,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Outbound construction (pure).
+//
+// Each builder produces a `to_radio::PayloadVariant` ready to encode + write.
+// The driver supplies the runtime-owned bits — the packet `id` (from the
+// service's atomic counter) and, for admin writes, the destination node — and
+// performs the actual transport write. No I/O here.
+// ---------------------------------------------------------------------------
+
+/// `WantConfigId` handshake payload.
+pub fn want_config(nonce: u32) -> to_radio::PayloadVariant {
+    to_radio::PayloadVariant::WantConfigId(nonce)
+}
+
+/// A `TextMessageApp` packet. `to` defaults to broadcast; `want_ack` is set
+/// only for direct messages. Fails if the text exceeds the firmware limit.
+pub fn text_packet(
+    id: u32,
+    text: &str,
+    channel: u32,
+    to: Option<u32>,
+) -> Result<to_radio::PayloadVariant> {
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(Error::Other(format!(
+            "text payload too large: {} > {MAX_TEXT_BYTES} bytes",
+            text.len()
+        )));
+    }
+    let pkt = MeshPacket {
+        from: 0,
+        to: to.unwrap_or(BROADCAST_ADDR),
+        channel,
+        id,
+        want_ack: to.is_some(),
+        hop_limit: 3,
+        priority: mesh_packet::Priority::Default as i32,
+        payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+            portnum: TEXT_MESSAGE_APP as i32,
+            payload: text.as_bytes().to_vec(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    Ok(to_radio::PayloadVariant::Packet(pkt))
+}
+
+/// A raw application-data packet (e.g. voice chunks on `PRIVATE_APP`).
+pub fn data_packet(
+    id: u32,
+    portnum: i32,
+    payload: Vec<u8>,
+    channel: u32,
+    to: Option<u32>,
+    want_ack: bool,
+    want_response: bool,
+) -> to_radio::PayloadVariant {
+    let pkt = MeshPacket {
+        from: 0,
+        to: to.unwrap_or(BROADCAST_ADDR),
+        channel,
+        id,
+        want_ack,
+        hop_limit: 3,
+        priority: mesh_packet::Priority::Default as i32,
+        payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+            portnum,
+            payload,
+            want_response,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    to_radio::PayloadVariant::Packet(pkt)
+}
+
+/// An `AdminMessage` packet addressed to `to_node` (our own node, for config
+/// writes). Reliable priority, `want_ack`, no app-level response requested.
+pub fn admin_packet(
+    id: u32,
+    to_node: u32,
+    payload: admin_message::PayloadVariant,
+) -> Result<to_radio::PayloadVariant> {
+    let admin = AdminMessage {
+        payload_variant: Some(payload),
+        ..Default::default()
+    };
+    let mut bytes = Vec::with_capacity(admin.encoded_len());
+    admin.encode(&mut bytes)?;
+    let pkt = MeshPacket {
+        from: 0,
+        to: to_node,
+        channel: 0,
+        id,
+        want_ack: true,
+        hop_limit: 0,
+        priority: mesh_packet::Priority::Reliable as i32,
+        payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+            portnum: ADMIN_APP as i32,
+            payload: bytes,
+            want_response: false,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    Ok(to_radio::PayloadVariant::Packet(pkt))
+}
+
+/// Active node-discovery ping: broadcast our `User` on `NODEINFO_APP` with
+/// `want_response = true` so peers reply with their own `User` immediately
+/// instead of waiting for the next periodic NodeInfo broadcast. Their replies
+/// hit the firmware's NodeDB and arrive back to us as `FromRadio::NodeInfo`
+/// events, just like passive discovery — this only accelerates it.
+pub fn nodeinfo_request_packet(
+    id: u32,
+    owner: &User,
+    channel: u32,
+) -> Result<to_radio::PayloadVariant> {
+    let mut payload = Vec::with_capacity(owner.encoded_len());
+    owner.encode(&mut payload)?;
+    let pkt = MeshPacket {
+        from: 0,
+        to: BROADCAST_ADDR,
+        channel,
+        id,
+        want_ack: false,
+        hop_limit: 3,
+        priority: mesh_packet::Priority::Default as i32,
+        payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+            portnum: PortNum::NodeinfoApp as i32,
+            payload,
+            want_response: true,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    Ok(to_radio::PayloadVariant::Packet(pkt))
+}
+
+// ---------------------------------------------------------------------------
+// Canonical protocol state (sans-IO).
+//
+// The single source of truth for the device's config/identity snapshot, with
+// one implementation of every state transition ([`ProtocolState::apply`]) that
+// all drivers share. The native [`super::MeshtasticService`] keeps it in a
+// sync `Mutex` and mirrors the touched field into its watch channels (so its
+// subscriber API is unchanged); a browser driver can read it directly.
+//
+// Transient messages, connection state, the outbound packet-id counter, and
+// the firmware queue depth are tracked outside this struct (broadcast
+// channels / `set_state` / atomics / a dedicated mutex), so they are not
+// duplicated here.
+// ---------------------------------------------------------------------------
+
+/// The device config + identity snapshot, rebuilt from inbound events.
+#[derive(Default)]
+pub struct ProtocolState {
+    pub my_info: Option<MyNodeInfo>,
+    pub nodes: HashMap<u32, NodeInfo>,
+    pub owner: Option<User>,
+    pub lora: Option<LoRaConfig>,
+    pub device: Option<DeviceConfig>,
+    pub position: Option<PositionConfig>,
+    pub power: Option<PowerConfig>,
+    pub network: Option<NetworkConfig>,
+    pub display: Option<DisplayConfig>,
+    pub bluetooth: Option<BluetoothConfig>,
+    pub channels: Vec<Channel>,
+    pub metadata: Option<DeviceMetadata>,
+}
+
+impl ProtocolState {
+    /// Apply one snapshot-updating event. Non-snapshot events (see
+    /// [`InboundEvent::is_snapshot`]) are ignored. Takes the event by
+    /// reference so the driver can still move it into its own channels.
+    pub fn apply(&mut self, event: &InboundEvent) {
+        match event {
+            InboundEvent::MyInfo(info) => self.my_info = Some(info.clone()),
+            InboundEvent::NodeInfo(ni) => {
+                self.nodes.insert(ni.num, ni.clone());
+            }
+            InboundEvent::Owner(user) => self.owner = Some(user.clone()),
+            InboundEvent::Config(v) => self.apply_config(v.clone()),
+            InboundEvent::Channel(ch) => self.upsert_channel(ch.clone()),
+            InboundEvent::Metadata(meta) => self.metadata = Some(meta.clone()),
+            InboundEvent::ConfigComplete(_)
+            | InboundEvent::IncomingText(_)
+            | InboundEvent::IncomingData(_)
+            | InboundEvent::Voice(_)
+            | InboundEvent::QueueStatus(_) => {}
+        }
+    }
+
+    fn apply_config(&mut self, v: config::PayloadVariant) {
+        match v {
+            config::PayloadVariant::Lora(c) => self.lora = Some(c),
+            config::PayloadVariant::Device(c) => self.device = Some(c),
+            config::PayloadVariant::Position(c) => self.position = Some(c),
+            config::PayloadVariant::Power(c) => self.power = Some(c),
+            config::PayloadVariant::Network(c) => self.network = Some(c),
+            config::PayloadVariant::Display(c) => self.display = Some(c),
+            config::PayloadVariant::Bluetooth(c) => self.bluetooth = Some(c),
+            _ => {}
+        }
+    }
+
+    /// Insert or replace a channel, keeping the list sorted by index.
+    fn upsert_channel(&mut self, ch: Channel) {
+        if let Some(slot) = self.channels.iter_mut().find(|c| c.index == ch.index) {
+            *slot = ch;
+        } else {
+            self.channels.push(ch);
+            self.channels.sort_by_key(|c| c.index);
+        }
+    }
+
+    /// Reset the config sections + channel list (but not identity/nodes), as
+    /// done when re-requesting the config burst.
+    pub fn clear_config(&mut self) {
+        self.lora = None;
+        self.device = None;
+        self.position = None;
+        self.power = None;
+        self.network = None;
+        self.display = None;
+        self.bluetooth = None;
+        self.channels.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! These run with no tokio runtime, no service, no hardware — the point of
+    //! pulling the decode logic out into a sans-IO function.
+    use super::*;
+    use crate::proto::{Position, from_radio};
+
+    fn encode(variant: from_radio::PayloadVariant) -> Vec<u8> {
+        let msg = FromRadio {
+            id: 0,
+            payload_variant: Some(variant),
+        };
+        let mut buf = Vec::new();
+        msg.encode(&mut buf).expect("encode");
+        buf
+    }
+
+    #[test]
+    fn decodes_my_info() {
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x1234_5678,
+            ..Default::default()
+        }));
+        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        assert!(matches!(
+            ev.as_slice(),
+            [InboundEvent::MyInfo(i)] if i.my_node_num == 0x1234_5678
+        ));
+    }
+
+    #[test]
+    fn own_nodeinfo_also_yields_owner() {
+        let ni = NodeInfo {
+            num: 7,
+            user: Some(User {
+                long_name: "me".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::NodeInfo(ni));
+        // Without my_node_num: just the NodeInfo event.
+        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        assert!(matches!(ev.as_slice(), [InboundEvent::NodeInfo(_)]));
+        // When it's our own node: Owner is emitted before NodeInfo.
+        let ev = decode_inbound(
+            &bytes,
+            &InboundCtx {
+                my_node_num: Some(7),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            ev.as_slice(),
+            [InboundEvent::Owner(u), InboundEvent::NodeInfo(_)] if u.long_name == "me"
+        ));
+    }
+
+    #[test]
+    fn text_packet_rejects_oversized() {
+        let big = "x".repeat(MAX_TEXT_BYTES + 1);
+        assert!(text_packet(1, &big, 0, None).is_err());
+        assert!(text_packet(1, "hi", 0, None).is_ok());
+    }
+
+    #[test]
+    fn text_packet_sets_want_ack_only_for_direct() {
+        let to_radio::PayloadVariant::Packet(bcast) = text_packet(1, "hi", 0, None).unwrap() else {
+            panic!("expected packet");
+        };
+        assert!(!bcast.want_ack, "broadcast must not request ack");
+        let to_radio::PayloadVariant::Packet(dm) = text_packet(1, "hi", 0, Some(42)).unwrap()
+        else {
+            panic!("expected packet");
+        };
+        assert!(dm.want_ack, "direct message must request ack");
+        assert_eq!(dm.to, 42);
+    }
+
+    #[test]
+    fn protocol_state_tracks_snapshot() {
+        let mut s = ProtocolState::default();
+        assert!(s.my_info.is_none());
+
+        // MyInfo + two NodeInfos accumulate.
+        s.apply(&InboundEvent::MyInfo(MyNodeInfo {
+            my_node_num: 9,
+            ..Default::default()
+        }));
+        s.apply(&InboundEvent::NodeInfo(NodeInfo {
+            num: 1,
+            ..Default::default()
+        }));
+        s.apply(&InboundEvent::NodeInfo(NodeInfo {
+            num: 2,
+            ..Default::default()
+        }));
+        assert_eq!(s.my_info.as_ref().unwrap().my_node_num, 9);
+        assert_eq!(s.nodes.len(), 2);
+
+        // Transient events don't touch the snapshot.
+        s.apply(&InboundEvent::ConfigComplete(7));
+        assert_eq!(s.nodes.len(), 2);
+    }
+
+    #[test]
+    fn protocol_state_channels_stay_sorted_and_upsert() {
+        let mut s = ProtocolState::default();
+        let ch = |index, name: &str| Channel {
+            index,
+            ..Channel {
+                settings: Some(crate::proto::ChannelSettings {
+                    name: name.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        s.apply(&InboundEvent::Channel(ch(2, "two")));
+        s.apply(&InboundEvent::Channel(ch(0, "zero")));
+        assert_eq!(
+            s.channels.iter().map(|c| c.index).collect::<Vec<_>>(),
+            [0, 2]
+        );
+        // Upsert in place (no duplicate).
+        s.apply(&InboundEvent::Channel(ch(0, "zero-v2")));
+        assert_eq!(s.channels.len(), 2);
+        assert_eq!(s.channels[0].settings.as_ref().unwrap().name, "zero-v2");
+    }
+
+    #[test]
+    fn clear_config_keeps_identity() {
+        let mut s = ProtocolState::default();
+        s.apply(&InboundEvent::MyInfo(MyNodeInfo {
+            my_node_num: 9,
+            ..Default::default()
+        }));
+        s.apply(&InboundEvent::Config(config::PayloadVariant::Lora(
+            Default::default(),
+        )));
+        assert!(s.lora.is_some());
+        s.clear_config();
+        assert!(s.lora.is_none(), "config cleared");
+        assert!(s.my_info.is_some(), "identity preserved");
+    }
+
+    #[test]
+    fn out_of_range_latitude_is_dropped() {
+        let ni = NodeInfo {
+            num: 7,
+            position: Some(Position {
+                latitude_i: Some(900_000_001), // > 90°
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::NodeInfo(ni));
+        let ev = decode_inbound(&bytes, &InboundCtx { my_node_num: None }).unwrap();
+        let [InboundEvent::NodeInfo(ni)] = ev.as_slice() else {
+            panic!("expected NodeInfo");
+        };
+        assert_eq!(ni.position.as_ref().unwrap().latitude_i, None);
+    }
+}

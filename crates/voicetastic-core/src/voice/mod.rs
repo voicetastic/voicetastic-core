@@ -40,8 +40,11 @@ pub mod mac;
 pub mod message;
 pub mod nack;
 pub mod outgoing;
+pub mod send_prep;
 pub mod sender;
 pub mod sink;
+pub mod tx_policy;
+pub mod tx_state;
 pub mod types;
 
 pub use assembler::{AssemblerConfig, OutboundNack, TickOutput, VoiceAssembler};
@@ -59,7 +62,9 @@ pub use nack::{NackInfo, build_nack, parse_nack_body};
 pub use outgoing::{
     DEFAULT_RETAIN_TTL, MAX_RETRANSMITS_PER_MESSAGE, OutgoingVoice, OutgoingVoiceRegistry,
 };
+pub use send_prep::{PreparedVoice, prepare_voice_send};
 pub use sender::{DEFAULT_LINGER, SendHandle, SendRequest, SendStatus, VoiceSender};
+pub use tx_state::{VoiceTx, VoiceTxAction};
 pub use types::{ModemPreset, PacketType, VoiceCodec, VoiceDestination};
 
 /// Returns the protocol version byte of a `PRIVATE_APP` payload.

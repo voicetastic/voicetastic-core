@@ -35,6 +35,10 @@ pub use meshtastic::pairing;
 #[cfg(feature = "serial-tokio")]
 pub use meshtastic::serial;
 pub use meshtastic::service::ConnectionState;
+/// The sans-IO protocol core (decode/build/state). `MeshtasticService` is the
+/// native (tokio) driver over it; a browser client drives the same module with
+/// Web Serial. See [`protocol`] for the driver contract.
+pub use meshtastic::service::protocol;
 pub use meshtastic::{MeshtasticService, ids, ports, proto, service};
 
 pub use error::{Error, Result};

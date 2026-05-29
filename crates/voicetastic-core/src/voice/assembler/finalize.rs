@@ -1,7 +1,7 @@
 //! Finalization helpers: producing a [`VoiceMessage`] from an
 //! [`AssemblyState`] and managing the recent-completion blacklist.
 
-use std::time::Instant;
+use web_time::Instant;
 
 use tracing::warn;
 
@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn push_blacklist_adds_entry() {
         let mut bl = Vec::new();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let key = (Arc::from("sender1"), 123u32);
 
         push_blacklist(&mut bl, key.clone(), now);
@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn push_blacklist_idempotent() {
         let mut bl = Vec::new();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let key = (Arc::from("sender1"), 123u32);
 
         push_blacklist(&mut bl, key.clone(), now);
@@ -124,7 +124,7 @@ mod tests {
     #[test]
     fn push_blacklist_respects_max() {
         let mut bl = Vec::new();
-        let now = std::time::Instant::now();
+        let now = Instant::now();
 
         for i in 0..=(BLACKLIST_MAX + 10) {
             let key = (Arc::from(format!("sender{}", i).as_str()), i as u32);
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn push_blacklist_evicts_oldest() {
         let mut bl = Vec::new();
-        let mut time = std::time::Instant::now();
+        let mut time = Instant::now();
 
         for i in 0..BLACKLIST_MAX {
             let key = (Arc::from(format!("sender{}", i).as_str()), i as u32);

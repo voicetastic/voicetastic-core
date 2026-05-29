@@ -56,6 +56,7 @@ use parking_lot::Mutex;
 use tokio::runtime::Handle;
 use tokio::sync::{Semaphore, broadcast};
 use tracing::{debug, info, warn};
+use web_time::Instant;
 
 use crate::meshtastic::MeshtasticService;
 use crate::ports::PRIVATE_APP;
@@ -710,13 +711,13 @@ fn spawn_deferred_retransmit(
     channel: u32,
     to: Option<u32>,
     status_tx: broadcast::Sender<SendStatus>,
-    deadline: std::time::Instant,
+    deadline: Instant,
 ) {
     tokio::spawn(async move {
         // Sleep just past the deadline so `take_retransmit` sees
         // cooldown as elapsed. A small grace absorbs scheduler jitter
         // and any clock skew between `Instant::now()` calls.
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let wait = deadline
             .checked_duration_since(now)
             .unwrap_or_default()

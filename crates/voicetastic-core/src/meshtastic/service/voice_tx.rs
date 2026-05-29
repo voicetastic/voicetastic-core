@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 use crate::ports::PRIVATE_APP;
+use crate::voice::tx_policy::{self, RADIO_QUEUE_WAIT_TIMEOUT};
 
 use super::Inner;
 use super::MeshtasticService;
@@ -60,20 +61,10 @@ pub(super) struct VoiceTxItem {
 /// backpressure rather than allocating without limit.
 pub(super) const QUEUE_CAPACITY: usize = 512;
 
-/// Firmware queue low-water mark. When the device reports
-/// `QueueStatus.free <= RADIO_QUEUE_LOW_WATER` we pause the voice TX
-/// worker until the next update. Meshtastic firmware sizes its
-/// outbound queue at ~16 slots; leaving a small safety margin prevents
-/// us from racing the radio into "queue full" rejections (and the
-/// out-of-memory reboots that follow on long voice bursts).
-pub(super) const RADIO_QUEUE_LOW_WATER: u32 = 2;
-
-/// Maximum time we wait for a fresh `QueueStatus` notification before
-/// proceeding anyway. Acts as a safety valve for the (rare) case where
-/// the firmware never publishes another update, e.g. because traffic
-/// has stalled. The configured per-frame pacing still provides
-/// timer-based throttling underneath.
-pub(super) const RADIO_QUEUE_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+// Pacing + backpressure policy (RADIO_QUEUE_LOW_WATER, RADIO_QUEUE_WAIT_TIMEOUT,
+// pacing_delay, queue_has_room) lives in `crate::voice::tx_policy` so every TX
+// driver — this native worker and a future browser worker — paces identically.
+// This worker just performs the waits the policy asks for.
 
 /// Spawn the FIFO worker. The worker holds only a `Weak<Inner>` so
 /// dropping the last external [`MeshtasticService`] clone tears it down
@@ -84,14 +75,11 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
     tokio::spawn(async move {
         let mut last_send: Option<Instant> = None;
         while let Some(item) = rx.recv().await {
-            // Sleep just enough to honour the configured pacing.
-            let mut waited = Duration::ZERO;
-            if let Some(prev) = last_send {
-                let elapsed = prev.elapsed();
-                if elapsed < item.pacing {
-                    waited = item.pacing - elapsed;
-                    tokio::time::sleep(waited).await;
-                }
+            // Sleep just enough to honour the configured pacing. The gap is
+            // computed by the shared policy; this worker only does the sleep.
+            let waited = tx_policy::pacing_delay(last_send.map(|p| p.elapsed()), item.pacing);
+            if !waited.is_zero() {
+                tokio::time::sleep(waited).await;
             }
             // Re-anchor a strong handle every iteration so the worker
             // exits as soon as the last external `MeshtasticService` is gone.
@@ -110,7 +98,7 @@ pub(super) fn spawn_worker(weak: Weak<Inner>, mut rx: mpsc::Receiver<VoiceTxItem
             let mut bp_waited = Duration::ZERO;
             loop {
                 let free = *inner.radio_queue_free.lock();
-                if free > RADIO_QUEUE_LOW_WATER {
+                if tx_policy::queue_has_room(free) {
                     break;
                 }
                 let bp_start = Instant::now();

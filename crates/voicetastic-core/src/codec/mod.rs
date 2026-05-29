@@ -184,6 +184,41 @@ mod imp;
 #[cfg(feature = "codecs")]
 pub use imp::{Encoder, decode};
 
+// One-shot Codec2 (pure Rust, wasm-safe). Available whenever `codec2` is on —
+// which `codecs` implies, and which wasm consumers enable on its own.
+#[cfg(feature = "codec2")]
+mod c2;
+#[cfg(feature = "codec2")]
+pub use c2::{codec2_decode, codec2_encode};
+
+// Pure-Rust Opus *decoder* (no encode — audiopus stays the native encode
+// path). Builds for wasm32 so the browser can play back Opus voice from
+// desktop/Android.
+#[cfg(feature = "opus-decode")]
+mod opus_d;
+#[cfg(feature = "opus-decode")]
+pub use opus_d::opus_decode;
+
+// AMR-NB encode/decode through opencore-amr compiled to a standalone wasm
+// (via emscripten — see the `opencore-amrnb` sub-crate). Routes through
+// a small JS shim because the standalone wasm runs in its own linear
+// memory, distinct from the main Rust wasm. Wire-compatible with the
+// native AMR-NB path; `feature = "amrnb-wasm"` ⇒ wasm32 only.
+#[cfg(all(feature = "amrnb-wasm", target_arch = "wasm32"))]
+mod amrnb_wasm;
+#[cfg(all(feature = "amrnb-wasm", target_arch = "wasm32"))]
+pub use amrnb_wasm::{amrnb_decode, amrnb_encode, init as amrnb_init};
+
+// Opus encode + decode through libopus compiled to a standalone wasm (via
+// emscripten — see the `libopus` sub-crate). Same JS-shim pattern as
+// AMR-NB. Wire-compatible with the native Opus path (audiopus); `feature
+// = "opus-wasm"` ⇒ wasm32 only. Supersedes `opus-decode` by adding encode
+// and matching the C reference bit-for-bit.
+#[cfg(all(feature = "opus-wasm", target_arch = "wasm32"))]
+mod opus_wasm;
+#[cfg(all(feature = "opus-wasm", target_arch = "wasm32"))]
+pub use opus_wasm::{init as opus_init, opus_decode as opus_wasm_decode, opus_encode};
+
 #[cfg(not(feature = "codecs"))]
 mod disabled {
     use super::*;

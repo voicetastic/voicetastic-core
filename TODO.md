@@ -13,14 +13,28 @@ Ordered roughly by user impact / payoff.
   Touches: `crates/voicetastic-core/src/service/mod.rs`,
   `crates/voicetastic-core/src/service/transport.rs`.
 
-- [ ] **Channel encryption (AES256-CTR)**
-  `service::inbound::handle_packet` currently drops every `MeshPacket` whose
-  `payload_variant` is `Encrypted` instead of `Decoded`. Implement the
-  Meshtastic AES-CTR scheme (PSK + packet id/from as nonce) so non-default
-  channels are usable. Without this the app is effectively limited to the
-  unencrypted default channel.
-  Touches: `crates/voicetastic-core/src/service/inbound.rs`, new module e.g.
-  `crates/voicetastic-core/src/crypto.rs`.
+- [ ] **Verify whether the firmware ever delivers `Encrypted` packets
+  addressed to us, and decrypt PKC DMs if so**
+  `meshtastic::service::inbound::handle_packet` drops every
+  `MeshPacket` whose `payload_variant` is `Encrypted`. The firmware
+  already handles channel AES-CTR for any channel whose PSK is loaded
+  on the radio — those packets arrive as `Decoded`, which is why the
+  default channel (and any configured custom channels) work today
+  without any decrypt code on the desktop side. Earlier framing of
+  this item as "non-default channels unusable" was wrong.
+
+  The `Encrypted` arm fires for packets the *radio itself* couldn't
+  decrypt. In practice that's overheard PKC direct messages between
+  two other nodes — we don't hold the recipient's private key and
+  couldn't read them even if we tried. Dropping is correct.
+
+  Open question worth verifying against firmware: does the phone-API
+  ever hand us an `Encrypted` packet whose `to` matches our own node
+  num? If yes (PKC DM left to the host to decrypt), we need a
+  Curve25519 decrypt path keyed on our node's private key. If no, the
+  item can be closed and the DEBUG log downgraded to TRACE.
+  Touches: `crates/voicetastic-core/src/meshtastic/service/inbound.rs`,
+  possibly a new `crypto` module.
 
 - [ ] **ACK / delivery tracking**
   `send_text` / `send_data` set `want_ack=true` for DMs but discard the
