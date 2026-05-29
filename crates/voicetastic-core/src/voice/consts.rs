@@ -1,4 +1,4 @@
-//! Protocol-wide constants. See the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol) Appendix A.
+//! Protocol-wide constants. See the [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol) Appendix A.
 
 use std::time::Duration;
 

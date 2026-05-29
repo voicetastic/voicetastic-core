@@ -93,9 +93,13 @@ Ordered roughly by user impact / payoff.
   `#[instrument]` on service methods.
 
 - [x] **CI pipeline**
-  Both GitLab CI (`.gitlab-ci.yml`) and GitHub Actions (`.github/workflows/ci.yml`) are
-  set up. Linux matrix that runs `fmt --check`, `clippy -D warnings`, `test --workspace`,
-  and a release build. Catches submodule-init regressions and toolchain breaks.
+  GitHub Actions (`.github/workflows/ci.yml`) is the canonical CI; GitLab CI
+  (`.gitlab-ci.yml`) is kept as a dual-CI for the mirror at
+  `git.cha-sam.re/voicetastic/voicetastic-core`. Linux matrix that runs
+  `fmt --check`, `clippy -D warnings`, `test --workspace`, and a release build.
+  `.github/workflows/release.yml` cuts a GitHub Release on `v*` tags from
+  `CHANGELOG.md`; `.github/workflows/mirror-to-gitlab.yml` keeps the GitLab
+  side in sync via push-mirror.
 
 - [ ] **Fuzz inbound decode path**
   `cargo-fuzz` target on `FromRadio::decode` + `MeshService::handle_from_radio`.

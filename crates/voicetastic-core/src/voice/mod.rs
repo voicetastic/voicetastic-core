@@ -1,4 +1,4 @@
-//! Voice protocol — see the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol)
+//! Voice protocol — see the [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol)
 //! for the wire-format spec; this module is the reference implementation.
 //!
 //! This module is **codec-free**: it ships, reassembles, and FEC-protects

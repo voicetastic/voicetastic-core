@@ -1,0 +1,94 @@
+# GitHub Release on annotated `vX.Y.Z` tag push.
+#
+# Mirrors what the GitLab CI `release` job did: build the workspace,
+# extract release notes from CHANGELOG.md (matching `## X.Y.Z ...` or
+# `## [X.Y.Z] ...`), fall back to a git-log summary if no section is
+# found, and publish a GitHub Release.
+#
+# The maintainer's flow is unchanged:
+#   1. Edit CHANGELOG.md to move "Unreleased" entries under the new
+#      version heading.
+#   2. Merge that change into main.
+#   3. Tag the resulting commit:
+#        git tag -a vX.Y.Z -m "Release X.Y.Z"
+#        git push origin vX.Y.Z
+#
+# This pipeline never rewrites Cargo.toml. The binary version shown by
+# `--version` is derived at build time from the `vX.Y.Z` git tag by
+# each binary crate's build.rs via the VOICETASTIC_VERSION env var.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write  # Required by softprops/action-gh-release to create the Release.
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0  # `git log <prev-tag>..` needs full history.
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev libasound2-dev libopus-dev libopencore-amrnb-dev \
+            pkg-config protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --workspace --locked --release
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        env:
+          NEW_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          NEW_VERSION="${NEW_TAG#v}"
+          LAST_TAG="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname \
+                      | grep -v "^${NEW_TAG}\$" | head -n1 || true)"
+          NOTES_FILE="$(mktemp)"
+          CHANGELOG_SECTION=""
+          if [ -f CHANGELOG.md ]; then
+            CHANGELOG_SECTION="$(awk -v ver="${NEW_VERSION}" '
+              /^## / {
+                if (in_section) { exit }
+                header = $0
+                sub(/^## \[?/, "", header)
+                sub(/\].*$/, "", header)
+                sub(/[[:space:](].*$/, "", header)
+                if (header == ver) { in_section = 1; next }
+              }
+              in_section { print }
+            ' CHANGELOG.md)"
+          fi
+          if [ -n "$CHANGELOG_SECTION" ]; then
+            printf '%s\n' "$CHANGELOG_SECTION" > "${NOTES_FILE}"
+          else
+            echo "No CHANGELOG.md section found for ${NEW_VERSION}; falling back to git log." >&2
+            {
+              echo "## Changes"
+              echo
+              git log --pretty=format:'- %s (%h)' "${LAST_TAG:+${LAST_TAG}..}${NEW_TAG}" | head -n 200
+            } > "${NOTES_FILE}"
+          fi
+          echo "notes-file=${NOTES_FILE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.notes.outputs.notes-file }}
+          fail_on_unmatched_files: false

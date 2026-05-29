@@ -16,8 +16,8 @@ with the Android app for AMR-NB.
 
 ## Documentation
 
-- **Voice protocol spec** (normative wire format): [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol)
-- **Voice protocol wiki** (implementer guide, examples, diagrams): [project wiki](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Home)
+- **Voice protocol spec** (normative wire format): [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol)
+- **Voice protocol wiki** (implementer guide, examples, diagrams): [project wiki](https://github.com/voicetastic/voicetastic-core/wiki/Home)
 
 ## Prerequisites
 
@@ -107,7 +107,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 Voice messages are captured live from the microphone, encoded, and protected with
 FEC (Reed-Solomon), then chunked into ≤ 215-byte Meshtastic data packets sent
 over `PortNum::PRIVATE_APP` with a **16-byte v3 header** (protocol version `0x03`),
-see the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol). Four codecs are supported:
+see the [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol). Four codecs are supported:
 
 | Codec     | Wire id | Rate    | Bitrates                          | Notes                                  |
 |-----------|---------|---------|-----------------------------------|----------------------------------------|
@@ -119,9 +119,9 @@ see the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetasti
 The codec used to encode a message is advertised in its header, so peers always
 decode using the correct codec regardless of their own outgoing-codec setting.
 
-See the [Settings wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Settings) for the client-side settings
+See the [Settings wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Settings) for the client-side settings
 (codec choice, bitrate, recording duration, reassembly timeout) and
-the [Voice-Protocol wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Voice-Protocol) for the wire format.
+the [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol) for the wire format.
 
 ## Settings
 
@@ -143,7 +143,7 @@ cargo run -p voicetastic-cli -- settings reset voice.amrnb_mode
 cargo run -p voicetastic-cli -- settings reset
 ```
 
-Full key reference: [Settings wiki page](https://git.cha-sam.re/voicetastic/voicetastic-desktop/-/wikis/Settings).
+Full key reference: [Settings wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Settings).
 
 ## License
 
