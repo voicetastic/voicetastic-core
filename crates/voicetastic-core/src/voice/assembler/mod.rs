@@ -97,15 +97,20 @@ impl VoiceAssembler {
     /// changing. Using `set_config` with `AssemblerConfig { foo: …,
     /// ..Default::default() }` from multiple call sites is racy — each
     /// site clobbers the other's contribution by resetting every field
-    /// it doesn't explicitly mention. Returns error if the resulting config
-    /// violates invariants.
+    /// it doesn't explicitly mention. Returns error (and leaves the live
+    /// config unchanged) if the result of `f` violates invariants.
     pub fn update_config<F: FnOnce(&mut AssemblerConfig)>(
         &self,
         f: F,
     ) -> std::result::Result<(), String> {
-        let mut cfg = self.cfg.lock();
-        f(&mut cfg);
-        cfg.validate()?;
+        // Apply `f` to a clone first so a failing `validate()` leaves the
+        // live config untouched. Mutating the guard in place and then
+        // bailing on `?` would publish the invalid intermediate state to
+        // every subsequent reader.
+        let mut candidate = self.cfg.lock().clone();
+        f(&mut candidate);
+        candidate.validate()?;
+        *self.cfg.lock() = candidate;
         Ok(())
     }
 

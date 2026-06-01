@@ -1,6 +1,6 @@
-//! Bundles the per-burst prep step both drivers do before handing frames
-//! to [`super::tx_state::VoiceTx`]: compute the modem-preset-driven
-//! `chunk_size`, resolve the FEC policy via
+//! Bundles the per-burst prep step a non-tokio driver does before
+//! handing frames to [`super::tx_state::VoiceTx`]: compute the
+//! modem-preset-driven `chunk_size`, resolve the FEC policy via
 //! [`crate::settings::api::VoiceFecMode::resolve`], pick a fresh
 //! `message_id`, and invoke [`super::build_message`].
 //!
@@ -8,6 +8,9 @@
 //! (Codec2 / Opus / AMR-NB) and a snapshot of the radio's modem preset.
 //! Returns a [`PreparedVoice`] the driver feeds to its registry +
 //! [`super::tx_state::VoiceTx`] in two more lines.
+//!
+//! Native (tokio) callers use [`crate::voice::sender::VoiceSender`]
+//! instead — it folds the same prep step into its `send` method.
 
 use crate::settings::api::VoiceFecMode;
 use crate::voice::builder::{BuildConfig, EncodedMessage, build_message, random_message_id};
