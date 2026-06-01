@@ -137,6 +137,77 @@ fn entry_thread(e: &ChatEntry, my_num: Option<u32>) -> Option<Thread> {
     }
 }
 
+/// Collapsible roster of every node the radio currently knows about.
+/// Reads `SharedState.nodes`, which `watchers.rs` mirrors from the
+/// service's `watch_nodes()` channel, so no extra subscription is
+/// needed.
+fn nodes_panel(ui: &mut egui::Ui, nodes: &std::collections::HashMap<u32, NodeInfo>, my_num: Option<u32>) {
+    let mut rows: Vec<&NodeInfo> = nodes
+        .values()
+        .filter(|n| Some(n.num) != my_num && n.num != BROADCAST_ADDR)
+        .collect();
+    rows.sort_by_key(|n| std::cmp::Reverse(n.last_heard));
+
+    egui::CollapsingHeader::new(format!("📡 Nodes ({})", rows.len()))
+        .id_salt("chat_nodes_panel")
+        .default_open(false)
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                ui.weak("(no peers heard yet)");
+                return;
+            }
+            egui::Grid::new("nodes_grid")
+                .num_columns(5)
+                .spacing([12.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Node");
+                    ui.strong("Last heard");
+                    ui.strong("SNR");
+                    ui.strong("Battery");
+                    ui.strong("ID");
+                    ui.end_row();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(0);
+                    for n in rows {
+                        let name = node_display_name(Some(n), n.num);
+                        ui.label(name);
+                        ui.label(format_relative_age(n.last_heard, now));
+                        ui.label(format!("{:.1} dB", n.snr));
+                        ui.label(format_battery(n.device_metrics.as_ref()));
+                        ui.weak(format!("!{:08x}", n.num));
+                        ui.end_row();
+                    }
+                });
+        });
+}
+
+fn format_relative_age(last_heard: u32, now: u32) -> String {
+    if last_heard == 0 {
+        return "—".into();
+    }
+    let age = now.saturating_sub(last_heard);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    }
+}
+
+fn format_battery(metrics: Option<&voicetastic_core::proto::DeviceMetrics>) -> String {
+    match metrics.and_then(|m| m.battery_level) {
+        Some(101) => "AC".into(),
+        Some(pct) => format!("{pct}%"),
+        None => "—".into(),
+    }
+}
+
 pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
     ui.heading("Text Chat");
     ui.separator();
@@ -152,6 +223,8 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             st.my_info.as_ref().map(|m| m.my_node_num),
         )
     };
+
+    nodes_panel(ui, &nodes, my_num);
 
     // Active channels (for the broadcast room dropdown).
     let mut bcast_indices: BTreeSet<u32> = BTreeSet::new();
