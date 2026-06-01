@@ -1041,7 +1041,8 @@ mod smoke;
 
 pub use codec2_wrapper::{Codec2Encoder, Codec2Error, codec2_decode};
 pub use mesh_service::{
-    IncomingDataMsg, IncomingTextMsg, MeshConfigListener, MeshConnectionState, MeshDataListener,
-    MeshQueueListener, MeshService, MeshServiceError, MeshStateListener, MeshTextListener,
-    MeshTransport, MeshTransportSink, QueueStatusEvent, node_id_to_num, node_num_to_id,
+    AckResultKind, IncomingDataMsg, IncomingTextMsg, MeshAckListener, MeshConfigListener,
+    MeshConnectionState, MeshDataListener, MeshQueueListener, MeshService, MeshServiceError,
+    MeshStateListener, MeshTextListener, MeshTransport, MeshTransportSink, QueueStatusEvent,
+    node_id_to_num, node_num_to_id,
 };

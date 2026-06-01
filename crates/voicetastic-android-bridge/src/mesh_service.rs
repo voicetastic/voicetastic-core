@@ -254,6 +254,36 @@ pub trait MeshQueueListener: Send + Sync {
     fn on_queue_status(&self, event: QueueStatusEvent);
 }
 
+/// Coarse delivery outcome for an outgoing packet. Mirrors core's
+/// [`voicetastic_core::meshtastic::ack::AckResult`] minus the variant
+/// payload (the `Failed(_)` reason is reduced to a flat `Failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckResultKind {
+    Delivered,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl From<voicetastic_core::meshtastic::ack::AckResult> for AckResultKind {
+    fn from(r: voicetastic_core::meshtastic::ack::AckResult) -> Self {
+        use voicetastic_core::meshtastic::ack::AckResult;
+        match r {
+            AckResult::Delivered => Self::Delivered,
+            AckResult::Failed(_) => Self::Failed,
+            AckResult::TimedOut => Self::TimedOut,
+            AckResult::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Per-packet ack/nak listener. Fires once for every ack/nak the
+/// firmware reports for any outgoing packet, not just the ones the
+/// caller explicitly tracked via `send_text_tracked`.
+pub trait MeshAckListener: Send + Sync {
+    fn on_ack(&self, packet_id: u32, result: AckResultKind);
+}
+
 /// Per-section config listener. Each call receives a fully-encoded
 /// protobuf payload that Kotlin parses with its geeksville-mesh codegen.
 /// The bridge intentionally does NOT re-export the proto schema across
@@ -374,6 +404,7 @@ struct ListenerHandles {
     data: Option<JoinHandle<()>>,
     queue: Option<JoinHandle<()>>,
     config: Option<JoinHandle<()>>,
+    ack: Option<JoinHandle<()>>,
 }
 
 impl ListenerHandles {
@@ -402,6 +433,11 @@ impl ListenerHandles {
             prev.abort();
         }
     }
+    fn replace_ack(&mut self, h: JoinHandle<()>) {
+        if let Some(prev) = self.ack.replace(h) {
+            prev.abort();
+        }
+    }
     fn abort_all(&mut self) {
         for h in [
             self.state.take(),
@@ -409,6 +445,7 @@ impl ListenerHandles {
             self.data.take(),
             self.queue.take(),
             self.config.take(),
+            self.ack.take(),
         ]
         .into_iter()
         .flatten()
@@ -624,6 +661,22 @@ impl MeshService {
             }
         });
         self.listeners.lock().replace_queue(handle);
+    }
+
+    pub fn set_ack_listener(&self, listener: Arc<dyn MeshAckListener>) {
+        let mut rx = self.core.subscribe_acks();
+        let handle = runtime().spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok((id, result)) => listener.on_ack(id, result.into()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "ack listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        self.listeners.lock().replace_ack(handle);
     }
 
     pub fn set_config_listener(&self, listener: Arc<dyn MeshConfigListener>) {

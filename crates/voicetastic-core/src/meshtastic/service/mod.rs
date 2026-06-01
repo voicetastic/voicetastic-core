@@ -139,6 +139,14 @@ struct Inner {
     pub(super) queue_status_tx: broadcast::Sender<types::QueueStatusEvent>,
     /// Protocol-filtered inbound voice data (port + version checked).
     pub(super) voice_data_tx: broadcast::Sender<VoiceData>,
+    /// Fan-out of every ack/nak event the firmware reports, keyed by the
+    /// originating packet id. The `pending_acks` oneshot path below is
+    /// the synchronous "wait for a specific packet" API; this broadcast
+    /// is the per-event firehose that callers (Android Kotlin bindings,
+    /// future delivery-icon UI) subscribe to without having to register
+    /// per-id slots in advance.
+    pub(super) ack_event_tx:
+        broadcast::Sender<(u32, crate::meshtastic::ack::AckResult)>,
     /// Outbound packets awaiting their firmware-reported delivery ack.
     /// Keyed by the packet id; populated by `send_*_tracked` before the
     /// send, drained by the inbound `Routing` handler. Entries whose
@@ -188,6 +196,7 @@ impl MeshtasticService {
         // the ~64 KB worst-case footprint is cheap.
         let (queue_status_tx, _) = broadcast::channel(4096);
         let (voice_data_tx, _) = broadcast::channel(512);
+        let (ack_event_tx, _) = broadcast::channel(256);
         let (lora_tx, _) = watch::channel(None);
         let (device_tx, _) = watch::channel(None);
         let (position_tx, _) = watch::channel(None);
@@ -231,6 +240,7 @@ impl MeshtasticService {
             voice_tx: voice_tx_send,
             queue_status_tx,
             voice_data_tx,
+            ack_event_tx,
             pending_acks: parking_lot::Mutex::new(HashMap::new()),
             lora_tx,
             device_tx,
@@ -336,6 +346,17 @@ impl MeshtasticService {
     pub fn subscribe_data(&self) -> broadcast::Receiver<IncomingData> {
         self.inner.incoming_data_tx.subscribe()
     }
+    /// Subscribe to per-packet ack/nak events as the firmware reports
+    /// them. Each event carries `(packet_id, AckResult)`. Use this when
+    /// you need delivery status for every outgoing packet (e.g. to flip
+    /// a UI delivery-status icon) without registering oneshot waiters
+    /// per packet via [`Self::send_text_tracked`].
+    pub fn subscribe_acks(
+        &self,
+    ) -> broadcast::Receiver<(u32, crate::meshtastic::ack::AckResult)> {
+        self.inner.ack_event_tx.subscribe()
+    }
+
     /// Subscribe to firmware queue-status events. Each event carries
     /// `(res, free, maxlen, mesh_packet_id)` and is emitted as the radio
     /// queue accepts or drains a packet. Useful for confirming that a

@@ -599,6 +599,24 @@ interface MeshQueueListener {
     void on_queue_status(QueueStatusEvent event);
 };
 
+/// Coarse delivery outcome for an outgoing packet. Mirrors core's
+/// `AckResult` minus the variant payload; bridges directly to a
+/// Kotlin enum.
+enum AckResultKind {
+    "Delivered",
+    "Failed",
+    "TimedOut",
+    "Cancelled",
+};
+
+/// Per-packet ack/nak listener. Fired once for every ack/nak the
+/// firmware reports, on every outgoing packet (not just ones the
+/// caller explicitly tracked via `send_text_tracked`).
+[Trait, WithForeign]
+interface MeshAckListener {
+    void on_ack(u32 packet_id, AckResultKind result);
+};
+
 /// Per-section config listener. All payload arguments are
 /// protobuf-encoded; Kotlin decodes with its geeksville-mesh codegen.
 [Trait, WithForeign]
@@ -670,6 +688,7 @@ interface MeshService {
     void set_data_listener(MeshDataListener listener);
     void set_queue_listener(MeshQueueListener listener);
     void set_config_listener(MeshConfigListener listener);
+    void set_ack_listener(MeshAckListener listener);
 
     /// Shared `VoiceSender` bound to this service. Cached; subsequent
     /// calls return the same instance. Frontends should call this once

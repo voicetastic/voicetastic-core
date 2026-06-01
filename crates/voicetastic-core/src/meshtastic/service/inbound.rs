@@ -136,6 +136,10 @@ impl MeshtasticService {
                 let _ = self.inner.queue_status_tx.send(qs);
             }
             InboundEvent::AckOrNak { request_id, result } => {
+                // Broadcast first so subscribers (Android Kotlin
+                // bindings, future delivery-icon UI) get every event,
+                // not just the ones with an explicit oneshot waiter.
+                let _ = self.inner.ack_event_tx.send((request_id, result));
                 self.signal_ack(request_id, result);
             }
             // is_snapshot() routed these above.
