@@ -94,6 +94,12 @@ pub const DEFAULT_OPUS_BANDWIDTH: &str = OPUS_BANDWIDTH_WIDE;
 /// (where the `denoise` feature may be disabled) don't surprise users.
 pub const DEFAULT_VOICE_DENOISE_ENABLED: bool = false;
 
+/// Default for the partial-play-on-timeout receive policy. When true, an
+/// incomplete voice message whose reassembly timer fires is finalised with
+/// whatever chunks did arrive (silence padded for the rest); when false,
+/// the partial is dropped on timeout.
+pub const DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT: bool = true;
+
 /// FEC parity policy id strings. Persisted as text so the TOML file is
 /// human-editable and forward-compatible with new variants.
 pub const VOICE_FEC_MODE_AUTO: &str = "auto";
@@ -200,6 +206,13 @@ pub struct AppSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice_denoise_enabled: Option<bool>,
 
+    /// When `Some(true)` (the default), the receiver plays back any chunks
+    /// it has when the reassembly timer fires for a message it never
+    /// completed (silence padded for missing data). `None` falls back to
+    /// [`DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_partial_play_on_timeout: Option<bool>,
+
     /// Sender-side FEC parity policy id. One of
     /// [`VOICE_FEC_MODE_AUTO`] (default) / `_OFF` / `_LIGHT` / `_MEDIUM` /
     /// `_HEAVY`. Resolved against destination + modem preset at send time
@@ -296,6 +309,12 @@ impl AppSettings {
     pub fn voice_denoise_enabled(&self) -> bool {
         self.voice_denoise_enabled
             .unwrap_or(DEFAULT_VOICE_DENOISE_ENABLED)
+    }
+
+    /// Effective partial-play-on-timeout toggle.
+    pub fn voice_partial_play_on_timeout(&self) -> bool {
+        self.voice_partial_play_on_timeout
+            .unwrap_or(DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT)
     }
 
     /// Effective FEC mode id (validated). Unknown values fall back to

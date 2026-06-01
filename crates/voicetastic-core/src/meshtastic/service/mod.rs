@@ -388,6 +388,22 @@ impl MeshtasticService {
             .map(|i| i.my_node_num)
     }
 
+    /// Wipe the radio's NodeDB, drop our cached learned-peer map, and
+    /// re-request the configuration burst.
+    ///
+    /// `reset_nodedb()` alone leaves the local `nodes_tx` snapshot intact
+    /// (the firmware acks the admin packet but never re-bursts NodeInfo
+    /// for an empty NodeDB), so a UI that ran just `reset_nodedb()` would
+    /// keep showing the stale peer list. This helper clears the local
+    /// snapshot in lockstep and then drives `refresh_config()` so the
+    /// config-section caches resync too.
+    pub async fn reset_nodedb_and_refresh(&self) -> Result<()> {
+        self.reset_nodedb().await?;
+        self.inner.state.lock().clear_nodes();
+        let _ = self.inner.nodes_tx.send(std::collections::HashMap::new());
+        self.refresh_config().await
+    }
+
     /// Re-request the entire configuration burst.
     pub async fn refresh_config(&self) -> Result<()> {
         let prev = *self.inner.state_tx.borrow();

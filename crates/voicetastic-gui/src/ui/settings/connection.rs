@@ -86,6 +86,12 @@ pub(super) fn actions_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                 });
             }
             ui.add_space(4.0);
+            if ui.button("Reset NodeDB").clicked() {
+                run_status(ctx, "Reset NodeDB", |svc| {
+                    Box::pin(async move { svc.reset_nodedb_and_refresh().await })
+                });
+            }
+            ui.add_space(4.0);
             let red = ui.style().visuals.error_fg_color;
             let btn = egui::Button::new(egui::RichText::new("Factory reset").color(red));
             if ui.add(btn).clicked() {

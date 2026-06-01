@@ -348,6 +348,27 @@ pub fn section(ui: &mut egui::Ui, app: &mut VoicetasticApp) {
                 );
             }
 
+            ui.add_space(6.0);
+            let mut partial = app.settings.voice_partial_play_on_timeout();
+            ui.horizontal(|ui| {
+                let resp = ui.checkbox(&mut partial, "Play partial voice on timeout");
+                if resp.changed()
+                    && let Err(e) = app.settings.set_voice_partial_play_on_timeout(partial)
+                {
+                    warn("set voice_partial_play_on_timeout", e);
+                }
+                if ui.small_button("Reset").clicked()
+                    && let Err(e) = app.settings.reset(SettingKey::VoicePartialPlayOnTimeout)
+                {
+                    warn("reset voice_partial_play_on_timeout", e);
+                }
+            });
+            ui.weak(
+                "When a voice message never completes within the reassembly window, \
+                 play whatever chunks arrived (missing data is filled with silence) \
+                 instead of dropping the message. On by default.",
+            );
+
             if !audio::is_available() {
                 ui.add_space(4.0);
                 ui.colored_label(

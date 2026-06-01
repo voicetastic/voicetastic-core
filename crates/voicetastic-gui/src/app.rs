@@ -102,6 +102,7 @@ impl VoicetasticApp {
                 message_timeout: std::time::Duration::from_secs(
                     settings.reassembly_timeout_secs() as u64
                 ),
+                partial_play_on_timeout: settings.voice_partial_play_on_timeout(),
                 ..AssemblerConfig::default()
             };
             // Keep the consecutive-silence budget tied to
@@ -271,6 +272,14 @@ impl SettingsListener for VoiceRuntimeListener {
                     }
                 }) {
                     error!("Failed to update assembler nack params: {}", e);
+                }
+            }
+            SettingKey::VoicePartialPlayOnTimeout => {
+                let enabled = self.settings.voice_partial_play_on_timeout();
+                if let Err(e) = self.assembler.update_config(|cfg| {
+                    cfg.partial_play_on_timeout = enabled;
+                }) {
+                    error!("Failed to update assembler partial_play_on_timeout: {}", e);
                 }
             }
             _ => {}

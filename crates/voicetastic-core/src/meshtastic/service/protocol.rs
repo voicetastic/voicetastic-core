@@ -682,6 +682,14 @@ impl ProtocolState {
         self.channels.clear();
         self.our_private_key = None;
     }
+
+    /// Wipe the learned-peer map (every `(node_num, NodeInfo)` we've
+    /// accumulated). Mirrors what the firmware does on
+    /// `AdminMessage::NodedbReset` so a client driving the same admin
+    /// action can resync its local view in lockstep.
+    pub fn clear_nodes(&mut self) {
+        self.nodes.clear();
+    }
 }
 
 #[cfg(test)]

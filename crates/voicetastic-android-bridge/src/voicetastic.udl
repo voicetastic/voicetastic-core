@@ -423,6 +423,7 @@ enum SettingKey {
     "VoiceOpusBitrateKbps",
     "VoiceOpusBandwidth",
     "VoiceDenoiseEnabled",
+    "VoicePartialPlayOnTimeout",
     "VoiceFecMode",
     "VoiceNackMode",
     "ThemeMode",
@@ -500,6 +501,10 @@ interface SettingsApi {
     boolean voice_denoise_enabled();
     [Throws=SettingsError]
     void set_voice_denoise_enabled(boolean enabled);
+
+    boolean voice_partial_play_on_timeout();
+    [Throws=SettingsError]
+    void set_voice_partial_play_on_timeout(boolean enabled);
 };
 
 // -----------------------------------------------------------------------------

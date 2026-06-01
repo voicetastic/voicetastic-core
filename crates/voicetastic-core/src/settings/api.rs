@@ -21,7 +21,8 @@ use super::data::{
     AMRNB_MODE_1220, AppSettings, CODEC2_MODE_1200, DEFAULT_AMRNB_MODE, DEFAULT_CODEC2_MODE,
     DEFAULT_OPUS_BANDWIDTH, DEFAULT_OPUS_BITRATE_KBPS, DEFAULT_REASSEMBLY_TIMEOUT_SECS,
     DEFAULT_THEME_CONTRAST, DEFAULT_THEME_MODE, DEFAULT_VOICE_CODEC, DEFAULT_VOICE_DENOISE_ENABLED,
-    DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE, OPUS_BANDWIDTH_NARROW,
+    DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_MAX_SECS, DEFAULT_VOICE_NACK_MODE,
+    DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT, OPUS_BANDWIDTH_NARROW,
     OPUS_BANDWIDTH_WIDE, OPUS_BITRATE_KBPS_MAX, OPUS_BITRATE_KBPS_MIN,
     REASSEMBLY_TIMEOUT_LOWER_SECS, REASSEMBLY_TIMEOUT_UPPER_SECS, THEME_CONTRAST_HIGH,
     THEME_CONTRAST_STANDARD, THEME_MODE_DARK, THEME_MODE_LIGHT, THEME_MODE_SYSTEM,
@@ -69,6 +70,9 @@ pub enum SettingKey {
     VoiceOpusBandwidth,
     /// Capture-side RNNoise noise-suppression toggle.
     VoiceDenoiseEnabled,
+    /// Receive-side: play partially-received voice when the reassembly
+    /// timer fires for a never-completed message.
+    VoicePartialPlayOnTimeout,
     /// Sender-side FEC parity policy.
     VoiceFecMode,
     /// Receive-side NACK aggressiveness policy.
@@ -92,6 +96,7 @@ impl SettingKey {
             Self::VoiceOpusBitrateKbps => "voice.opus_bitrate_kbps",
             Self::VoiceOpusBandwidth => "voice.opus_bandwidth",
             Self::VoiceDenoiseEnabled => "voice.denoise_enabled",
+            Self::VoicePartialPlayOnTimeout => "voice.partial_play_on_timeout",
             Self::VoiceFecMode => "voice.fec_mode",
             Self::VoiceNackMode => "voice.nack_mode",
             Self::ThemeMode => "theme.mode",
@@ -110,6 +115,7 @@ impl SettingKey {
             "voice.opus_bitrate_kbps" => Self::VoiceOpusBitrateKbps,
             "voice.opus_bandwidth" => Self::VoiceOpusBandwidth,
             "voice.denoise_enabled" => Self::VoiceDenoiseEnabled,
+            "voice.partial_play_on_timeout" => Self::VoicePartialPlayOnTimeout,
             "voice.fec_mode" => Self::VoiceFecMode,
             "voice.nack_mode" => Self::VoiceNackMode,
             "theme.mode" => Self::ThemeMode,
@@ -129,6 +135,7 @@ impl SettingKey {
             SettingKey::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth,
             SettingKey::VoiceDenoiseEnabled,
+            SettingKey::VoicePartialPlayOnTimeout,
             SettingKey::VoiceFecMode,
             SettingKey::VoiceNackMode,
             SettingKey::ThemeMode,
@@ -927,6 +934,15 @@ impl SettingsApi {
         self.persist_and_notify(SettingKey::VoiceDenoiseEnabled)
     }
 
+    pub fn voice_partial_play_on_timeout(&self) -> bool {
+        self.inner.read().voice_partial_play_on_timeout()
+    }
+
+    pub fn set_voice_partial_play_on_timeout(&self, enabled: bool) -> SettingsResult<()> {
+        self.inner.write().voice_partial_play_on_timeout = Some(enabled);
+        self.persist_and_notify(SettingKey::VoicePartialPlayOnTimeout)
+    }
+
     pub fn set_voice_fec_mode(&self, mode: VoiceFecMode) -> SettingsResult<()> {
         self.inner.write().voice_fec_mode = Some(mode.id().to_string());
         self.persist_and_notify(SettingKey::VoiceFecMode)
@@ -961,6 +977,7 @@ impl SettingsApi {
                 SettingKey::VoiceOpusBitrateKbps => g.voice_opus_bitrate_kbps = None,
                 SettingKey::VoiceOpusBandwidth => g.voice_opus_bandwidth = None,
                 SettingKey::VoiceDenoiseEnabled => g.voice_denoise_enabled = None,
+                SettingKey::VoicePartialPlayOnTimeout => g.voice_partial_play_on_timeout = None,
                 SettingKey::VoiceFecMode => g.voice_fec_mode = None,
                 SettingKey::VoiceNackMode => g.voice_nack_mode = None,
                 SettingKey::ThemeMode => g.theme_mode = None,
@@ -997,6 +1014,9 @@ impl SettingsApi {
             SettingKey::VoiceOpusBitrateKbps => self.voice_opus_bitrate_kbps().to_string(),
             SettingKey::VoiceOpusBandwidth => self.voice_opus_bandwidth().id().to_string(),
             SettingKey::VoiceDenoiseEnabled => self.voice_denoise_enabled().to_string(),
+            SettingKey::VoicePartialPlayOnTimeout => {
+                self.voice_partial_play_on_timeout().to_string()
+            }
             SettingKey::VoiceFecMode => self.voice_fec_mode().id().to_string(),
             SettingKey::VoiceNackMode => self.voice_nack_mode().id().to_string(),
             SettingKey::ThemeMode => self.theme_mode().id().to_string(),
@@ -1079,6 +1099,10 @@ impl SettingsApi {
             SettingKey::VoiceDenoiseEnabled => {
                 let b = parse_bool(key, value)?;
                 self.set_voice_denoise_enabled(b)
+            }
+            SettingKey::VoicePartialPlayOnTimeout => {
+                let b = parse_bool(key, value)?;
+                self.set_voice_partial_play_on_timeout(b)
             }
             SettingKey::VoiceFecMode => {
                 let mode = VoiceFecMode::from_id(value).ok_or_else(|| SettingsError::Invalid {
@@ -1207,6 +1231,12 @@ impl SettingsApi {
                 "Run captured audio through an RNNoise-based denoiser before the encoder. Reduces stationary background noise (fans, HVAC, keyboard) at the cost of ~10 ms latency. No effect on builds without the `denoise` feature.",
                 SettingKind::Bool,
                 DEFAULT_VOICE_DENOISE_ENABLED.to_string(),
+            ),
+            SettingKey::VoicePartialPlayOnTimeout => (
+                "Play partial voice on timeout",
+                "When a voice message never completes within the reassembly window, play back whatever chunks did arrive (silence padded for the rest) instead of dropping the message.",
+                SettingKind::Bool,
+                DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT.to_string(),
             ),
             SettingKey::VoiceFecMode => (
                 "FEC parity policy (sender)",
