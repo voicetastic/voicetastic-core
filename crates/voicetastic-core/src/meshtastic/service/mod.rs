@@ -887,6 +887,36 @@ mod tests {
         assert_eq!(owner.long_name, "Me");
     }
 
+    /// Smoke test for `reset_nodedb`: with `my_node_num` known but no
+    /// transport attached, the call routes through `send_admin` and fails
+    /// at the transport step (NotConnected). Confirms the variant is wired
+    /// up and the method exists at the public surface.
+    #[tokio::test]
+    async fn reset_nodedb_without_transport_errors() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x1234_5678,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        assert!(svc.reset_nodedb().await.is_err());
+    }
+
+    /// Same smoke test for `remove_node` — routes through `send_admin`,
+    /// fails on the missing transport.
+    #[tokio::test]
+    async fn remove_node_without_transport_errors() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x1234_5678,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        assert!(svc.remove_node(0xDEAD_BEEF).await.is_err());
+    }
+
     #[tokio::test]
     async fn refresh_config_clears_section_snapshots() {
         let svc = make_service().await;

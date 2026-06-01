@@ -236,6 +236,32 @@ impl MeshtasticService {
             .await
     }
 
+    /// Wipe the local node's NodeDB.
+    ///
+    /// Targets the radio this service is connected to over BLE / serial.
+    /// Removes every learned `(node_num, NodeInfo)` entry it has accumulated
+    /// from the mesh (positions, names, last-heard timestamps, public keys).
+    /// Useful during testing when peer nodes have been re-flashed or
+    /// re-named and their stale entries linger on this radio.
+    ///
+    /// Does NOT touch other nodes' NodeDBs: each radio has to be told
+    /// individually, either over a direct link or via remote-admin DM
+    /// (requires the admin key configured).
+    pub async fn reset_nodedb(&self) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::NodedbReset(true))
+            .await
+    }
+
+    /// Remove a single entry from the local node's NodeDB.
+    ///
+    /// Targets the radio this service is connected to. Use [`Self::reset_nodedb`]
+    /// to wipe everything instead. No-op on the radio if `node_num` is not
+    /// in its NodeDB; the firmware still acks the admin packet.
+    pub async fn remove_node(&self, node_num: u32) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::RemoveByNodenum(node_num))
+            .await
+    }
+
     async fn send_to_radio(&self, payload: to_radio::PayloadVariant) -> Result<()> {
         let transport = {
             let slot = self.inner.transport.lock().await;
