@@ -66,7 +66,6 @@ use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
 use crate::voice::outgoing::{OutgoingVoiceRegistry, RetransmitSkipReason};
-use crate::voice::sink::VoiceFrameSink;
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
 /// Default linger window after the initial burst. Matches the
@@ -248,7 +247,7 @@ pub struct VoiceSender {
     /// Limits concurrent retransmit tasks spawned from the NACK listener
     /// to prevent unbounded task growth when many messages are NACK'd
     /// simultaneously.
-    retransmit_permits: Arc<tokio::sync::Semaphore>,
+    retransmit_permits: Arc<Semaphore>,
     /// Diagnostic counter: NACKs dropped due to listener lagging behind
     /// the broadcast channel. High values indicate the NACK listener task
     /// cannot keep up with the message arrival rate.
@@ -538,7 +537,7 @@ async fn nack_listener_task(
             map.get(&message_id)
                 .map(|a| (a.status_tx.clone(), a.channel, a.to))
         };
-        let Some((status_tx, _channel, to)) = entry else {
+        let Some((status_tx, channel, to)) = entry else {
             continue;
         };
         let Ok((header, body)) = ChunkHeader::parse(&data.payload) else {
@@ -587,7 +586,7 @@ async fn nack_listener_task(
                     spawn_deferred_retransmit(
                         Arc::downgrade(&sender),
                         nack.message_id,
-                        _channel,
+                        channel,
                         to,
                         status_tx.clone(),
                         deadline,
@@ -645,7 +644,6 @@ async fn nack_listener_task(
         let svc = sender.svc.clone();
         let registry = Arc::clone(&sender.registry);
         let message_id = nack.message_id;
-        let channel = _channel;
         tokio::spawn(async move {
             let _permit = match permits.acquire_owned().await {
                 Ok(p) => p,

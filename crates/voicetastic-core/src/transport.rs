@@ -52,8 +52,8 @@ pub trait Transport: Send + Sync {
     /// Long Write (Prepare/Execute), so going past this cap is a
     /// guaranteed silent drop.
     ///
-    /// Used by [`crate::voice::sender::VoiceSender`] (via the
-    /// [`crate::voice::sink::VoiceFrameSink`] trait) to size voice
+    /// Used by [`crate::voice::sender::VoiceSender`] (through
+    /// [`crate::MeshtasticService::max_voice_body_size`]) to size voice
     /// chunks so each wire frame fits in a single transport write.
     fn max_tx_payload(&self) -> usize {
         usize::MAX

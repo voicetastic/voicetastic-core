@@ -1,12 +1,20 @@
 //! Sans-IO state machine for sending one voice burst, frame by frame.
 //!
-//! Drivers (the native voice TX worker on desktop / Android, the wasm
-//! browser client) own the radio handle and the async runtime — they
-//! pace voice frames on different primitives (`tokio::time::sleep` vs.
-//! `setTimeout`). The *policy* — when the per-frame airtime gap is
-//! satisfied, whether the firmware's outbound queue has room, and the
-//! safety-valve timeout for stale queue reports — is identical across
-//! platforms and lives here.
+//! ## Scope
+//!
+//! This is the **sans-IO** TX path, intended for drivers that can't use
+//! tokio primitives directly — primarily the future `wasm32` browser
+//! client, which paces frames on `setTimeout` instead of
+//! `tokio::time::sleep`. It's published as part of the crate's public
+//! API so a non-native driver can drive the protocol through pure
+//! `next_action(now, queue_free)` calls without naming any tokio types.
+//!
+//! The native (tokio) path lives in
+//! [`crate::meshtastic::service::voice_tx`] and is not built on top of
+//! `VoiceTx` — it shares only the pure pacing/backpressure policy in
+//! [`crate::voice::tx_policy`]. Both paths converge on identical
+//! per-frame airtime gap + firmware-queue-depth decisions; only the
+//! waiting primitive differs.
 //!
 //! Usage from a driver:
 //!

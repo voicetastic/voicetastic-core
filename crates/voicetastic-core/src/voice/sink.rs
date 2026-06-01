@@ -1,8 +1,17 @@
 //! Voice frame transmission interface.
 //!
-//! `VoiceFrameSink` is the minimal interface `VoiceSender` needs to do its job:
-//! enqueue frames and listen for inbound NACK packets. It exists so the
-//! sender doesn't have to name a concrete service type.
+//! `VoiceFrameSink` is the seam between a voice driver and the radio it
+//! ships frames to. The shipping crate's native [`crate::voice::sender::VoiceSender`]
+//! talks to [`crate::MeshtasticService`] directly (tighter integration
+//! with the inherent NACK / queue-status plumbing); this trait is the
+//! intended attachment point for non-tokio drivers — primarily the
+//! `wasm32` browser client, which paces voice frames through the
+//! sans-IO [`crate::voice::tx_state::VoiceTx`] state machine instead of
+//! the native worker.
+//!
+//! [`MeshtasticService`](crate::MeshtasticService) implements this trait
+//! so the same service can back either driver as the browser client
+//! lands.
 
 use std::time::Duration;
 
@@ -16,8 +25,10 @@ use crate::voice::types::VoiceData;
 
 /// Minimal interface for voice frame transmission.
 ///
-/// `VoiceSender` uses this to send bursts and retransmits, and to subscribe to
-/// inbound NACK packets.
+/// Used by non-tokio drivers (browser/wasm) to enqueue bursts +
+/// retransmits and to subscribe to inbound NACK packets. The native
+/// [`crate::voice::sender::VoiceSender`] calls into
+/// [`crate::MeshtasticService`] directly and does not consume this trait.
 #[async_trait]
 pub trait VoiceFrameSink: Send + Sync {
     /// Enqueue a voice frame for transmission. The service handles protocol-specific
