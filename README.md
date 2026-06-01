@@ -145,6 +145,27 @@ cargo run -p voicetastic-cli -- settings reset
 
 Full key reference: [Settings wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Settings).
 
+## NodeDB Management
+
+`MeshtasticService` exposes two admin helpers for clearing a radio's
+learned node list. Useful during testing when peer radios have been
+re-flashed or re-named and their stale entries linger:
+
+- `reset_nodedb()` wipes every `NodeInfo` entry on the attached radio.
+- `remove_node(node_num)` drops one specific entry.
+
+The firmware applies both changes immediately and persists them to
+flash, so **no reboot is required**. Each radio holds its own copy
+of the NodeDB though, so clearing peer entries requires either a
+direct link to each peer or remote-admin DMs with the admin key
+configured.
+
+The phone-API client (this crate) caches its own snapshot of the
+NodeDB in the `nodes_tx` watch channel; that snapshot is **not**
+auto-refreshed when the firmware-side list changes. To see the
+cleared state in-app, call `refresh_config()` to re-request the
+config burst, or disconnect and reconnect.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE) for the full text.
