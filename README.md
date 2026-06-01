@@ -145,6 +145,46 @@ cargo run -p voicetastic-cli -- settings reset
 
 Full key reference: [Settings wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Settings).
 
+## Auto-Reboot Watchdog (opt-in)
+
+Two complementary probes can ask the attached radio to reboot itself
+when it appears wedged, mirroring the manual "power-cycle the node"
+recovery. Both are off by default and enabled via environment
+variables. They are independent of each other and can be combined.
+
+### `VOICETASTIC_RX_WATCHDOG_MAX_TRIPS=<N>` (passive)
+
+Counts consecutive 180s silence-probe trips (the same probe that
+already disconnects + auto-reconnects on a dead inbound stream). The
+counter is cleared every time a peer-originated `NodeInfo`,
+`IncomingText`, `IncomingData`, or `Voice` event lands while the
+connection is `Ready`, so a single transient trip can't accumulate.
+When `N` consecutive trips happen without real mesh activity in
+between, the next disconnect is preceded by a `reboot(0)`.
+
+Recommended starting value: `N=2` (first trip recovers via reconnect,
+second consecutive trip reboots). Set higher to be more conservative.
+
+### `VOICETASTIC_SELF_DM_HEARTBEAT_SECS=<S>` (active)
+
+Periodically sends a marker self-DM to our own node number and waits
+up to 15 seconds for the firmware's short-circuited `Routing` ack.
+After 3 consecutive ack failures the watchdog requests `reboot(0)`.
+
+This probe catches BLE/serial + firmware-routing wedges only - the
+self-DM never touches the LoRa radio, so it cannot detect a LoRa RX
+wedge. The marker text is filtered out before reaching subscribers,
+so it never appears in the chat UI.
+
+Recommended starting value: `S=60` (probe once per minute). Lower
+values surface wedges faster but add BLE/serial traffic.
+
+### Combined behaviour
+
+Both probes can fire `reboot(0)` independently; the firmware will only
+honour the first request. After reboot, the existing auto-reconnect
+watcher brings the link back up.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE) for the full text.

@@ -5,13 +5,15 @@
 //! All Meshtastic decode/interpret logic lives in [`super::protocol`]; this
 //! file is just the tokio-flavoured glue that publishes the decoded effects.
 
+use std::sync::atomic::Ordering;
+
 use tracing::{info, warn};
 
 use crate::error::Result;
 use crate::proto::config;
 
 use super::protocol::{InboundCtx, InboundEvent, decode_inbound};
-use super::{ConnectionState, MeshtasticService};
+use super::{ConnectionState, HEARTBEAT_MARKER, MeshtasticService};
 
 impl MeshtasticService {
     pub(super) async fn handle_from_radio(&self, bytes: &[u8]) -> Result<()> {
@@ -55,8 +57,22 @@ impl MeshtasticService {
                 InboundEvent::MyInfo(_) => {
                     let _ = self.inner.my_info_tx.send(state.my_info.clone());
                 }
-                InboundEvent::NodeInfo(_) => {
+                InboundEvent::NodeInfo(ref n) => {
                     let _ = self.inner.nodes_tx.send(state.nodes.clone());
+                    // Peer NodeInfo arrival in Ready state proves the
+                    // radio's LoRa RX (or store-and-forward) is alive.
+                    // Reset the watchdog counter so a one-off silence
+                    // trip doesn't escalate to reboot. Config-burst
+                    // NodeInfos (during Configuring) are excluded by
+                    // the state check.
+                    let me = state.my_info.as_ref().map(|i| i.my_node_num);
+                    if Some(n.num) != me
+                        && *self.inner.state_tx.borrow() == ConnectionState::Ready
+                    {
+                        self.inner
+                            .consecutive_silence_trips
+                            .store(0, Ordering::Relaxed);
+                    }
                 }
                 InboundEvent::Owner(_) => {
                     let _ = self.inner.owner_tx.send(state.owner.clone());
@@ -115,14 +131,38 @@ impl MeshtasticService {
                 let _ = self.inner.config_complete_tx.send(nonce);
             }
             InboundEvent::IncomingText(text) => {
+                let me = self.my_node_num();
+                // Drop the self-DM heartbeat echo (sent by
+                // `spawn_heartbeat_task`) before it reaches subscribers
+                // so the chat UI never displays it.
+                if Some(text.from) == me && text.text == HEARTBEAT_MARKER {
+                    return;
+                }
+                if Some(text.from) != me {
+                    self.inner
+                        .consecutive_silence_trips
+                        .store(0, Ordering::Relaxed);
+                }
                 let _ = self.inner.incoming_text_tx.send(text);
             }
             InboundEvent::IncomingData(data) => {
+                let me = self.my_node_num();
+                if Some(data.from) != me {
+                    self.inner
+                        .consecutive_silence_trips
+                        .store(0, Ordering::Relaxed);
+                }
                 if self.inner.incoming_data_tx.receiver_count() > 0 {
                     let _ = self.inner.incoming_data_tx.send(data);
                 }
             }
             InboundEvent::Voice(voice) => {
+                let me = self.my_node_num();
+                if Some(voice.from.as_u32()) != me {
+                    self.inner
+                        .consecutive_silence_trips
+                        .store(0, Ordering::Relaxed);
+                }
                 if self.inner.voice_data_tx.receiver_count() > 0 {
                     let _ = self.inner.voice_data_tx.send(voice);
                 }

@@ -29,6 +29,23 @@ use tracing::{debug, warn};
 /// `ConfigCompleteId`, we revert to `Connected` so the UI isn't stranded.
 const CONFIG_BURST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Marker text for the optional self-DM heartbeat (see
+/// [`spawn_heartbeat_task`]). A single SOH byte: invisible in chat UIs,
+/// short on the wire, and unmistakable when [`inbound::apply_inbound`]
+/// filters it back out so it does not pollute `incoming_text_tx`.
+pub(super) const HEARTBEAT_MARKER: &str = "\u{0001}";
+
+/// Consecutive failed self-DM heartbeats before the watchdog triggers a
+/// radio reboot. Three matches the silence-probe tolerance: a single
+/// transient blip is forgiven, a sustained outage escalates.
+const HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
+
+/// Hard deadline for one self-DM heartbeat round-trip: BLE/serial
+/// write, firmware self-loop, Routing ack back to us. Comfortable for
+/// slow BLE links while still surfacing a wedged firmware within one
+/// heartbeat interval.
+const HEARTBEAT_ACK_DEADLINE: Duration = Duration::from_secs(15);
+
 #[cfg(feature = "ble-btleplug")]
 use crate::ble::{BleManager, Connection, DiscoveredDevice};
 #[cfg(feature = "ble-btleplug")]
@@ -171,6 +188,20 @@ struct Inner {
     /// doesn't create a `tokio::spawn` recursion through
     /// [`connect_with_transport`].
     pub(super) reconnect_request: Arc<Notify>,
+    /// Number of consecutive inbound silence-probe trips since the last
+    /// time peer-originated traffic landed during [`ConnectionState::Ready`].
+    /// Bumped by the silence probe just before it disconnects; cleared
+    /// by [`crate::meshtastic::service::inbound`] when a real mesh
+    /// inbound event arrives. Used by the optional auto-reboot
+    /// watchdog (see [`Self::rx_watchdog_max_trips`]).
+    pub(super) consecutive_silence_trips: AtomicU32,
+    /// Threshold for the passive auto-reboot watchdog. When the silence
+    /// probe trips this many times in a row without any peer traffic
+    /// intervening, the next disconnect is preceded by `reboot(0)`.
+    /// `0` (the default) disables the watchdog entirely; the silence
+    /// probe still reconnects on its own as before. Read once at
+    /// construction from `VOICETASTIC_RX_WATCHDOG_MAX_TRIPS`.
+    pub(super) rx_watchdog_max_trips: u32,
 }
 
 impl MeshtasticService {
@@ -203,6 +234,31 @@ impl MeshtasticService {
         // it can shut down cleanly when the last MeshtasticService clone drops.
         let (voice_tx_send, voice_tx_recv) = tokio::sync::mpsc::channel(voice_tx::QUEUE_CAPACITY);
         let reconnect_request = Arc::new(Notify::new());
+        // Opt-in passive auto-reboot watchdog. Unset / 0 / unparseable
+        // leaves it disabled; the silence probe behaves exactly as
+        // before. See module docs above for the env-var contract.
+        let rx_watchdog_max_trips = std::env::var("VOICETASTIC_RX_WATCHDOG_MAX_TRIPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        // Opt-in active self-DM heartbeat interval in seconds. 0 /
+        // unset / unparseable disables the heartbeat task entirely.
+        let self_dm_heartbeat_secs = std::env::var("VOICETASTIC_SELF_DM_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        if rx_watchdog_max_trips > 0 {
+            tracing::info!(
+                max_trips = rx_watchdog_max_trips,
+                "VOICETASTIC_RX_WATCHDOG_MAX_TRIPS active"
+            );
+        }
+        if self_dm_heartbeat_secs > 0 {
+            tracing::info!(
+                interval_s = self_dm_heartbeat_secs,
+                "VOICETASTIC_SELF_DM_HEARTBEAT_SECS active"
+            );
+        }
         let inner = Arc::new(Inner {
             #[cfg(feature = "ble-btleplug")]
             ble: tokio::sync::OnceCell::new(),
@@ -244,6 +300,8 @@ impl MeshtasticService {
             metadata_tx,
             reconnect_config: Mutex::new(None),
             reconnect_request: reconnect_request.clone(),
+            consecutive_silence_trips: AtomicU32::new(0),
+            rx_watchdog_max_trips,
         });
         // Auto-reconnect watcher: notified by [`try_reconnect`] after the
         // inbound stream drops (transport tore down, silence-probe gave up,
@@ -309,6 +367,17 @@ impl MeshtasticService {
             });
         }
         voice_tx::spawn_worker(Arc::downgrade(&inner), voice_tx_recv);
+        // Heartbeat task only meaningful when at least one transport
+        // feature is compiled in (mirrors the auto-reconnect watcher
+        // gating above). On the wasm-only build there's no transport
+        // to probe.
+        #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+        if self_dm_heartbeat_secs > 0 {
+            spawn_heartbeat_task(
+                Arc::downgrade(&inner),
+                Duration::from_secs(self_dm_heartbeat_secs),
+            );
+        }
         Ok(Self { inner })
     }
 
@@ -481,6 +550,31 @@ impl MeshtasticService {
                         // No inbound data for 60 s — probe the device.
                         if silent_probes >= 2 {
                             warn!("inbound: no data for ~180 s despite probes, disconnecting");
+                            let trips = svc
+                                .inner
+                                .consecutive_silence_trips
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
+                            let max_trips = svc.inner.rx_watchdog_max_trips;
+                            // Auto-reboot watchdog: fire only when opted in
+                            // via `VOICETASTIC_RX_WATCHDOG_MAX_TRIPS`. We send
+                            // reboot(0) BEFORE the disconnect below so the
+                            // firmware sees the write while the link is still
+                            // up. Reset the counter so the post-reboot
+                            // reconnect doesn't immediately retrigger.
+                            if max_trips > 0 && trips >= max_trips {
+                                warn!(
+                                    trips,
+                                    max_trips,
+                                    "rx watchdog: requesting radio reboot before disconnect",
+                                );
+                                if let Err(e) = svc.reboot(0).await {
+                                    warn!(?e, "rx watchdog: reboot request failed");
+                                }
+                                svc.inner
+                                    .consecutive_silence_trips
+                                    .store(0, Ordering::Relaxed);
+                            }
                             break;
                         }
                         silent_probes += 1;
@@ -693,6 +787,80 @@ impl MeshtasticService {
     }
 }
 
+/// Background self-DM heartbeat. Periodically sends a marker text DM
+/// addressed to our own node number and waits for the firmware's
+/// short-circuited Routing ack. The firmware short-circuits self-DMs
+/// (the packet never touches the LoRa radio), so this is a pure
+/// BLE/serial + firmware-routing health probe — it cannot detect a
+/// LoRa RX wedge, that signal lives in the silence-probe counter.
+///
+/// After [`HEARTBEAT_FAILURE_THRESHOLD`] consecutive ack failures the
+/// task asks the radio to reboot via [`MeshtasticService::reboot`] and
+/// resets the counter. The task is `Weak<Inner>`-bound, so it self-
+/// exits when the last `MeshtasticService` clone drops.
+#[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+fn spawn_heartbeat_task(weak: std::sync::Weak<Inner>, interval: Duration) {
+    use tokio::time::MissedTickBehavior;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // First tick fires immediately; skip it so we don't probe
+        // before the radio is even Ready.
+        tick.tick().await;
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            tick.tick().await;
+            let Some(inner) = weak.upgrade() else { return };
+            let svc = MeshtasticService { inner };
+            // Only probe a fully ready link. `Connecting` /
+            // `Configuring` are transient; firing during those is just
+            // noise.
+            if *svc.inner.state_tx.borrow() != ConnectionState::Ready {
+                continue;
+            }
+            let Some(my_node_num) = svc.my_node_num() else {
+                continue;
+            };
+            let outcome = match svc
+                .send_text_tracked(HEARTBEAT_MARKER, 0, my_node_num)
+                .await
+            {
+                Ok((_, handle)) => Some(handle.wait(HEARTBEAT_ACK_DEADLINE).await),
+                Err(e) => {
+                    warn!(?e, "heartbeat: self-DM enqueue failed");
+                    None
+                }
+            };
+            let delivered = matches!(
+                outcome,
+                Some(crate::meshtastic::ack::AckResult::Delivered)
+            );
+            if delivered {
+                consecutive_failures = 0;
+                continue;
+            }
+            consecutive_failures = consecutive_failures.saturating_add(1);
+            warn!(
+                consecutive_failures,
+                ?outcome,
+                "heartbeat: self-DM ack failed",
+            );
+            if consecutive_failures >= HEARTBEAT_FAILURE_THRESHOLD {
+                warn!(
+                    consecutive_failures,
+                    "heartbeat: requesting radio reboot",
+                );
+                if let Err(e) = svc.reboot(0).await {
+                    warn!(?e, "heartbeat: reboot request failed");
+                }
+                // Reset so the post-reboot reconnect doesn't immediately
+                // re-trip the threshold on lingering ack timeouts.
+                consecutive_failures = 0;
+            }
+        }
+    });
+}
+
 /// Compile-time assertion that `MeshtasticService` can be cloned across `tokio::spawn`
 /// boundaries and shared between threads. Catches refactors that accidentally
 /// embed a `!Send` or `!Sync` field (e.g. `Rc`, `RefCell`, raw pointers).
@@ -885,6 +1053,99 @@ mod tests {
         svc.handle_from_radio(&ni_bytes).await.unwrap();
         let owner = svc.inner.owner_tx.borrow().clone().unwrap();
         assert_eq!(owner.long_name, "Me");
+    }
+
+    /// Peer NodeInfo arriving while the connection is Ready clears the
+    /// passive watchdog counter so a one-off silence-probe trip can't
+    /// accumulate toward the reboot threshold.
+    #[tokio::test]
+    async fn peer_nodeinfo_during_ready_resets_silence_trips() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x1111_1111,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        svc.set_state(ConnectionState::Ready);
+        svc.inner
+            .consecutive_silence_trips
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+
+        let peer = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 0x2222_2222,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&peer).await.unwrap();
+        assert_eq!(
+            svc.inner
+                .consecutive_silence_trips
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "peer NodeInfo in Ready state must clear the counter"
+        );
+    }
+
+    /// Our own NodeInfo (echoed back from the radio's NodeDB) is not
+    /// evidence the LoRa side is alive, so it must NOT reset the
+    /// watchdog counter.
+    #[tokio::test]
+    async fn self_nodeinfo_does_not_reset_silence_trips() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x3333_3333,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        svc.set_state(ConnectionState::Ready);
+        svc.inner
+            .consecutive_silence_trips
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let self_ni = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 0x3333_3333,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&self_ni).await.unwrap();
+        assert_eq!(
+            svc.inner
+                .consecutive_silence_trips
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "self NodeInfo must not reset the counter"
+        );
+    }
+
+    /// Peer NodeInfo arriving during the config burst (state still
+    /// Configuring) is a NodeDB dump, not real-time mesh activity, so
+    /// it must not reset the watchdog counter.
+    #[tokio::test]
+    async fn peer_nodeinfo_during_configuring_does_not_reset() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let bytes = encode(from_radio::PayloadVariant::MyInfo(MyNodeInfo {
+            my_node_num: 0x4444_4444,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&bytes).await.unwrap();
+        svc.set_state(ConnectionState::Configuring);
+        svc.inner
+            .consecutive_silence_trips
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+
+        let peer = encode(from_radio::PayloadVariant::NodeInfo(NodeInfo {
+            num: 0x5555_5555,
+            ..Default::default()
+        }));
+        svc.handle_from_radio(&peer).await.unwrap();
+        assert_eq!(
+            svc.inner
+                .consecutive_silence_trips
+                .load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "config-burst NodeInfo must not reset the counter"
+        );
     }
 
     #[tokio::test]
