@@ -112,6 +112,24 @@ impl DebugLevel {
     }
 }
 
+/// Cap on retained telemetry samples per node before FIFO eviction.
+/// 60 covers ~30 min of NodeInfo updates at the typical broadcast
+/// cadence; enough for a sparkline trend without leaking memory
+/// across long-lived sessions.
+pub const MAX_NODE_HISTORY: usize = 60;
+
+/// One telemetry sample of a peer's latest reported metrics. Stored
+/// in `SharedState.node_history` ring buffer keyed by node_num; the
+/// node-detail panel renders these as inline sparklines so the user
+/// can see battery + signal trends without leaving the chat tab.
+#[derive(Clone, Copy)]
+pub struct NodeSample {
+    #[allow(dead_code)] // surfaced when sample tooltips/hover land later.
+    pub at: std::time::SystemTime,
+    pub battery_level: Option<u32>,
+    pub snr: f32,
+}
+
 /// One in-app event surfaced in the Debug log panel. `source` groups
 /// entries by subsystem (transport, protocol, voice, mesh) so the
 /// panel can filter; `msg` is a short human-readable summary.
@@ -177,6 +195,12 @@ pub struct SharedState {
     /// callbacks; rendered by the Debug log panel under the Devices
     /// tab. FIFO eviction past [`MAX_DEBUG_ENTRIES`].
     pub debug_log: VecDeque<DebugEntry>,
+
+    /// Per-node history of telemetry samples (battery, snr). Keyed by
+    /// node_num; ring-buffered at [`MAX_NODE_HISTORY`] per node so a
+    /// long-running session can't leak memory. Populated by the
+    /// `watch_nodes` watcher when a peer's metrics change.
+    pub node_history: HashMap<u32, VecDeque<NodeSample>>,
     pub owner: Option<User>,
     pub metadata: Option<DeviceMetadata>,
 
@@ -219,6 +243,7 @@ impl Clone for SharedState {
             bluetooth: self.bluetooth,
             mqtt: self.mqtt.clone(),
             debug_log: self.debug_log.clone(),
+            node_history: self.node_history.clone(),
             channels: self.channels.clone(),
             owner: self.owner.clone(),
             metadata: self.metadata.clone(),
@@ -292,6 +317,7 @@ impl Default for SharedState {
             bluetooth: None,
             mqtt: None,
             debug_log: VecDeque::new(),
+            node_history: HashMap::new(),
             channels: Vec::new(),
             owner: None,
             metadata: None,

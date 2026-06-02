@@ -18,7 +18,8 @@ use voicetastic_core::voice::{
 };
 
 use crate::state::{
-    ChatEntry, DebugEntry, DebugLevel, MAX_DEBUG_ENTRIES, Section, SharedState, VoicePayload,
+    ChatEntry, DebugEntry, DebugLevel, MAX_DEBUG_ENTRIES, MAX_NODE_HISTORY, NodeSample, Section,
+    SharedState, VoicePayload,
 };
 
 /// Append a [`DebugEntry`] to `SharedState.debug_log` with FIFO
@@ -127,6 +128,30 @@ pub fn spawn_watchers(
         st.my_info = v;
     });
     spawn_watch!(rt, svc.watch_nodes(), shared, ctx, |v, st| {
+        // Capture a telemetry sample per node whose battery_level or
+        // snr changed since the last emission. Dedup against the prior
+        // nodes map (st.nodes) so we don't sample on every config
+        // refresh churn — only when the firmware reports new metrics.
+        let now = std::time::SystemTime::now();
+        for (num, ni) in v.iter() {
+            let new_batt = ni.device_metrics.as_ref().and_then(|m| m.battery_level);
+            let new_snr = ni.snr;
+            let prev = st.nodes.get(num);
+            let changed = match prev {
+                None => true,
+                Some(p) => {
+                    let p_batt = p.device_metrics.as_ref().and_then(|m| m.battery_level);
+                    p_batt != new_batt || (p.snr - new_snr).abs() > 0.01
+                }
+            };
+            if changed {
+                let buf = st.node_history.entry(*num).or_default();
+                buf.push_back(NodeSample { at: now, battery_level: new_batt, snr: new_snr });
+                while buf.len() > MAX_NODE_HISTORY {
+                    buf.pop_front();
+                }
+            }
+        }
         st.nodes = v;
     });
 

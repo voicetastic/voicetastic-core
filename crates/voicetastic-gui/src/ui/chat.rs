@@ -150,6 +150,7 @@ fn nodes_panel(
     nodes: &std::collections::HashMap<u32, NodeInfo>,
     my_num: Option<u32>,
     selected: &mut Option<u32>,
+    history: &std::collections::HashMap<u32, std::collections::VecDeque<crate::state::NodeSample>>,
 ) {
     let mut rows: Vec<&NodeInfo> = nodes
         .values()
@@ -202,6 +203,12 @@ fn nodes_panel(
                 ui.add_space(8.0);
                 ui.separator();
                 render_node_detail(ui, n);
+                if let Some(samples) = history.get(&sel)
+                    && samples.len() >= 2
+                {
+                    ui.add_space(4.0);
+                    render_node_sparklines(ui, samples);
+                }
             }
         });
 }
@@ -311,6 +318,60 @@ fn render_node_detail(ui: &mut egui::Ui, n: &NodeInfo) {
         });
 }
 
+/// Hand-drawn min-max-normalised polyline of one metric over the
+/// node's sample history. Renders inside `width × height` egui rect.
+/// `values` slice is sampled left-to-right; `(min, max)` is the
+/// fixed display range so consecutive plots stay comparable.
+fn sparkline(ui: &mut egui::Ui, values: &[f32], min: f32, max: f32, color: egui::Color32) {
+    let desired = egui::vec2(160.0, 24.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    if values.len() < 2 || (max - min).abs() < f32::EPSILON {
+        ui.painter()
+            .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, color.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+        return;
+    }
+    let mut points = Vec::with_capacity(values.len());
+    let n = values.len();
+    let step = rect.width() / (n.saturating_sub(1).max(1)) as f32;
+    for (i, &v) in values.iter().enumerate() {
+        let norm = ((v - min) / (max - min)).clamp(0.0, 1.0);
+        // SVG-style: y grows downward, so invert the normalised value.
+        let x = rect.min.x + step * i as f32;
+        let y = rect.max.y - norm * rect.height();
+        points.push(egui::pos2(x, y));
+    }
+    ui.painter()
+        .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, color.gamma_multiply(0.3)), egui::StrokeKind::Inside);
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+}
+
+fn render_node_sparklines(ui: &mut egui::Ui, samples: &std::collections::VecDeque<crate::state::NodeSample>) {
+    ui.label(egui::RichText::new("Trends").strong());
+    let batt: Vec<f32> = samples
+        .iter()
+        .filter_map(|s| s.battery_level.map(|b| b as f32))
+        .collect();
+    if batt.len() >= 2 {
+        ui.horizontal(|ui| {
+            ui.weak(format!("Battery ({} → {}%)", batt.first().copied().unwrap_or(0.0) as u32, batt.last().copied().unwrap_or(0.0) as u32));
+            sparkline(ui, &batt, 0.0, 100.0, egui::Color32::from_rgb(120, 200, 120));
+        });
+    }
+    let snr: Vec<f32> = samples.iter().map(|s| s.snr).collect();
+    if snr.len() >= 2 {
+        ui.horizontal(|ui| {
+            ui.weak(format!(
+                "SNR ({:.1} → {:.1} dB)",
+                snr.first().copied().unwrap_or(0.0),
+                snr.last().copied().unwrap_or(0.0)
+            ));
+            // Typical mesh SNR range from −20 dB to +20 dB.
+            sparkline(ui, &snr, -20.0, 20.0, egui::Color32::from_rgb(120, 160, 220));
+        });
+    }
+}
+
 fn format_uptime(secs: u32) -> String {
     let s = secs % 60;
     let m = (secs / 60) % 60;
@@ -367,7 +428,8 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         )
     };
 
-    nodes_panel(ui, &nodes, my_num, &mut app.selected_node_detail);
+    let history = app.shared.lock().node_history.clone();
+    nodes_panel(ui, &nodes, my_num, &mut app.selected_node_detail, &history);
 
     // Active channels (for the broadcast room dropdown).
     let mut bcast_indices: BTreeSet<u32> = BTreeSet::new();
