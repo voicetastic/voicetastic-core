@@ -146,7 +146,11 @@ pub fn spawn_watchers(
             };
             if changed {
                 let buf = st.node_history.entry(*num).or_default();
-                buf.push_back(NodeSample { at: now, battery_level: new_batt, snr: new_snr });
+                buf.push_back(NodeSample {
+                    at: now,
+                    battery_level: new_batt,
+                    snr: new_snr,
+                });
                 while buf.len() > MAX_NODE_HISTORY {
                     buf.pop_front();
                 }

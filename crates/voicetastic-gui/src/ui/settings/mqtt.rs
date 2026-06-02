@@ -34,9 +34,7 @@ pub(super) fn section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
             ch |= ui
                 .checkbox(&mut c.json_enabled, "Send/consume JSON packets")
                 .changed();
-            ch |= ui
-                .checkbox(&mut c.tls_enabled, "Use TLS")
-                .changed();
+            ch |= ui.checkbox(&mut c.tls_enabled, "Use TLS").changed();
             ch |= ui
                 .checkbox(
                     &mut c.proxy_to_client_enabled,
@@ -56,10 +54,21 @@ pub(super) fn section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                 let settings = c
                     .map_report_settings
                     .get_or_insert_with(module_config::MapReportSettings::default);
-                ch |= int_field(ui, "Map publish interval (s)", &mut settings.publish_interval_secs);
-                ch |= int_field(ui, "Map position precision (bits)", &mut settings.position_precision);
+                ch |= int_field(
+                    ui,
+                    "Map publish interval (s)",
+                    &mut settings.publish_interval_secs,
+                );
+                ch |= int_field(
+                    ui,
+                    "Map position precision (bits)",
+                    &mut settings.position_precision,
+                );
                 ch |= ui
-                    .checkbox(&mut settings.should_report_location, "Opt-in: report location")
+                    .checkbox(
+                        &mut settings.should_report_location,
+                        "Opt-in: report location",
+                    )
                     .changed();
             }
             ch

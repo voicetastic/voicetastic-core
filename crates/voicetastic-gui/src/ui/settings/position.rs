@@ -144,9 +144,9 @@ pub(super) fn section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                         ..Default::default()
                     };
                     run_status(ctx, "Broadcast position", move |svc| {
-                        Box::pin(async move {
-                            svc.broadcast_position(pos, 0, None).await.map(|_| ())
-                        })
+                        Box::pin(
+                            async move { svc.broadcast_position(pos, 0, None).await.map(|_| ()) },
+                        )
                     });
                 }
                 if ui.button("Reset to current").clicked() {

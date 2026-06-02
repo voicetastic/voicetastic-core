@@ -104,7 +104,12 @@ pub(super) fn actions_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
     egui::CollapsingHeader::new("⬆ Firmware update")
         .id_salt("ota")
         .show(ui, |ui| {
-            let fw = ctx.shared.lock().metadata.as_ref().map(|m| m.firmware_version.clone());
+            let fw = ctx
+                .shared
+                .lock()
+                .metadata
+                .as_ref()
+                .map(|m| m.firmware_version.clone());
             ui.horizontal(|ui| {
                 ui.weak("Installed:");
                 ui.label(fw.unwrap_or_else(|| "—".to_string()));

@@ -204,13 +204,12 @@ impl MeshtasticService {
     /// Write a [`ModuleConfig`] section (MQTT, Telemetry, …) to the local
     /// node. Mirrors [`Self::write_config`] but targets the parallel
     /// module-config admin path the firmware exposes.
-    pub async fn write_module_config(
-        &self,
-        cfg: module_config::PayloadVariant,
-    ) -> Result<u32> {
-        self.send_admin(admin_message::PayloadVariant::SetModuleConfig(ModuleConfig {
-            payload_variant: Some(cfg),
-        }))
+    pub async fn write_module_config(&self, cfg: module_config::PayloadVariant) -> Result<u32> {
+        self.send_admin(admin_message::PayloadVariant::SetModuleConfig(
+            ModuleConfig {
+                payload_variant: Some(cfg),
+            },
+        ))
         .await
     }
 

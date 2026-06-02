@@ -145,8 +145,7 @@ struct Inner {
     /// is the per-event firehose that callers (Android Kotlin bindings,
     /// future delivery-icon UI) subscribe to without having to register
     /// per-id slots in advance.
-    pub(super) ack_event_tx:
-        broadcast::Sender<(u32, crate::meshtastic::ack::AckResult)>,
+    pub(super) ack_event_tx: broadcast::Sender<(u32, crate::meshtastic::ack::AckResult)>,
     /// Outbound packets awaiting their firmware-reported delivery ack.
     /// Keyed by the packet id; populated by `send_*_tracked` before the
     /// send, drained by the inbound `Routing` handler. Entries whose
@@ -358,9 +357,7 @@ impl MeshtasticService {
     /// you need delivery status for every outgoing packet (e.g. to flip
     /// a UI delivery-status icon) without registering oneshot waiters
     /// per packet via [`Self::send_text_tracked`].
-    pub fn subscribe_acks(
-        &self,
-    ) -> broadcast::Receiver<(u32, crate::meshtastic::ack::AckResult)> {
+    pub fn subscribe_acks(&self) -> broadcast::Receiver<(u32, crate::meshtastic::ack::AckResult)> {
         self.inner.ack_event_tx.subscribe()
     }
 

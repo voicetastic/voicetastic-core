@@ -39,7 +39,9 @@ use crate::proto::{
         BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
         PowerConfig,
     },
-    from_radio, mesh_packet, module_config, module_config::MqttConfig, routing, to_radio,
+    from_radio, mesh_packet, module_config,
+    module_config::MqttConfig,
+    routing, to_radio,
 };
 use crate::voice::types::VoiceData;
 use crate::voice::{PROTOCOL_VERSION as VOICE_PROTOCOL_VERSION, VoiceDestination, detect_version};

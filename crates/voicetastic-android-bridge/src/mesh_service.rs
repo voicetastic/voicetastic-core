@@ -570,9 +570,8 @@ impl MeshService {
             }
         })?;
         let svc = self.core.clone();
-        let id = runtime().block_on(async move {
-            svc.broadcast_position(position, channel, dest).await
-        })?;
+        let id = runtime()
+            .block_on(async move { svc.broadcast_position(position, channel, dest).await })?;
         Ok(id)
     }
 

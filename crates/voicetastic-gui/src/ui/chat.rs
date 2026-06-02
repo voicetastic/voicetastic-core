@@ -281,7 +281,11 @@ fn render_node_detail(ui: &mut egui::Ui, n: &NodeInfo) {
             if let Some(m) = n.device_metrics.as_ref() {
                 if let Some(b) = m.battery_level {
                     ui.weak("Battery");
-                    ui.label(if b == 101 { "AC".into() } else { format!("{b}%") });
+                    ui.label(if b == 101 {
+                        "AC".into()
+                    } else {
+                        format!("{b}%")
+                    });
                     ui.end_row();
                 }
                 if let Some(v) = m.voltage {
@@ -326,8 +330,12 @@ fn sparkline(ui: &mut egui::Ui, values: &[f32], min: f32, max: f32, color: egui:
     let desired = egui::vec2(160.0, 24.0);
     let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
     if values.len() < 2 || (max - min).abs() < f32::EPSILON {
-        ui.painter()
-            .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, color.gamma_multiply(0.4)), egui::StrokeKind::Inside);
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, color.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
         return;
     }
     let mut points = Vec::with_capacity(values.len());
@@ -340,13 +348,20 @@ fn sparkline(ui: &mut egui::Ui, values: &[f32], min: f32, max: f32, color: egui:
         let y = rect.max.y - norm * rect.height();
         points.push(egui::pos2(x, y));
     }
-    ui.painter()
-        .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, color.gamma_multiply(0.3)), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, color.gamma_multiply(0.3)),
+        egui::StrokeKind::Inside,
+    );
     ui.painter()
         .add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
 }
 
-fn render_node_sparklines(ui: &mut egui::Ui, samples: &std::collections::VecDeque<crate::state::NodeSample>) {
+fn render_node_sparklines(
+    ui: &mut egui::Ui,
+    samples: &std::collections::VecDeque<crate::state::NodeSample>,
+) {
     ui.label(egui::RichText::new("Trends").strong());
     let batt: Vec<f32> = samples
         .iter()
@@ -354,8 +369,18 @@ fn render_node_sparklines(ui: &mut egui::Ui, samples: &std::collections::VecDequ
         .collect();
     if batt.len() >= 2 {
         ui.horizontal(|ui| {
-            ui.weak(format!("Battery ({} → {}%)", batt.first().copied().unwrap_or(0.0) as u32, batt.last().copied().unwrap_or(0.0) as u32));
-            sparkline(ui, &batt, 0.0, 100.0, egui::Color32::from_rgb(120, 200, 120));
+            ui.weak(format!(
+                "Battery ({} → {}%)",
+                batt.first().copied().unwrap_or(0.0) as u32,
+                batt.last().copied().unwrap_or(0.0) as u32
+            ));
+            sparkline(
+                ui,
+                &batt,
+                0.0,
+                100.0,
+                egui::Color32::from_rgb(120, 200, 120),
+            );
         });
     }
     let snr: Vec<f32> = samples.iter().map(|s| s.snr).collect();
@@ -367,7 +392,13 @@ fn render_node_sparklines(ui: &mut egui::Ui, samples: &std::collections::VecDequ
                 snr.last().copied().unwrap_or(0.0)
             ));
             // Typical mesh SNR range from −20 dB to +20 dB.
-            sparkline(ui, &snr, -20.0, 20.0, egui::Color32::from_rgb(120, 160, 220));
+            sparkline(
+                ui,
+                &snr,
+                -20.0,
+                20.0,
+                egui::Color32::from_rgb(120, 160, 220),
+            );
         });
     }
 }
