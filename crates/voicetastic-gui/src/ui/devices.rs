@@ -128,4 +128,61 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             ui.label(format!("  {user_name}  (0x{num:08x})"));
         }
     });
+
+    debug_panel(app, ui);
+}
+
+fn debug_panel(app: &mut crate::app::VoicetasticApp, ui: &mut egui::Ui) {
+    use crate::state::DebugLevel;
+    let entries = app.shared.lock().debug_log.clone();
+    egui::CollapsingHeader::new(format!("🪲 Debug log ({})", entries.len()))
+        .id_salt("debug_log")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("Clear").clicked() {
+                    app.shared.lock().debug_log.clear();
+                }
+                ui.weak(format!(
+                    "showing last {} of {}",
+                    entries.len().min(200),
+                    entries.len()
+                ));
+            });
+            egui::ScrollArea::vertical()
+                .max_height(200.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    // Display the most recent 200 entries, oldest first
+                    // so new entries scroll into view.
+                    let skip = entries.len().saturating_sub(200);
+                    for entry in entries.iter().skip(skip) {
+                        let ts = entry
+                            .at
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let secs = ts % 60;
+                        let mins = (ts / 60) % 60;
+                        let hours = (ts / 3600) % 24;
+                        let color = match entry.level {
+                            DebugLevel::Info => ui.style().visuals.text_color(),
+                            DebugLevel::Warn => egui::Color32::from_rgb(200, 140, 60),
+                            DebugLevel::Error => ui.style().visuals.error_fg_color,
+                        };
+                        ui.colored_label(
+                            color,
+                            format!(
+                                "{:02}:{:02}:{:02} {} [{}] {}",
+                                hours,
+                                mins,
+                                secs,
+                                entry.level.icon(),
+                                entry.source,
+                                entry.msg,
+                            ),
+                        );
+                    }
+                });
+        });
 }

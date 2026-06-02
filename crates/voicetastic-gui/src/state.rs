@@ -87,6 +87,42 @@ pub struct VoicePayload {
     pub duration_ms: u32,
 }
 
+/// Cap on retained debug entries before FIFO eviction. ~500 lines
+/// covers a few minutes of dense radio activity without leaking.
+pub const MAX_DEBUG_ENTRIES: usize = 500;
+
+/// Severity buckets the Debug log filter dropdown uses. `Info` is the
+/// default; `Warn` / `Error` are emitted when a callback or watcher
+/// hits a recoverable failure.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DebugLevel {
+    Info,
+    #[allow(dead_code)] // emitted by future watchers (e.g. lagging broadcast subscribers).
+    Warn,
+    Error,
+}
+
+impl DebugLevel {
+    pub fn icon(self) -> &'static str {
+        match self {
+            DebugLevel::Info => "·",
+            DebugLevel::Warn => "⚠",
+            DebugLevel::Error => "✗",
+        }
+    }
+}
+
+/// One in-app event surfaced in the Debug log panel. `source` groups
+/// entries by subsystem (transport, protocol, voice, mesh) so the
+/// panel can filter; `msg` is a short human-readable summary.
+#[derive(Clone)]
+pub struct DebugEntry {
+    pub at: std::time::SystemTime,
+    pub level: DebugLevel,
+    pub source: &'static str,
+    pub msg: String,
+}
+
 /// Identifies one editable settings section. Used as a dirty-tracking key
 /// so an inbound device push doesn't clobber an in-progress edit.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,6 +172,11 @@ pub struct SharedState {
     pub bluetooth: Option<BluetoothConfig>,
     pub mqtt: Option<MqttConfig>,
     pub channels: Vec<Channel>,
+
+    /// In-app debug ring buffer. Fed from the watcher and inbound
+    /// callbacks; rendered by the Debug log panel under the Devices
+    /// tab. FIFO eviction past [`MAX_DEBUG_ENTRIES`].
+    pub debug_log: VecDeque<DebugEntry>,
     pub owner: Option<User>,
     pub metadata: Option<DeviceMetadata>,
 
@@ -177,6 +218,7 @@ impl Clone for SharedState {
             display: self.display,
             bluetooth: self.bluetooth,
             mqtt: self.mqtt.clone(),
+            debug_log: self.debug_log.clone(),
             channels: self.channels.clone(),
             owner: self.owner.clone(),
             metadata: self.metadata.clone(),
@@ -249,6 +291,7 @@ impl Default for SharedState {
             display: None,
             bluetooth: None,
             mqtt: None,
+            debug_log: VecDeque::new(),
             channels: Vec::new(),
             owner: None,
             metadata: None,

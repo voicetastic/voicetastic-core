@@ -158,8 +158,14 @@ where
             Ok(()) => {
                 s.dirty.remove(&section);
                 s.config_status = Some(format!("{name} sent"));
+                let msg = format!("apply {name}");
+                crate::watchers::push_debug(&mut *s, crate::state::DebugLevel::Info, "settings", msg);
             }
-            Err(e) => s.config_status = Some(format!("{name} send failed: {e}")),
+            Err(e) => {
+                s.config_status = Some(format!("{name} send failed: {e}"));
+                let msg = format!("apply {name} failed: {e}");
+                crate::watchers::push_debug(&mut *s, crate::state::DebugLevel::Error, "settings", msg);
+            }
         }
     });
 }

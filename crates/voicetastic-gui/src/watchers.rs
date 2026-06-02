@@ -17,7 +17,28 @@ use voicetastic_core::voice::{
     VoiceDestination, VoiceMessage, detect_version,
 };
 
-use crate::state::{ChatEntry, Section, SharedState, VoicePayload};
+use crate::state::{
+    ChatEntry, DebugEntry, DebugLevel, MAX_DEBUG_ENTRIES, Section, SharedState, VoicePayload,
+};
+
+/// Append a [`DebugEntry`] to `SharedState.debug_log` with FIFO
+/// eviction. Caller must hold the shared-state mutex.
+pub(crate) fn push_debug(
+    st: &mut SharedState,
+    level: DebugLevel,
+    source: &'static str,
+    msg: String,
+) {
+    st.debug_log.push_back(DebugEntry {
+        at: std::time::SystemTime::now(),
+        level,
+        source,
+        msg,
+    });
+    while st.debug_log.len() > MAX_DEBUG_ENTRIES {
+        st.debug_log.pop_front();
+    }
+}
 
 /// Spawn a watcher for a single `tokio::sync::watch` channel that copies the
 /// new value into `SharedState` via `apply` and respects the dirty flag at
@@ -91,7 +112,16 @@ pub fn spawn_watchers(
     }
 
     spawn_watch!(rt, svc.watch_state(), shared, ctx, |v, st| {
+        let prev = st.conn_state;
         st.conn_state = v;
+        if prev != v {
+            push_debug(
+                &mut *st,
+                DebugLevel::Info,
+                "transport",
+                format!("connection: {:?} → {:?}", prev, v),
+            );
+        }
     });
     spawn_watch!(rt, svc.watch_my_info(), shared, ctx, |v, st| {
         st.my_info = v;
