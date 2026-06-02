@@ -74,7 +74,10 @@ impl BleReconnectPolicy {
     /// Build a policy from a config. Use [`BleReconnectPolicy::default`]
     /// for the standard profile.
     pub fn new(config: BleReconnectConfig) -> Self {
-        Self { config, attempts: 0 }
+        Self {
+            config,
+            attempts: 0,
+        }
     }
 
     /// How long to wait before the next attempt. Always returns a
