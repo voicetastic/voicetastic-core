@@ -806,6 +806,7 @@ pub enum SettingKey {
     VoiceOpusBitrateKbps,
     VoiceOpusBandwidth,
     VoiceDenoiseEnabled,
+    VoicePartialPlayOnTimeout,
     VoiceFecMode,
     VoiceNackMode,
     ThemeMode,
@@ -824,6 +825,7 @@ impl From<SettingKey> for s::SettingKey {
             SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
             SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
+            SettingKey::VoicePartialPlayOnTimeout => Self::VoicePartialPlayOnTimeout,
             SettingKey::VoiceFecMode => Self::VoiceFecMode,
             SettingKey::VoiceNackMode => Self::VoiceNackMode,
             SettingKey::ThemeMode => Self::ThemeMode,
@@ -844,6 +846,7 @@ impl From<s::SettingKey> for SettingKey {
             s::SettingKey::VoiceOpusBitrateKbps => Self::VoiceOpusBitrateKbps,
             s::SettingKey::VoiceOpusBandwidth => Self::VoiceOpusBandwidth,
             s::SettingKey::VoiceDenoiseEnabled => Self::VoiceDenoiseEnabled,
+            s::SettingKey::VoicePartialPlayOnTimeout => Self::VoicePartialPlayOnTimeout,
             s::SettingKey::VoiceFecMode => Self::VoiceFecMode,
             s::SettingKey::VoiceNackMode => Self::VoiceNackMode,
             s::SettingKey::ThemeMode => Self::ThemeMode,
@@ -1017,6 +1020,16 @@ impl SettingsApi {
             .set_voice_denoise_enabled(enabled)
             .map_err(Into::into)
     }
+
+    pub fn voice_partial_play_on_timeout(&self) -> bool {
+        self.0.voice_partial_play_on_timeout()
+    }
+
+    pub fn set_voice_partial_play_on_timeout(&self, enabled: bool) -> Result<(), SettingsError> {
+        self.0
+            .set_voice_partial_play_on_timeout(enabled)
+            .map_err(Into::into)
+    }
 }
 
 uniffi::include_scaffolding!("voicetastic");
@@ -1028,7 +1041,8 @@ mod smoke;
 
 pub use codec2_wrapper::{Codec2Encoder, Codec2Error, codec2_decode};
 pub use mesh_service::{
-    IncomingDataMsg, IncomingTextMsg, MeshConfigListener, MeshConnectionState, MeshDataListener,
-    MeshQueueListener, MeshService, MeshServiceError, MeshStateListener, MeshTextListener,
-    MeshTransport, MeshTransportSink, QueueStatusEvent, node_id_to_num, node_num_to_id,
+    AckResultKind, IncomingDataMsg, IncomingTextMsg, MeshAckListener, MeshConfigListener,
+    MeshConnectionState, MeshDataListener, MeshQueueListener, MeshService, MeshServiceError,
+    MeshStateListener, MeshTextListener, MeshTransport, MeshTransportSink, QueueStatusEvent,
+    node_id_to_num, node_num_to_id,
 };

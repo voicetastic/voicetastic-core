@@ -13,6 +13,7 @@ pub mod ids;
 pub mod pkc;
 pub mod ports;
 pub mod proto;
+pub mod reconnect;
 
 #[cfg(all(feature = "ble-btleplug", target_os = "linux"))]
 pub mod pairing;

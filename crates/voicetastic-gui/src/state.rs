@@ -10,6 +10,7 @@ use voicetastic_core::proto::{
         BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
         PowerConfig,
     },
+    module_config::MqttConfig,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -86,6 +87,60 @@ pub struct VoicePayload {
     pub duration_ms: u32,
 }
 
+/// Cap on retained debug entries before FIFO eviction. ~500 lines
+/// covers a few minutes of dense radio activity without leaking.
+pub const MAX_DEBUG_ENTRIES: usize = 500;
+
+/// Severity buckets the Debug log filter dropdown uses. `Info` is the
+/// default; `Warn` / `Error` are emitted when a callback or watcher
+/// hits a recoverable failure.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DebugLevel {
+    Info,
+    #[allow(dead_code)] // emitted by future watchers (e.g. lagging broadcast subscribers).
+    Warn,
+    Error,
+}
+
+impl DebugLevel {
+    pub fn icon(self) -> &'static str {
+        match self {
+            DebugLevel::Info => "·",
+            DebugLevel::Warn => "⚠",
+            DebugLevel::Error => "✗",
+        }
+    }
+}
+
+/// Cap on retained telemetry samples per node before FIFO eviction.
+/// 60 covers ~30 min of NodeInfo updates at the typical broadcast
+/// cadence; enough for a sparkline trend without leaking memory
+/// across long-lived sessions.
+pub const MAX_NODE_HISTORY: usize = 60;
+
+/// One telemetry sample of a peer's latest reported metrics. Stored
+/// in `SharedState.node_history` ring buffer keyed by node_num; the
+/// node-detail panel renders these as inline sparklines so the user
+/// can see battery + signal trends without leaving the chat tab.
+#[derive(Clone, Copy)]
+pub struct NodeSample {
+    #[allow(dead_code)] // surfaced when sample tooltips/hover land later.
+    pub at: std::time::SystemTime,
+    pub battery_level: Option<u32>,
+    pub snr: f32,
+}
+
+/// One in-app event surfaced in the Debug log panel. `source` groups
+/// entries by subsystem (transport, protocol, voice, mesh) so the
+/// panel can filter; `msg` is a short human-readable summary.
+#[derive(Clone)]
+pub struct DebugEntry {
+    pub at: std::time::SystemTime,
+    pub level: DebugLevel,
+    pub source: &'static str,
+    pub msg: String,
+}
+
 /// Identifies one editable settings section. Used as a dirty-tracking key
 /// so an inbound device push doesn't clobber an in-progress edit.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -98,6 +153,7 @@ pub enum Section {
     Network,
     Display,
     Bluetooth,
+    Mqtt,
     Channel(i32),
 }
 
@@ -132,7 +188,19 @@ pub struct SharedState {
     pub network: Option<NetworkConfig>,
     pub display: Option<DisplayConfig>,
     pub bluetooth: Option<BluetoothConfig>,
+    pub mqtt: Option<MqttConfig>,
     pub channels: Vec<Channel>,
+
+    /// In-app debug ring buffer. Fed from the watcher and inbound
+    /// callbacks; rendered by the Debug log panel under the Devices
+    /// tab. FIFO eviction past [`MAX_DEBUG_ENTRIES`].
+    pub debug_log: VecDeque<DebugEntry>,
+
+    /// Per-node history of telemetry samples (battery, snr). Keyed by
+    /// node_num; ring-buffered at [`MAX_NODE_HISTORY`] per node so a
+    /// long-running session can't leak memory. Populated by the
+    /// `watch_nodes` watcher when a peer's metrics change.
+    pub node_history: HashMap<u32, VecDeque<NodeSample>>,
     pub owner: Option<User>,
     pub metadata: Option<DeviceMetadata>,
 
@@ -173,6 +241,9 @@ impl Clone for SharedState {
             network: self.network.clone(),
             display: self.display,
             bluetooth: self.bluetooth,
+            mqtt: self.mqtt.clone(),
+            debug_log: self.debug_log.clone(),
+            node_history: self.node_history.clone(),
             channels: self.channels.clone(),
             owner: self.owner.clone(),
             metadata: self.metadata.clone(),
@@ -244,6 +315,9 @@ impl Default for SharedState {
             network: None,
             display: None,
             bluetooth: None,
+            mqtt: None,
+            debug_log: VecDeque::new(),
+            node_history: HashMap::new(),
             channels: Vec::new(),
             owner: None,
             metadata: None,

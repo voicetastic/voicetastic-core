@@ -137,6 +137,312 @@ fn entry_thread(e: &ChatEntry, my_num: Option<u32>) -> Option<Thread> {
     }
 }
 
+/// Collapsible roster of every node the radio currently knows about.
+/// Reads `SharedState.nodes`, which `watchers.rs` mirrors from the
+/// service's `watch_nodes()` channel, so no extra subscription is
+/// needed.
+///
+/// Clicking a row toggles `selected` to that node's id and renders a
+/// detail block below the table with every `NodeInfo` field worth
+/// showing (position, hw model, role, voltage, util, uptime, etc.).
+fn nodes_panel(
+    ui: &mut egui::Ui,
+    nodes: &std::collections::HashMap<u32, NodeInfo>,
+    my_num: Option<u32>,
+    selected: &mut Option<u32>,
+    history: &std::collections::HashMap<u32, std::collections::VecDeque<crate::state::NodeSample>>,
+) {
+    let mut rows: Vec<&NodeInfo> = nodes
+        .values()
+        .filter(|n| Some(n.num) != my_num && n.num != BROADCAST_ADDR)
+        .collect();
+    rows.sort_by_key(|n| std::cmp::Reverse(n.last_heard));
+
+    egui::CollapsingHeader::new(format!("📡 Nodes ({})", rows.len()))
+        .id_salt("chat_nodes_panel")
+        .default_open(false)
+        .show(ui, |ui| {
+            if rows.is_empty() {
+                ui.weak("(no peers heard yet)");
+                return;
+            }
+            egui::Grid::new("nodes_grid")
+                .num_columns(5)
+                .spacing([12.0, 4.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Node");
+                    ui.strong("Last heard");
+                    ui.strong("SNR");
+                    ui.strong("Battery");
+                    ui.strong("ID");
+                    ui.end_row();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as u32)
+                        .unwrap_or(0);
+                    for n in &rows {
+                        let name = node_display_name(Some(*n), n.num);
+                        let is_selected = *selected == Some(n.num);
+                        // selectable_label only highlights the name cell;
+                        // a single click toggles the inline detail row.
+                        if ui.selectable_label(is_selected, name).clicked() {
+                            *selected = if is_selected { None } else { Some(n.num) };
+                        }
+                        ui.label(format_relative_age(n.last_heard, now));
+                        ui.label(format!("{:.1} dB", n.snr));
+                        ui.label(format_battery(n.device_metrics.as_ref()));
+                        ui.weak(format!("!{:08x}", n.num));
+                        ui.end_row();
+                    }
+                });
+
+            if let Some(sel) = *selected
+                && let Some(n) = nodes.get(&sel)
+            {
+                ui.add_space(8.0);
+                ui.separator();
+                render_node_detail(ui, n);
+                if let Some(samples) = history.get(&sel)
+                    && samples.len() >= 2
+                {
+                    ui.add_space(4.0);
+                    render_node_sparklines(ui, samples);
+                }
+            }
+        });
+}
+
+fn render_node_detail(ui: &mut egui::Ui, n: &NodeInfo) {
+    ui.label(egui::RichText::new(node_display_name(Some(n), n.num)).strong());
+    egui::Grid::new(("node_detail_grid", n.num))
+        .num_columns(2)
+        .spacing([10.0, 2.0])
+        .show(ui, |ui| {
+            ui.weak("Node id");
+            ui.label(format!("!{:08x} ({})", n.num, n.num));
+            ui.end_row();
+            if let Some(u) = n.user.as_ref() {
+                if !u.long_name.is_empty() {
+                    ui.weak("Long name");
+                    ui.label(&u.long_name);
+                    ui.end_row();
+                }
+                if !u.short_name.is_empty() {
+                    ui.weak("Short name");
+                    ui.label(&u.short_name);
+                    ui.end_row();
+                }
+                ui.weak("HW model");
+                ui.label(format!("{:?} ({})", u.hw_model(), u.hw_model));
+                ui.end_row();
+                ui.weak("Role");
+                ui.label(format!("{:?} ({})", u.role(), u.role));
+                ui.end_row();
+                if u.is_licensed {
+                    ui.weak("HAM");
+                    ui.label("yes");
+                    ui.end_row();
+                }
+            }
+            ui.weak("Channel");
+            ui.label(n.channel.to_string());
+            ui.end_row();
+            if n.last_heard != 0 {
+                ui.weak("Last heard");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                ui.label(format!(
+                    "{} ({})",
+                    format_relative_age(n.last_heard, now),
+                    n.last_heard
+                ));
+                ui.end_row();
+            }
+            ui.weak("SNR");
+            ui.label(format!("{:.1} dB", n.snr));
+            ui.end_row();
+            if let Some(p) = n.position.as_ref() {
+                let lat = p.latitude_i.map(|i| i as f64 / 1e7);
+                let lon = p.longitude_i.map(|i| i as f64 / 1e7);
+                if let (Some(la), Some(lo)) = (lat, lon) {
+                    ui.weak("Position");
+                    ui.label(format!("{la:.5}, {lo:.5}"));
+                    ui.end_row();
+                }
+                if let Some(alt) = p.altitude {
+                    ui.weak("Altitude");
+                    ui.label(format!("{alt} m"));
+                    ui.end_row();
+                }
+            }
+            if let Some(m) = n.device_metrics.as_ref() {
+                if let Some(b) = m.battery_level {
+                    ui.weak("Battery");
+                    ui.label(if b == 101 {
+                        "AC".into()
+                    } else {
+                        format!("{b}%")
+                    });
+                    ui.end_row();
+                }
+                if let Some(v) = m.voltage {
+                    ui.weak("Voltage");
+                    ui.label(format!("{v:.2} V"));
+                    ui.end_row();
+                }
+                if let Some(cu) = m.channel_utilization {
+                    ui.weak("Ch util");
+                    ui.label(format!("{cu:.1}%"));
+                    ui.end_row();
+                }
+                if let Some(au) = m.air_util_tx {
+                    ui.weak("Air util TX");
+                    ui.label(format!("{au:.1}%"));
+                    ui.end_row();
+                }
+                if let Some(up) = m.uptime_seconds {
+                    ui.weak("Uptime");
+                    ui.label(format_uptime(up));
+                    ui.end_row();
+                }
+            }
+            if n.via_mqtt {
+                ui.weak("Via MQTT");
+                ui.label("yes");
+                ui.end_row();
+            }
+            if n.is_favorite {
+                ui.weak("Favorite");
+                ui.label("yes");
+                ui.end_row();
+            }
+        });
+}
+
+/// Hand-drawn min-max-normalised polyline of one metric over the
+/// node's sample history. Renders inside `width × height` egui rect.
+/// `values` slice is sampled left-to-right; `(min, max)` is the
+/// fixed display range so consecutive plots stay comparable.
+fn sparkline(ui: &mut egui::Ui, values: &[f32], min: f32, max: f32, color: egui::Color32) {
+    let desired = egui::vec2(160.0, 24.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    if values.len() < 2 || (max - min).abs() < f32::EPSILON {
+        ui.painter().rect_stroke(
+            rect,
+            2.0,
+            egui::Stroke::new(1.0, color.gamma_multiply(0.4)),
+            egui::StrokeKind::Inside,
+        );
+        return;
+    }
+    let mut points = Vec::with_capacity(values.len());
+    let n = values.len();
+    let step = rect.width() / (n.saturating_sub(1).max(1)) as f32;
+    for (i, &v) in values.iter().enumerate() {
+        let norm = ((v - min) / (max - min)).clamp(0.0, 1.0);
+        // SVG-style: y grows downward, so invert the normalised value.
+        let x = rect.min.x + step * i as f32;
+        let y = rect.max.y - norm * rect.height();
+        points.push(egui::pos2(x, y));
+    }
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, color.gamma_multiply(0.3)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(1.5, color)));
+}
+
+fn render_node_sparklines(
+    ui: &mut egui::Ui,
+    samples: &std::collections::VecDeque<crate::state::NodeSample>,
+) {
+    ui.label(egui::RichText::new("Trends").strong());
+    let batt: Vec<f32> = samples
+        .iter()
+        .filter_map(|s| s.battery_level.map(|b| b as f32))
+        .collect();
+    if batt.len() >= 2 {
+        ui.horizontal(|ui| {
+            ui.weak(format!(
+                "Battery ({} → {}%)",
+                batt.first().copied().unwrap_or(0.0) as u32,
+                batt.last().copied().unwrap_or(0.0) as u32
+            ));
+            sparkline(
+                ui,
+                &batt,
+                0.0,
+                100.0,
+                egui::Color32::from_rgb(120, 200, 120),
+            );
+        });
+    }
+    let snr: Vec<f32> = samples.iter().map(|s| s.snr).collect();
+    if snr.len() >= 2 {
+        ui.horizontal(|ui| {
+            ui.weak(format!(
+                "SNR ({:.1} → {:.1} dB)",
+                snr.first().copied().unwrap_or(0.0),
+                snr.last().copied().unwrap_or(0.0)
+            ));
+            // Typical mesh SNR range from −20 dB to +20 dB.
+            sparkline(
+                ui,
+                &snr,
+                -20.0,
+                20.0,
+                egui::Color32::from_rgb(120, 160, 220),
+            );
+        });
+    }
+}
+
+fn format_uptime(secs: u32) -> String {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let d = secs / 86_400;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
+fn format_relative_age(last_heard: u32, now: u32) -> String {
+    if last_heard == 0 {
+        return "—".into();
+    }
+    let age = now.saturating_sub(last_heard);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    }
+}
+
+fn format_battery(metrics: Option<&voicetastic_core::proto::DeviceMetrics>) -> String {
+    match metrics.and_then(|m| m.battery_level) {
+        Some(101) => "AC".into(),
+        Some(pct) => format!("{pct}%"),
+        None => "—".into(),
+    }
+}
+
 pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
     ui.heading("Text Chat");
     ui.separator();
@@ -152,6 +458,9 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
             st.my_info.as_ref().map(|m| m.my_node_num),
         )
     };
+
+    let history = app.shared.lock().node_history.clone();
+    nodes_panel(ui, &nodes, my_num, &mut app.selected_node_detail, &history);
 
     // Active channels (for the broadcast room dropdown).
     let mut bcast_indices: BTreeSet<u32> = BTreeSet::new();

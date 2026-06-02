@@ -40,6 +40,10 @@ pub struct VoicetasticApp {
     pub chat_channel: u32,
     /// Destination node num for outgoing messages. `None` = broadcast.
     pub chat_dest: Option<u32>,
+    /// Node selected for the inline detail card under the Nodes panel.
+    /// `None` collapses the detail; clicking a row toggles this between
+    /// `None` and `Some(node_num)`.
+    pub selected_node_detail: Option<u32>,
     /// In-progress voice message composition state.
     pub voice_compose: VoiceCompose,
     /// Currently-playing inbound or outbound voice clip (single-track —
@@ -102,6 +106,7 @@ impl VoicetasticApp {
                 message_timeout: std::time::Duration::from_secs(
                     settings.reassembly_timeout_secs() as u64
                 ),
+                partial_play_on_timeout: settings.voice_partial_play_on_timeout(),
                 ..AssemblerConfig::default()
             };
             // Keep the consecutive-silence budget tied to
@@ -146,6 +151,7 @@ impl VoicetasticApp {
             chat_input: String::new(),
             chat_channel: 0,
             chat_dest: None,
+            selected_node_detail: None,
             voice_compose: VoiceCompose::Idle,
             voice_playback: None,
             playback_source: None,
@@ -271,6 +277,14 @@ impl SettingsListener for VoiceRuntimeListener {
                     }
                 }) {
                     error!("Failed to update assembler nack params: {}", e);
+                }
+            }
+            SettingKey::VoicePartialPlayOnTimeout => {
+                let enabled = self.settings.voice_partial_play_on_timeout();
+                if let Err(e) = self.assembler.update_config(|cfg| {
+                    cfg.partial_play_on_timeout = enabled;
+                }) {
+                    error!("Failed to update assembler partial_play_on_timeout: {}", e);
                 }
             }
             _ => {}

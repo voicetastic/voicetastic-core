@@ -139,6 +139,13 @@ struct Inner {
     pub(super) queue_status_tx: broadcast::Sender<types::QueueStatusEvent>,
     /// Protocol-filtered inbound voice data (port + version checked).
     pub(super) voice_data_tx: broadcast::Sender<VoiceData>,
+    /// Fan-out of every ack/nak event the firmware reports, keyed by the
+    /// originating packet id. The `pending_acks` oneshot path below is
+    /// the synchronous "wait for a specific packet" API; this broadcast
+    /// is the per-event firehose that callers (Android Kotlin bindings,
+    /// future delivery-icon UI) subscribe to without having to register
+    /// per-id slots in advance.
+    pub(super) ack_event_tx: broadcast::Sender<(u32, crate::meshtastic::ack::AckResult)>,
     /// Outbound packets awaiting their firmware-reported delivery ack.
     /// Keyed by the packet id; populated by `send_*_tracked` before the
     /// send, drained by the inbound `Routing` handler. Entries whose
@@ -156,6 +163,11 @@ struct Inner {
     pub(super) network_tx: watch::Sender<Option<NetworkConfig>>,
     pub(super) display_tx: watch::Sender<Option<DisplayConfig>>,
     pub(super) bluetooth_tx: watch::Sender<Option<BluetoothConfig>>,
+    /// MQTT module-config snapshot, when the firmware has reported one.
+    /// Tracked independently of the seven `Config` sections because the
+    /// firmware emits it through `FromRadio::ModuleConfig`, not
+    /// `FromRadio::Config`.
+    pub(super) mqtt_tx: watch::Sender<Option<crate::proto::module_config::MqttConfig>>,
     pub(super) channels_tx: watch::Sender<Vec<Channel>>,
     pub(super) owner_tx: watch::Sender<Option<User>>,
     pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
@@ -188,6 +200,7 @@ impl MeshtasticService {
         // the ~64 KB worst-case footprint is cheap.
         let (queue_status_tx, _) = broadcast::channel(4096);
         let (voice_data_tx, _) = broadcast::channel(512);
+        let (ack_event_tx, _) = broadcast::channel(256);
         let (lora_tx, _) = watch::channel(None);
         let (device_tx, _) = watch::channel(None);
         let (position_tx, _) = watch::channel(None);
@@ -195,6 +208,7 @@ impl MeshtasticService {
         let (network_tx, _) = watch::channel(None);
         let (display_tx, _) = watch::channel(None);
         let (bluetooth_tx, _) = watch::channel(None);
+        let (mqtt_tx, _) = watch::channel(None);
         let (channels_tx, _) = watch::channel(Vec::new());
         let (owner_tx, _) = watch::channel(None);
         let (metadata_tx, _) = watch::channel(None);
@@ -231,6 +245,7 @@ impl MeshtasticService {
             voice_tx: voice_tx_send,
             queue_status_tx,
             voice_data_tx,
+            ack_event_tx,
             pending_acks: parking_lot::Mutex::new(HashMap::new()),
             lora_tx,
             device_tx,
@@ -239,6 +254,7 @@ impl MeshtasticService {
             network_tx,
             display_tx,
             bluetooth_tx,
+            mqtt_tx,
             channels_tx,
             owner_tx,
             metadata_tx,
@@ -336,6 +352,15 @@ impl MeshtasticService {
     pub fn subscribe_data(&self) -> broadcast::Receiver<IncomingData> {
         self.inner.incoming_data_tx.subscribe()
     }
+    /// Subscribe to per-packet ack/nak events as the firmware reports
+    /// them. Each event carries `(packet_id, AckResult)`. Use this when
+    /// you need delivery status for every outgoing packet (e.g. to flip
+    /// a UI delivery-status icon) without registering oneshot waiters
+    /// per packet via [`Self::send_text_tracked`].
+    pub fn subscribe_acks(&self) -> broadcast::Receiver<(u32, crate::meshtastic::ack::AckResult)> {
+        self.inner.ack_event_tx.subscribe()
+    }
+
     /// Subscribe to firmware queue-status events. Each event carries
     /// `(res, free, maxlen, mesh_packet_id)` and is emitted as the radio
     /// queue accepts or drains a packet. Useful for confirming that a
@@ -368,6 +393,14 @@ impl MeshtasticService {
     pub fn watch_bluetooth_config(&self) -> watch::Receiver<Option<BluetoothConfig>> {
         self.inner.bluetooth_tx.subscribe()
     }
+    /// Subscribe to the radio's MQTT module-config snapshot. Emits
+    /// `None` until the radio reports one (during the want-config
+    /// burst) and again after a `refresh_config`.
+    pub fn watch_mqtt_config(
+        &self,
+    ) -> watch::Receiver<Option<crate::proto::module_config::MqttConfig>> {
+        self.inner.mqtt_tx.subscribe()
+    }
     pub fn watch_channels(&self) -> watch::Receiver<Vec<Channel>> {
         self.inner.channels_tx.subscribe()
     }
@@ -386,6 +419,22 @@ impl MeshtasticService {
             .my_info
             .as_ref()
             .map(|i| i.my_node_num)
+    }
+
+    /// Wipe the radio's NodeDB, drop our cached learned-peer map, and
+    /// re-request the configuration burst.
+    ///
+    /// `reset_nodedb()` alone leaves the local `nodes_tx` snapshot intact
+    /// (the firmware acks the admin packet but never re-bursts NodeInfo
+    /// for an empty NodeDB), so a UI that ran just `reset_nodedb()` would
+    /// keep showing the stale peer list. This helper clears the local
+    /// snapshot in lockstep and then drives `refresh_config()` so the
+    /// config-section caches resync too.
+    pub async fn reset_nodedb_and_refresh(&self) -> Result<()> {
+        self.reset_nodedb().await?;
+        self.inner.state.lock().clear_nodes();
+        let _ = self.inner.nodes_tx.send(std::collections::HashMap::new());
+        self.refresh_config().await
     }
 
     /// Re-request the entire configuration burst.
@@ -411,6 +460,7 @@ impl MeshtasticService {
         let _ = self.inner.network_tx.send(None);
         let _ = self.inner.display_tx.send(None);
         let _ = self.inner.bluetooth_tx.send(None);
+        let _ = self.inner.mqtt_tx.send(None);
         let _ = self.inner.channels_tx.send(Vec::new());
         self.spawn_config_watchdog();
         Ok(())

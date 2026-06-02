@@ -42,7 +42,9 @@ use voicetastic_core::meshtastic::service::{
     ConnectionState as CoreConnState, IncomingData as CoreIncomingData,
     IncomingText as CoreIncomingText, QueueStatusEvent as CoreQueueStatusEvent,
 };
-use voicetastic_core::proto::{AdminMessage, Channel, Config, MyNodeInfo, NodeInfo, User, config};
+use voicetastic_core::proto::{
+    AdminMessage, Channel, Config, ModuleConfig, MyNodeInfo, NodeInfo, User, config, module_config,
+};
 use voicetastic_core::transport::Transport;
 use voicetastic_core::voice as v;
 
@@ -254,6 +256,36 @@ pub trait MeshQueueListener: Send + Sync {
     fn on_queue_status(&self, event: QueueStatusEvent);
 }
 
+/// Coarse delivery outcome for an outgoing packet. Mirrors core's
+/// [`voicetastic_core::meshtastic::ack::AckResult`] minus the variant
+/// payload (the `Failed(_)` reason is reduced to a flat `Failed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckResultKind {
+    Delivered,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl From<voicetastic_core::meshtastic::ack::AckResult> for AckResultKind {
+    fn from(r: voicetastic_core::meshtastic::ack::AckResult) -> Self {
+        use voicetastic_core::meshtastic::ack::AckResult;
+        match r {
+            AckResult::Delivered => Self::Delivered,
+            AckResult::Failed(_) => Self::Failed,
+            AckResult::TimedOut => Self::TimedOut,
+            AckResult::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+/// Per-packet ack/nak listener. Fires once for every ack/nak the
+/// firmware reports for any outgoing packet, not just the ones the
+/// caller explicitly tracked via `send_text_tracked`.
+pub trait MeshAckListener: Send + Sync {
+    fn on_ack(&self, packet_id: u32, result: AckResultKind);
+}
+
 /// Per-section config listener. Each call receives a fully-encoded
 /// protobuf payload that Kotlin parses with its geeksville-mesh codegen.
 /// The bridge intentionally does NOT re-export the proto schema across
@@ -265,6 +297,10 @@ pub trait MeshConfigListener: Send + Sync {
     fn on_node_info(&self, encoded: Vec<u8>);
     /// `Config` proto bytes wrapping one of the per-section variants.
     fn on_config(&self, encoded: Vec<u8>);
+    /// `ModuleConfig` proto bytes wrapping one of the per-module variants.
+    /// Currently only the MQTT variant is emitted; the others are
+    /// silently dropped by the protocol layer until their UI lands.
+    fn on_module_config(&self, encoded: Vec<u8>);
     /// `Channel` proto bytes (single index slot).
     fn on_channel(&self, encoded: Vec<u8>);
     /// `User` proto bytes for the local node owner.
@@ -374,6 +410,7 @@ struct ListenerHandles {
     data: Option<JoinHandle<()>>,
     queue: Option<JoinHandle<()>>,
     config: Option<JoinHandle<()>>,
+    ack: Option<JoinHandle<()>>,
 }
 
 impl ListenerHandles {
@@ -402,6 +439,11 @@ impl ListenerHandles {
             prev.abort();
         }
     }
+    fn replace_ack(&mut self, h: JoinHandle<()>) {
+        if let Some(prev) = self.ack.replace(h) {
+            prev.abort();
+        }
+    }
     fn abort_all(&mut self) {
         for h in [
             self.state.take(),
@@ -409,6 +451,7 @@ impl ListenerHandles {
             self.data.take(),
             self.queue.take(),
             self.config.take(),
+            self.ack.take(),
         ]
         .into_iter()
         .flatten()
@@ -511,6 +554,24 @@ impl MeshService {
             svc.send_data(portnum, payload, channel, dest, want_ack, want_response)
                 .await
         })?;
+        Ok(id)
+    }
+
+    pub fn broadcast_position(
+        &self,
+        position_proto: Vec<u8>,
+        channel: u32,
+        dest: Option<u32>,
+    ) -> Result<u32, MeshServiceError> {
+        use voicetastic_core::proto::Position;
+        let position = Position::decode(position_proto.as_slice()).map_err(|e| {
+            MeshServiceError::Protocol {
+                error_message: format!("Position decode: {e}"),
+            }
+        })?;
+        let svc = self.core.clone();
+        let id = runtime()
+            .block_on(async move { svc.broadcast_position(position, channel, dest).await })?;
         Ok(id)
     }
 
@@ -626,6 +687,22 @@ impl MeshService {
         self.listeners.lock().replace_queue(handle);
     }
 
+    pub fn set_ack_listener(&self, listener: Arc<dyn MeshAckListener>) {
+        let mut rx = self.core.subscribe_acks();
+        let handle = runtime().spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok((id, result)) => listener.on_ack(id, result.into()),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "ack listener lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        self.listeners.lock().replace_ack(handle);
+    }
+
     pub fn set_config_listener(&self, listener: Arc<dyn MeshConfigListener>) {
         let core = self.core.clone();
         let handle = runtime().spawn(async move {
@@ -641,6 +718,7 @@ impl MeshService {
             let mut network = core.watch_network_config();
             let mut display = core.watch_display_config();
             let mut bluetooth = core.watch_bluetooth_config();
+            let mut mqtt = core.watch_mqtt_config();
             let mut channels = core.watch_channels();
             let mut owner = core.watch_owner();
             let mut metadata = core.watch_metadata();
@@ -707,6 +785,7 @@ impl MeshService {
                     .as_ref()
                     .map(|c| config::PayloadVariant::Bluetooth(*c)),
             );
+            push_module_config_mqtt(&listener, mqtt.borrow().as_ref());
             push_channels(&listener, &channels.borrow());
             push_owner(&listener, &owner.borrow());
             push_metadata(&listener, &metadata.borrow());
@@ -767,6 +846,10 @@ impl MeshService {
                         bluetooth.borrow_and_update()
                             .as_ref()
                             .map(|c| config::PayloadVariant::Bluetooth(*c)),
+                    ),
+                    Ok(_) = mqtt.changed() => push_module_config_mqtt(
+                        &listener,
+                        mqtt.borrow_and_update().as_ref(),
                     ),
                     Ok(_) = channels.changed() => push_channels(&listener, &channels.borrow_and_update()),
                     Ok(_) = owner.changed() => push_owner(&listener, &owner.borrow_and_update()),
@@ -833,6 +916,18 @@ fn push_config_variant(
 fn push_channels(listener: &Arc<dyn MeshConfigListener>, snap: &[Channel]) {
     for ch in snap {
         listener.on_channel(encode(ch));
+    }
+}
+
+fn push_module_config_mqtt(
+    listener: &Arc<dyn MeshConfigListener>,
+    snap: Option<&module_config::MqttConfig>,
+) {
+    if let Some(c) = snap {
+        let mc = ModuleConfig {
+            payload_variant: Some(module_config::PayloadVariant::Mqtt(c.clone())),
+        };
+        listener.on_module_config(encode(&mc));
     }
 }
 

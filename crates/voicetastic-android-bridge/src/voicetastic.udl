@@ -423,6 +423,7 @@ enum SettingKey {
     "VoiceOpusBitrateKbps",
     "VoiceOpusBandwidth",
     "VoiceDenoiseEnabled",
+    "VoicePartialPlayOnTimeout",
     "VoiceFecMode",
     "VoiceNackMode",
     "ThemeMode",
@@ -500,6 +501,10 @@ interface SettingsApi {
     boolean voice_denoise_enabled();
     [Throws=SettingsError]
     void set_voice_denoise_enabled(boolean enabled);
+
+    boolean voice_partial_play_on_timeout();
+    [Throws=SettingsError]
+    void set_voice_partial_play_on_timeout(boolean enabled);
 };
 
 // -----------------------------------------------------------------------------
@@ -594,6 +599,24 @@ interface MeshQueueListener {
     void on_queue_status(QueueStatusEvent event);
 };
 
+/// Coarse delivery outcome for an outgoing packet. Mirrors core's
+/// `AckResult` minus the variant payload; bridges directly to a
+/// Kotlin enum.
+enum AckResultKind {
+    "Delivered",
+    "Failed",
+    "TimedOut",
+    "Cancelled",
+};
+
+/// Per-packet ack/nak listener. Fired once for every ack/nak the
+/// firmware reports, on every outgoing packet (not just ones the
+/// caller explicitly tracked via `send_text_tracked`).
+[Trait, WithForeign]
+interface MeshAckListener {
+    void on_ack(u32 packet_id, AckResultKind result);
+};
+
 /// Per-section config listener. All payload arguments are
 /// protobuf-encoded; Kotlin decodes with its geeksville-mesh codegen.
 [Trait, WithForeign]
@@ -601,6 +624,9 @@ interface MeshConfigListener {
     void on_my_info(bytes encoded);
     void on_node_info(bytes encoded);
     void on_config(bytes encoded);
+    /// `ModuleConfig` proto bytes (one variant; only MQTT is currently
+    /// emitted, others are dropped by the protocol layer).
+    void on_module_config(bytes encoded);
     void on_channel(bytes encoded);
     void on_owner(bytes encoded);
     void on_metadata(bytes encoded);
@@ -643,6 +669,12 @@ interface MeshService {
     [Throws=MeshServiceError]
     u32 send_data(i32 portnum, bytes payload, u32 channel, u32? dest, boolean want_ack, boolean want_response);
 
+    /// One-shot `Position` broadcast on the mesh (POSITION_APP port).
+    /// `position_proto` is a serialised `meshtastic.Position`; `dest`
+    /// addresses a specific peer or null broadcasts.
+    [Throws=MeshServiceError]
+    u32 broadcast_position(bytes position_proto, u32 channel, u32? dest);
+
     /// Encode `audio` per `cfg` and push the resulting frames onto the
     /// paced voice TX queue. Returns the per-frame packet ids in send
     /// order.
@@ -665,6 +697,7 @@ interface MeshService {
     void set_data_listener(MeshDataListener listener);
     void set_queue_listener(MeshQueueListener listener);
     void set_config_listener(MeshConfigListener listener);
+    void set_ack_listener(MeshAckListener listener);
 
     /// Shared `VoiceSender` bound to this service. Cached; subsequent
     /// calls return the same instance. Frontends should call this once

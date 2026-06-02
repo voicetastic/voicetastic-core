@@ -17,6 +17,7 @@ mod device;
 mod display;
 mod enums;
 mod lora;
+mod mqtt;
 mod network;
 mod owner;
 mod position;
@@ -80,6 +81,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         network::section(ui, &ctx);
         display::section(ui, &ctx);
         bluetooth::section(ui, &ctx);
+        mqtt::section(ui, &ctx);
         channels::section(ui, &ctx);
         connection::actions_section(ui, &ctx);
     });
@@ -156,8 +158,24 @@ where
             Ok(()) => {
                 s.dirty.remove(&section);
                 s.config_status = Some(format!("{name} sent"));
+                let msg = format!("apply {name}");
+                crate::watchers::push_debug(
+                    &mut s,
+                    crate::state::DebugLevel::Info,
+                    "settings",
+                    msg,
+                );
             }
-            Err(e) => s.config_status = Some(format!("{name} send failed: {e}")),
+            Err(e) => {
+                s.config_status = Some(format!("{name} send failed: {e}"));
+                let msg = format!("apply {name} failed: {e}");
+                crate::watchers::push_debug(
+                    &mut s,
+                    crate::state::DebugLevel::Error,
+                    "settings",
+                    msg,
+                );
+            }
         }
     });
 }

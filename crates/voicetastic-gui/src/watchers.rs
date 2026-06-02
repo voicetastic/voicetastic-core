@@ -17,7 +17,29 @@ use voicetastic_core::voice::{
     VoiceDestination, VoiceMessage, detect_version,
 };
 
-use crate::state::{ChatEntry, Section, SharedState, VoicePayload};
+use crate::state::{
+    ChatEntry, DebugEntry, DebugLevel, MAX_DEBUG_ENTRIES, MAX_NODE_HISTORY, NodeSample, Section,
+    SharedState, VoicePayload,
+};
+
+/// Append a [`DebugEntry`] to `SharedState.debug_log` with FIFO
+/// eviction. Caller must hold the shared-state mutex.
+pub(crate) fn push_debug(
+    st: &mut SharedState,
+    level: DebugLevel,
+    source: &'static str,
+    msg: String,
+) {
+    st.debug_log.push_back(DebugEntry {
+        at: std::time::SystemTime::now(),
+        level,
+        source,
+        msg,
+    });
+    while st.debug_log.len() > MAX_DEBUG_ENTRIES {
+        st.debug_log.pop_front();
+    }
+}
 
 /// Spawn a watcher for a single `tokio::sync::watch` channel that copies the
 /// new value into `SharedState` via `apply` and respects the dirty flag at
@@ -91,12 +113,49 @@ pub fn spawn_watchers(
     }
 
     spawn_watch!(rt, svc.watch_state(), shared, ctx, |v, st| {
+        let prev = st.conn_state;
         st.conn_state = v;
+        if prev != v {
+            push_debug(
+                &mut st,
+                DebugLevel::Info,
+                "transport",
+                format!("connection: {:?} → {:?}", prev, v),
+            );
+        }
     });
     spawn_watch!(rt, svc.watch_my_info(), shared, ctx, |v, st| {
         st.my_info = v;
     });
     spawn_watch!(rt, svc.watch_nodes(), shared, ctx, |v, st| {
+        // Capture a telemetry sample per node whose battery_level or
+        // snr changed since the last emission. Dedup against the prior
+        // nodes map (st.nodes) so we don't sample on every config
+        // refresh churn — only when the firmware reports new metrics.
+        let now = std::time::SystemTime::now();
+        for (num, ni) in v.iter() {
+            let new_batt = ni.device_metrics.as_ref().and_then(|m| m.battery_level);
+            let new_snr = ni.snr;
+            let prev = st.nodes.get(num);
+            let changed = match prev {
+                None => true,
+                Some(p) => {
+                    let p_batt = p.device_metrics.as_ref().and_then(|m| m.battery_level);
+                    p_batt != new_batt || (p.snr - new_snr).abs() > 0.01
+                }
+            };
+            if changed {
+                let buf = st.node_history.entry(*num).or_default();
+                buf.push_back(NodeSample {
+                    at: now,
+                    battery_level: new_batt,
+                    snr: new_snr,
+                });
+                while buf.len() > MAX_NODE_HISTORY {
+                    buf.pop_front();
+                }
+            }
+        }
         st.nodes = v;
     });
 
@@ -174,6 +233,11 @@ pub fn spawn_watchers(
     spawn_watch!(rt, svc.watch_bluetooth_config(), shared, ctx, |v, st| {
         if !st.dirty.contains(&Section::Bluetooth) {
             st.bluetooth = v;
+        }
+    });
+    spawn_watch!(rt, svc.watch_mqtt_config(), shared, ctx, |v, st| {
+        if !st.dirty.contains(&Section::Mqtt) {
+            st.mqtt = v;
         }
     });
     spawn_watch!(rt, svc.watch_owner(), shared, ctx, |v, st| {

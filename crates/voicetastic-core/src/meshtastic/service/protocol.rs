@@ -39,7 +39,9 @@ use crate::proto::{
         BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
         PowerConfig,
     },
-    from_radio, mesh_packet, routing, to_radio,
+    from_radio, mesh_packet, module_config,
+    module_config::MqttConfig,
+    routing, to_radio,
 };
 use crate::voice::types::VoiceData;
 use crate::voice::{PROTOCOL_VERSION as VOICE_PROTOCOL_VERSION, VoiceDestination, detect_version};
@@ -91,6 +93,11 @@ pub enum InboundEvent {
     Owner(User),
     /// One of the seven tracked config sections.
     Config(config::PayloadVariant),
+    /// One tracked module-config section. Currently only the MQTT
+    /// variant is surfaced; other module-config variants are silently
+    /// dropped by `decode_inbound`. Add them here + `apply_module_config`
+    /// when their UI lands.
+    ModuleConfig(module_config::PayloadVariant),
     Channel(Channel),
     Metadata(DeviceMetadata),
     ConfigComplete(u32),
@@ -119,6 +126,7 @@ impl InboundEvent {
                 | Self::NodeInfo(_)
                 | Self::Owner(_)
                 | Self::Config(_)
+                | Self::ModuleConfig(_)
                 | Self::Channel(_)
                 | Self::Metadata(_)
         )
@@ -176,6 +184,13 @@ pub fn decode_inbound(bytes: &[u8], ctx: &InboundCtx) -> Result<Vec<InboundEvent
                     | config::PayloadVariant::Bluetooth(_) => out.push(InboundEvent::Config(v)),
                     _ => {}
                 }
+            }
+        }
+        from_radio::PayloadVariant::ModuleConfig(mc) => {
+            if let Some(v) = mc.payload_variant
+                && matches!(v, module_config::PayloadVariant::Mqtt(_))
+            {
+                out.push(InboundEvent::ModuleConfig(v));
             }
         }
         from_radio::PayloadVariant::Channel(ch) => out.push(InboundEvent::Channel(ch)),
@@ -588,6 +603,10 @@ pub struct ProtocolState {
     pub network: Option<NetworkConfig>,
     pub display: Option<DisplayConfig>,
     pub bluetooth: Option<BluetoothConfig>,
+    /// MQTT module-config snapshot. Tracked because the gateway feature
+    /// is one of the few module-configs the UI is expected to edit; the
+    /// other ~12 variants are not surfaced yet.
+    pub mqtt: Option<MqttConfig>,
     pub channels: Vec<Channel>,
     pub metadata: Option<DeviceMetadata>,
     /// Our X25519 private key, captured from `Config::Security`. Held as
@@ -611,6 +630,7 @@ impl ProtocolState {
             }
             InboundEvent::Owner(user) => self.owner = Some(user.clone()),
             InboundEvent::Config(v) => self.apply_config(v.clone()),
+            InboundEvent::ModuleConfig(v) => self.apply_module_config(v.clone()),
             InboundEvent::Channel(ch) => self.upsert_channel(ch.clone()),
             InboundEvent::Metadata(meta) => self.metadata = Some(meta.clone()),
             InboundEvent::ConfigComplete(_)
@@ -650,6 +670,15 @@ impl ProtocolState {
         }
     }
 
+    fn apply_module_config(&mut self, v: module_config::PayloadVariant) {
+        // Only the variants the UI tracks are stored on `ProtocolState`;
+        // `decode_inbound` already filters everything else out of the
+        // inbound event stream so the unknown arm is just defensive.
+        if let module_config::PayloadVariant::Mqtt(c) = v {
+            self.mqtt = Some(c);
+        }
+    }
+
     /// Our X25519 private key snapshot. Available to driver-internal code
     /// for building an [`InboundCtx`]; intentionally not part of the
     /// public watch-channel surface.
@@ -679,8 +708,17 @@ impl ProtocolState {
         self.network = None;
         self.display = None;
         self.bluetooth = None;
+        self.mqtt = None;
         self.channels.clear();
         self.our_private_key = None;
+    }
+
+    /// Wipe the learned-peer map (every `(node_num, NodeInfo)` we've
+    /// accumulated). Mirrors what the firmware does on
+    /// `AdminMessage::NodedbReset` so a client driving the same admin
+    /// action can resync its local view in lockstep.
+    pub fn clear_nodes(&mut self) {
+        self.nodes.clear();
     }
 }
 

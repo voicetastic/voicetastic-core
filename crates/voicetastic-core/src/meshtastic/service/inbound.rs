@@ -8,7 +8,7 @@
 use tracing::{info, warn};
 
 use crate::error::Result;
-use crate::proto::config;
+use crate::proto::{config, module_config};
 
 use super::protocol::{InboundCtx, InboundEvent, decode_inbound};
 use super::{ConnectionState, MeshtasticService};
@@ -86,6 +86,11 @@ impl MeshtasticService {
                     }
                     _ => {}
                 },
+                InboundEvent::ModuleConfig(v) => {
+                    if let module_config::PayloadVariant::Mqtt(_) = v {
+                        let _ = self.inner.mqtt_tx.send(state.mqtt.clone());
+                    }
+                }
                 InboundEvent::Channel(_) => {
                     let _ = self.inner.channels_tx.send(state.channels.clone());
                 }
@@ -136,6 +141,10 @@ impl MeshtasticService {
                 let _ = self.inner.queue_status_tx.send(qs);
             }
             InboundEvent::AckOrNak { request_id, result } => {
+                // Broadcast first so subscribers (Android Kotlin
+                // bindings, future delivery-icon UI) get every event,
+                // not just the ones with an explicit oneshot waiter.
+                let _ = self.inner.ack_event_tx.send((request_id, result));
                 self.signal_ack(request_id, result);
             }
             // is_snapshot() routed these above.
