@@ -141,7 +141,16 @@ fn entry_thread(e: &ChatEntry, my_num: Option<u32>) -> Option<Thread> {
 /// Reads `SharedState.nodes`, which `watchers.rs` mirrors from the
 /// service's `watch_nodes()` channel, so no extra subscription is
 /// needed.
-fn nodes_panel(ui: &mut egui::Ui, nodes: &std::collections::HashMap<u32, NodeInfo>, my_num: Option<u32>) {
+///
+/// Clicking a row toggles `selected` to that node's id and renders a
+/// detail block below the table with every `NodeInfo` field worth
+/// showing (position, hw model, role, voltage, util, uptime, etc.).
+fn nodes_panel(
+    ui: &mut egui::Ui,
+    nodes: &std::collections::HashMap<u32, NodeInfo>,
+    my_num: Option<u32>,
+    selected: &mut Option<u32>,
+) {
     let mut rows: Vec<&NodeInfo> = nodes
         .values()
         .filter(|n| Some(n.num) != my_num && n.num != BROADCAST_ADDR)
@@ -171,9 +180,14 @@ fn nodes_panel(ui: &mut egui::Ui, nodes: &std::collections::HashMap<u32, NodeInf
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs() as u32)
                         .unwrap_or(0);
-                    for n in rows {
-                        let name = node_display_name(Some(n), n.num);
-                        ui.label(name);
+                    for n in &rows {
+                        let name = node_display_name(Some(*n), n.num);
+                        let is_selected = *selected == Some(n.num);
+                        // selectable_label only highlights the name cell;
+                        // a single click toggles the inline detail row.
+                        if ui.selectable_label(is_selected, name).clicked() {
+                            *selected = if is_selected { None } else { Some(n.num) };
+                        }
                         ui.label(format_relative_age(n.last_heard, now));
                         ui.label(format!("{:.1} dB", n.snr));
                         ui.label(format_battery(n.device_metrics.as_ref()));
@@ -181,7 +195,136 @@ fn nodes_panel(ui: &mut egui::Ui, nodes: &std::collections::HashMap<u32, NodeInf
                         ui.end_row();
                     }
                 });
+
+            if let Some(sel) = *selected
+                && let Some(n) = nodes.get(&sel)
+            {
+                ui.add_space(8.0);
+                ui.separator();
+                render_node_detail(ui, n);
+            }
         });
+}
+
+fn render_node_detail(ui: &mut egui::Ui, n: &NodeInfo) {
+    ui.label(egui::RichText::new(node_display_name(Some(n), n.num)).strong());
+    egui::Grid::new(("node_detail_grid", n.num))
+        .num_columns(2)
+        .spacing([10.0, 2.0])
+        .show(ui, |ui| {
+            ui.weak("Node id");
+            ui.label(format!("!{:08x} ({})", n.num, n.num));
+            ui.end_row();
+            if let Some(u) = n.user.as_ref() {
+                if !u.long_name.is_empty() {
+                    ui.weak("Long name");
+                    ui.label(&u.long_name);
+                    ui.end_row();
+                }
+                if !u.short_name.is_empty() {
+                    ui.weak("Short name");
+                    ui.label(&u.short_name);
+                    ui.end_row();
+                }
+                ui.weak("HW model");
+                ui.label(format!("{:?} ({})", u.hw_model(), u.hw_model));
+                ui.end_row();
+                ui.weak("Role");
+                ui.label(format!("{:?} ({})", u.role(), u.role));
+                ui.end_row();
+                if u.is_licensed {
+                    ui.weak("HAM");
+                    ui.label("yes");
+                    ui.end_row();
+                }
+            }
+            ui.weak("Channel");
+            ui.label(n.channel.to_string());
+            ui.end_row();
+            if n.last_heard != 0 {
+                ui.weak("Last heard");
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                ui.label(format!(
+                    "{} ({})",
+                    format_relative_age(n.last_heard, now),
+                    n.last_heard
+                ));
+                ui.end_row();
+            }
+            ui.weak("SNR");
+            ui.label(format!("{:.1} dB", n.snr));
+            ui.end_row();
+            if let Some(p) = n.position.as_ref() {
+                let lat = p.latitude_i.map(|i| i as f64 / 1e7);
+                let lon = p.longitude_i.map(|i| i as f64 / 1e7);
+                if let (Some(la), Some(lo)) = (lat, lon) {
+                    ui.weak("Position");
+                    ui.label(format!("{la:.5}, {lo:.5}"));
+                    ui.end_row();
+                }
+                if let Some(alt) = p.altitude {
+                    ui.weak("Altitude");
+                    ui.label(format!("{alt} m"));
+                    ui.end_row();
+                }
+            }
+            if let Some(m) = n.device_metrics.as_ref() {
+                if let Some(b) = m.battery_level {
+                    ui.weak("Battery");
+                    ui.label(if b == 101 { "AC".into() } else { format!("{b}%") });
+                    ui.end_row();
+                }
+                if let Some(v) = m.voltage {
+                    ui.weak("Voltage");
+                    ui.label(format!("{v:.2} V"));
+                    ui.end_row();
+                }
+                if let Some(cu) = m.channel_utilization {
+                    ui.weak("Ch util");
+                    ui.label(format!("{cu:.1}%"));
+                    ui.end_row();
+                }
+                if let Some(au) = m.air_util_tx {
+                    ui.weak("Air util TX");
+                    ui.label(format!("{au:.1}%"));
+                    ui.end_row();
+                }
+                if let Some(up) = m.uptime_seconds {
+                    ui.weak("Uptime");
+                    ui.label(format_uptime(up));
+                    ui.end_row();
+                }
+            }
+            if n.via_mqtt {
+                ui.weak("Via MQTT");
+                ui.label("yes");
+                ui.end_row();
+            }
+            if n.is_favorite {
+                ui.weak("Favorite");
+                ui.label("yes");
+                ui.end_row();
+            }
+        });
+}
+
+fn format_uptime(secs: u32) -> String {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let d = secs / 86_400;
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn format_relative_age(last_heard: u32, now: u32) -> String {
@@ -224,7 +367,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         )
     };
 
-    nodes_panel(ui, &nodes, my_num);
+    nodes_panel(ui, &nodes, my_num, &mut app.selected_node_detail);
 
     // Active channels (for the broadcast room dropdown).
     let mut bcast_indices: BTreeSet<u32> = BTreeSet::new();

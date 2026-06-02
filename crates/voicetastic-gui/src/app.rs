@@ -40,6 +40,10 @@ pub struct VoicetasticApp {
     pub chat_channel: u32,
     /// Destination node num for outgoing messages. `None` = broadcast.
     pub chat_dest: Option<u32>,
+    /// Node selected for the inline detail card under the Nodes panel.
+    /// `None` collapses the detail; clicking a row toggles this between
+    /// `None` and `Some(node_num)`.
+    pub selected_node_detail: Option<u32>,
     /// In-progress voice message composition state.
     pub voice_compose: VoiceCompose,
     /// Currently-playing inbound or outbound voice clip (single-track —
@@ -147,6 +151,7 @@ impl VoicetasticApp {
             chat_input: String::new(),
             chat_channel: 0,
             chat_dest: None,
+            selected_node_detail: None,
             voice_compose: VoiceCompose::Idle,
             voice_playback: None,
             playback_source: None,
