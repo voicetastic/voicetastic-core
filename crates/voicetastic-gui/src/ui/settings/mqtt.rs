@@ -31,9 +31,6 @@ pub(super) fn section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
             ch |= ui
                 .checkbox(&mut c.encryption_enabled, "Send encrypted packets")
                 .changed();
-            ch |= ui
-                .checkbox(&mut c.json_enabled, "Send/consume JSON packets")
-                .changed();
             ch |= ui.checkbox(&mut c.tls_enabled, "Use TLS").changed();
             ch |= ui
                 .checkbox(
