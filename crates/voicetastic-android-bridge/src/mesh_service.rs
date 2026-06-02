@@ -557,6 +557,25 @@ impl MeshService {
         Ok(id)
     }
 
+    pub fn broadcast_position(
+        &self,
+        position_proto: Vec<u8>,
+        channel: u32,
+        dest: Option<u32>,
+    ) -> Result<u32, MeshServiceError> {
+        use voicetastic_core::proto::Position;
+        let position = Position::decode(position_proto.as_slice()).map_err(|e| {
+            MeshServiceError::Protocol {
+                error_message: format!("Position decode: {e}"),
+            }
+        })?;
+        let svc = self.core.clone();
+        let id = runtime().block_on(async move {
+            svc.broadcast_position(position, channel, dest).await
+        })?;
+        Ok(id)
+    }
+
     /// Build a voice message with `voicetastic_core::voice::build_message`
     /// and push the frames through the paced TX worker. Returns the
     /// per-frame packet ids in send order.

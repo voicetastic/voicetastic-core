@@ -129,6 +129,26 @@ pub(super) fn section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                         Box::pin(async move { svc.set_fixed_position(pos).await.map(|_| ()) })
                     });
                 }
+                if ui.button("Broadcast position now").clicked() {
+                    // Broadcasts the edited coordinates as a one-shot
+                    // Position packet on POSITION_APP. Distinct from
+                    // "Send Fixed Position" above, which writes a config
+                    // admin message to the local radio (and does not
+                    // emit a mesh packet).
+                    let lat_deg = edit.latitude_deg.clamp(-90.0, 90.0);
+                    let lon_deg = edit.longitude_deg.clamp(-180.0, 180.0);
+                    let pos = Position {
+                        latitude_i: Some((lat_deg * 1e7).round() as i32),
+                        longitude_i: Some((lon_deg * 1e7).round() as i32),
+                        altitude: Some(edit.altitude_m),
+                        ..Default::default()
+                    };
+                    run_status(ctx, "Broadcast position", move |svc| {
+                        Box::pin(async move {
+                            svc.broadcast_position(pos, 0, None).await.map(|_| ())
+                        })
+                    });
+                }
                 if ui.button("Reset to current").clicked() {
                     ctx.shared.lock().fixed_pos_edit = None;
                 }

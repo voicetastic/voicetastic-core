@@ -233,6 +233,31 @@ impl MeshtasticService {
             .await
     }
 
+    /// Send a one-shot `Position` packet on the mesh (port
+    /// `POSITION_APP`). `to == None` broadcasts; otherwise the packet is
+    /// addressed to that node. This is the "share my location now" path
+    /// distinct from the firmware's own scheduled broadcasts and
+    /// distinct from [`Self::set_fixed_position`] (which writes a config
+    /// admin message to the local radio, not a mesh packet).
+    pub async fn broadcast_position(
+        &self,
+        position: Position,
+        channel: u32,
+        to: Option<u32>,
+    ) -> Result<u32> {
+        let mut buf = Vec::with_capacity(position.encoded_len());
+        position.encode(&mut buf)?;
+        self.send_data(
+            crate::ports::POSITION_APP as i32,
+            buf,
+            channel,
+            to,
+            /* want_ack: */ false,
+            /* want_response: */ false,
+        )
+        .await
+    }
+
     /// Clear the manually-fixed location and flip
     /// `position.fixed_position = false`.
     pub async fn remove_fixed_position(&self) -> Result<u32> {

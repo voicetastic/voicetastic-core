@@ -669,6 +669,12 @@ interface MeshService {
     [Throws=MeshServiceError]
     u32 send_data(i32 portnum, bytes payload, u32 channel, u32? dest, boolean want_ack, boolean want_response);
 
+    /// One-shot `Position` broadcast on the mesh (POSITION_APP port).
+    /// `position_proto` is a serialised `meshtastic.Position`; `dest`
+    /// addresses a specific peer or null broadcasts.
+    [Throws=MeshServiceError]
+    u32 broadcast_position(bytes position_proto, u32 channel, u32? dest);
+
     /// Encode `audio` per `cfg` and push the resulting frames onto the
     /// paced voice TX queue. Returns the per-frame packet ids in send
     /// order.
