@@ -117,7 +117,7 @@ pub fn spawn_watchers(
         st.conn_state = v;
         if prev != v {
             push_debug(
-                &mut *st,
+                &mut st,
                 DebugLevel::Info,
                 "transport",
                 format!("connection: {:?} → {:?}", prev, v),

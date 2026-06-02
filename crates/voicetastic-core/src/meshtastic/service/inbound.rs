@@ -86,12 +86,11 @@ impl MeshtasticService {
                     }
                     _ => {}
                 },
-                InboundEvent::ModuleConfig(v) => match v {
-                    module_config::PayloadVariant::Mqtt(_) => {
+                InboundEvent::ModuleConfig(v) => {
+                    if let module_config::PayloadVariant::Mqtt(_) = v {
                         let _ = self.inner.mqtt_tx.send(state.mqtt.clone());
                     }
-                    _ => {}
-                },
+                }
                 InboundEvent::Channel(_) => {
                     let _ = self.inner.channels_tx.send(state.channels.clone());
                 }
