@@ -100,4 +100,31 @@ pub(super) fn actions_section(ui: &mut egui::Ui, ctx: &Ctx<'_>) {
                 });
             }
         });
+
+    egui::CollapsingHeader::new("⬆ Firmware update")
+        .id_salt("ota")
+        .show(ui, |ui| {
+            let fw = ctx.shared.lock().metadata.as_ref().map(|m| m.firmware_version.clone());
+            ui.horizontal(|ui| {
+                ui.weak("Installed:");
+                ui.label(fw.unwrap_or_else(|| "—".to_string()));
+            });
+            ui.add_space(4.0);
+            ui.label(
+                "OTA upload from this client is not yet implemented. The \
+                 transport (XModem over AdminMessage) is in the protocol \
+                 but the upload loop, CRC, retry, and progress reporting \
+                 are deliberately not built yet to avoid bricking radios \
+                 mid-transfer.",
+            );
+            ui.add_space(4.0);
+            ui.weak(
+                "For now, flash via the Meshtastic web flasher or \
+                 `meshtastic --update` on the CLI.",
+            );
+            ui.hyperlink_to(
+                "Meshtastic web flasher →",
+                "https://flasher.meshtastic.org/",
+            );
+        });
 }
