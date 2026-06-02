@@ -624,6 +624,9 @@ interface MeshConfigListener {
     void on_my_info(bytes encoded);
     void on_node_info(bytes encoded);
     void on_config(bytes encoded);
+    /// `ModuleConfig` proto bytes (one variant; only MQTT is currently
+    /// emitted, others are dropped by the protocol layer).
+    void on_module_config(bytes encoded);
     void on_channel(bytes encoded);
     void on_owner(bytes encoded);
     void on_metadata(bytes encoded);

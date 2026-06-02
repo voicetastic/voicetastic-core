@@ -164,6 +164,11 @@ struct Inner {
     pub(super) network_tx: watch::Sender<Option<NetworkConfig>>,
     pub(super) display_tx: watch::Sender<Option<DisplayConfig>>,
     pub(super) bluetooth_tx: watch::Sender<Option<BluetoothConfig>>,
+    /// MQTT module-config snapshot, when the firmware has reported one.
+    /// Tracked independently of the seven `Config` sections because the
+    /// firmware emits it through `FromRadio::ModuleConfig`, not
+    /// `FromRadio::Config`.
+    pub(super) mqtt_tx: watch::Sender<Option<crate::proto::module_config::MqttConfig>>,
     pub(super) channels_tx: watch::Sender<Vec<Channel>>,
     pub(super) owner_tx: watch::Sender<Option<User>>,
     pub(super) metadata_tx: watch::Sender<Option<DeviceMetadata>>,
@@ -204,6 +209,7 @@ impl MeshtasticService {
         let (network_tx, _) = watch::channel(None);
         let (display_tx, _) = watch::channel(None);
         let (bluetooth_tx, _) = watch::channel(None);
+        let (mqtt_tx, _) = watch::channel(None);
         let (channels_tx, _) = watch::channel(Vec::new());
         let (owner_tx, _) = watch::channel(None);
         let (metadata_tx, _) = watch::channel(None);
@@ -249,6 +255,7 @@ impl MeshtasticService {
             network_tx,
             display_tx,
             bluetooth_tx,
+            mqtt_tx,
             channels_tx,
             owner_tx,
             metadata_tx,
@@ -389,6 +396,14 @@ impl MeshtasticService {
     pub fn watch_bluetooth_config(&self) -> watch::Receiver<Option<BluetoothConfig>> {
         self.inner.bluetooth_tx.subscribe()
     }
+    /// Subscribe to the radio's MQTT module-config snapshot. Emits
+    /// `None` until the radio reports one (during the want-config
+    /// burst) and again after a `refresh_config`.
+    pub fn watch_mqtt_config(
+        &self,
+    ) -> watch::Receiver<Option<crate::proto::module_config::MqttConfig>> {
+        self.inner.mqtt_tx.subscribe()
+    }
     pub fn watch_channels(&self) -> watch::Receiver<Vec<Channel>> {
         self.inner.channels_tx.subscribe()
     }
@@ -448,6 +463,7 @@ impl MeshtasticService {
         let _ = self.inner.network_tx.send(None);
         let _ = self.inner.display_tx.send(None);
         let _ = self.inner.bluetooth_tx.send(None);
+        let _ = self.inner.mqtt_tx.send(None);
         let _ = self.inner.channels_tx.send(Vec::new());
         self.spawn_config_watchdog();
         Ok(())

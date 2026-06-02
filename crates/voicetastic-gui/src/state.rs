@@ -10,6 +10,7 @@ use voicetastic_core::proto::{
         BluetoothConfig, DeviceConfig, DisplayConfig, LoRaConfig, NetworkConfig, PositionConfig,
         PowerConfig,
     },
+    module_config::MqttConfig,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,6 +99,7 @@ pub enum Section {
     Network,
     Display,
     Bluetooth,
+    Mqtt,
     Channel(i32),
 }
 
@@ -132,6 +134,7 @@ pub struct SharedState {
     pub network: Option<NetworkConfig>,
     pub display: Option<DisplayConfig>,
     pub bluetooth: Option<BluetoothConfig>,
+    pub mqtt: Option<MqttConfig>,
     pub channels: Vec<Channel>,
     pub owner: Option<User>,
     pub metadata: Option<DeviceMetadata>,
@@ -173,6 +176,7 @@ impl Clone for SharedState {
             network: self.network.clone(),
             display: self.display,
             bluetooth: self.bluetooth,
+            mqtt: self.mqtt.clone(),
             channels: self.channels.clone(),
             owner: self.owner.clone(),
             metadata: self.metadata.clone(),
@@ -244,6 +248,7 @@ impl Default for SharedState {
             network: None,
             display: None,
             bluetooth: None,
+            mqtt: None,
             channels: Vec::new(),
             owner: None,
             metadata: None,

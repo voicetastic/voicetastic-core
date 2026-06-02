@@ -8,7 +8,7 @@
 use tracing::{info, warn};
 
 use crate::error::Result;
-use crate::proto::config;
+use crate::proto::{config, module_config};
 
 use super::protocol::{InboundCtx, InboundEvent, decode_inbound};
 use super::{ConnectionState, MeshtasticService};
@@ -83,6 +83,12 @@ impl MeshtasticService {
                     }
                     config::PayloadVariant::Bluetooth(_) => {
                         let _ = self.inner.bluetooth_tx.send(state.bluetooth);
+                    }
+                    _ => {}
+                },
+                InboundEvent::ModuleConfig(v) => match v {
+                    module_config::PayloadVariant::Mqtt(_) => {
+                        let _ = self.inner.mqtt_tx.send(state.mqtt.clone());
                     }
                     _ => {}
                 },

@@ -176,6 +176,11 @@ pub fn spawn_watchers(
             st.bluetooth = v;
         }
     });
+    spawn_watch!(rt, svc.watch_mqtt_config(), shared, ctx, |v, st| {
+        if !st.dirty.contains(&Section::Mqtt) {
+            st.mqtt = v;
+        }
+    });
     spawn_watch!(rt, svc.watch_owner(), shared, ctx, |v, st| {
         if !st.dirty.contains(&Section::Owner) {
             st.owner = v;

@@ -17,6 +17,7 @@ mod device;
 mod display;
 mod enums;
 mod lora;
+mod mqtt;
 mod network;
 mod owner;
 mod position;
@@ -80,6 +81,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         network::section(ui, &ctx);
         display::section(ui, &ctx);
         bluetooth::section(ui, &ctx);
+        mqtt::section(ui, &ctx);
         channels::section(ui, &ctx);
         connection::actions_section(ui, &ctx);
     });

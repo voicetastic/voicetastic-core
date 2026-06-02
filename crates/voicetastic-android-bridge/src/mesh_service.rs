@@ -42,7 +42,9 @@ use voicetastic_core::meshtastic::service::{
     ConnectionState as CoreConnState, IncomingData as CoreIncomingData,
     IncomingText as CoreIncomingText, QueueStatusEvent as CoreQueueStatusEvent,
 };
-use voicetastic_core::proto::{AdminMessage, Channel, Config, MyNodeInfo, NodeInfo, User, config};
+use voicetastic_core::proto::{
+    AdminMessage, Channel, Config, ModuleConfig, MyNodeInfo, NodeInfo, User, config, module_config,
+};
 use voicetastic_core::transport::Transport;
 use voicetastic_core::voice as v;
 
@@ -295,6 +297,10 @@ pub trait MeshConfigListener: Send + Sync {
     fn on_node_info(&self, encoded: Vec<u8>);
     /// `Config` proto bytes wrapping one of the per-section variants.
     fn on_config(&self, encoded: Vec<u8>);
+    /// `ModuleConfig` proto bytes wrapping one of the per-module variants.
+    /// Currently only the MQTT variant is emitted; the others are
+    /// silently dropped by the protocol layer until their UI lands.
+    fn on_module_config(&self, encoded: Vec<u8>);
     /// `Channel` proto bytes (single index slot).
     fn on_channel(&self, encoded: Vec<u8>);
     /// `User` proto bytes for the local node owner.
@@ -694,6 +700,7 @@ impl MeshService {
             let mut network = core.watch_network_config();
             let mut display = core.watch_display_config();
             let mut bluetooth = core.watch_bluetooth_config();
+            let mut mqtt = core.watch_mqtt_config();
             let mut channels = core.watch_channels();
             let mut owner = core.watch_owner();
             let mut metadata = core.watch_metadata();
@@ -760,6 +767,7 @@ impl MeshService {
                     .as_ref()
                     .map(|c| config::PayloadVariant::Bluetooth(*c)),
             );
+            push_module_config_mqtt(&listener, mqtt.borrow().as_ref());
             push_channels(&listener, &channels.borrow());
             push_owner(&listener, &owner.borrow());
             push_metadata(&listener, &metadata.borrow());
@@ -820,6 +828,10 @@ impl MeshService {
                         bluetooth.borrow_and_update()
                             .as_ref()
                             .map(|c| config::PayloadVariant::Bluetooth(*c)),
+                    ),
+                    Ok(_) = mqtt.changed() => push_module_config_mqtt(
+                        &listener,
+                        mqtt.borrow_and_update().as_ref(),
                     ),
                     Ok(_) = channels.changed() => push_channels(&listener, &channels.borrow_and_update()),
                     Ok(_) = owner.changed() => push_owner(&listener, &owner.borrow_and_update()),
@@ -886,6 +898,18 @@ fn push_config_variant(
 fn push_channels(listener: &Arc<dyn MeshConfigListener>, snap: &[Channel]) {
     for ch in snap {
         listener.on_channel(encode(ch));
+    }
+}
+
+fn push_module_config_mqtt(
+    listener: &Arc<dyn MeshConfigListener>,
+    snap: Option<&module_config::MqttConfig>,
+) {
+    if let Some(c) = snap {
+        let mc = ModuleConfig {
+            payload_variant: Some(module_config::PayloadVariant::Mqtt(c.clone())),
+        };
+        listener.on_module_config(encode(&mc));
     }
 }
 
