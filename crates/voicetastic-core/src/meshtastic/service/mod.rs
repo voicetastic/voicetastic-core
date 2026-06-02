@@ -49,7 +49,10 @@ use crate::transport::Transport;
 use crate::voice::ModemPreset;
 use crate::voice::types::VoiceData;
 
-pub use types::{ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_long_name};
+pub use types::{
+    ConnectionState, IncomingData, IncomingText, QueueStatusEvent, node_display_name,
+    node_long_name, node_short_name,
+};
 
 /// Convert Meshtastic `LoRaConfig.modem_preset` proto integer to `ModemPreset`.
 /// Returns `None` for unknown values; callers should fall back to safe defaults.
@@ -419,6 +422,13 @@ impl MeshtasticService {
             .my_info
             .as_ref()
             .map(|i| i.my_node_num)
+    }
+
+    /// Snapshot of the local node's `NodeInfo`, if both `MyNodeInfo` and the
+    /// corresponding `NodeInfo` burst entry have been received.
+    pub fn self_node(&self) -> Option<NodeInfo> {
+        let state = self.inner.state.lock();
+        state.self_node().cloned()
     }
 
     /// Wipe the radio's NodeDB, drop our cached learned-peer map, and

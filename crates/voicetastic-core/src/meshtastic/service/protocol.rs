@@ -642,6 +642,13 @@ impl ProtocolState {
         }
     }
 
+    /// Returns the local node's full `NodeInfo` entry, or `None` if either
+    /// `my_info` or the corresponding `nodes` entry has not arrived yet.
+    pub fn self_node(&self) -> Option<&NodeInfo> {
+        let num = self.my_info.as_ref()?.my_node_num;
+        self.nodes.get(&num)
+    }
+
     fn apply_config(&mut self, v: config::PayloadVariant) {
         match v {
             config::PayloadVariant::Lora(c) => self.lora = Some(c),

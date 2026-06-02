@@ -58,6 +58,28 @@ pub fn node_long_name(node: &NodeInfo) -> Option<&str> {
     node.user.as_ref().map(|u: &User| u.long_name.as_str())
 }
 
+/// Short name accessor.
+pub fn node_short_name(node: &NodeInfo) -> Option<&str> {
+    node.user.as_ref().map(|u: &User| u.short_name.as_str())
+}
+
+/// Resolves a display name with fallback: long_name → short_name → `!hexid`.
+pub fn node_display_name(node: &NodeInfo) -> String {
+    node.user
+        .as_ref()
+        .and_then(|u: &User| {
+            if !u.long_name.is_empty() {
+                Some(u.long_name.as_str())
+            } else if !u.short_name.is_empty() {
+                Some(u.short_name.as_str())
+            } else {
+                None
+            }
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("!{:08x}", node.num))
+}
+
 pub(super) fn rand_u32() -> Result<u32, crate::Error> {
     let mut buf = [0u8; 4];
     getrandom::fill(&mut buf).map_err(|e| crate::Error::Other(e.to_string()))?;
