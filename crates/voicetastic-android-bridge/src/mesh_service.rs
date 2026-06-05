@@ -293,8 +293,11 @@ pub trait MeshAckListener: Send + Sync {
 pub trait MeshConfigListener: Send + Sync {
     /// `MyNodeInfo` proto bytes.
     fn on_my_info(&self, encoded: Vec<u8>);
-    /// `NodeInfo` proto bytes (one node).
-    fn on_node_info(&self, encoded: Vec<u8>);
+    /// `NodeInfo` proto bytes (one node). `num` is passed separately because
+    /// the consumer's vendored NodeInfo schema may decode the in-proto `num`
+    /// field with a mismatched wire type (geeksville reads it as fixed32 while
+    /// this bridge encodes uint32), so the embedded value can't be trusted.
+    fn on_node_info(&self, num: u32, encoded: Vec<u8>);
     /// `Config` proto bytes wrapping one of the per-section variants.
     fn on_config(&self, encoded: Vec<u8>);
     /// `ModuleConfig` proto bytes wrapping one of the per-module variants.
@@ -738,7 +741,7 @@ impl MeshService {
             let mut pushed_nodes: std::collections::HashMap<u32, NodeInfo> = {
                 let snap = nodes.borrow();
                 for ni in snap.values() {
-                    listener.on_node_info(encode(ni));
+                    listener.on_node_info(ni.num, encode(ni));
                 }
                 snap.clone()
             };
@@ -800,7 +803,7 @@ impl MeshService {
                         let snap = nodes.borrow_and_update();
                         for (num, ni) in snap.iter() {
                             if pushed_nodes.get(num) != Some(ni) {
-                                listener.on_node_info(encode(ni));
+                                listener.on_node_info(*num, encode(ni));
                             }
                         }
                         pushed_nodes = snap.clone();
