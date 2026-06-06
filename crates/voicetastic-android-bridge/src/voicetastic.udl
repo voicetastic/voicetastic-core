@@ -622,7 +622,9 @@ interface MeshAckListener {
 [Trait, WithForeign]
 interface MeshConfigListener {
     void on_my_info(bytes encoded);
-    void on_node_info(bytes encoded);
+    /// `num` is passed explicitly because the consumer's vendored NodeInfo
+    /// schema may read the in-proto `num` with a mismatched wire type.
+    void on_node_info(u32 num, bytes encoded);
     void on_config(bytes encoded);
     /// `ModuleConfig` proto bytes (one variant; only MQTT is currently
     /// emitted, others are dropped by the protocol layer).
