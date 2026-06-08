@@ -65,7 +65,7 @@ use crate::voice::consts::MAX_BODY_SIZE;
 use crate::voice::error::VoiceError;
 use crate::voice::header::ChunkHeader;
 use crate::voice::nack::parse_nack_body;
-use crate::voice::outgoing::{OutgoingVoiceRegistry, RetransmitSkipReason};
+use crate::voice::outgoing::{DeferOutcome, OutgoingVoiceRegistry, RetransmitSkipReason};
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
 /// Default linger window after the initial burst. Matches the
@@ -76,6 +76,13 @@ use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 /// alone takes ~140 s, leaving only a 60 s window for potentially dozens
 /// of NACK rounds, each subject to a multi-second retransmit cooldown.
 pub const DEFAULT_LINGER: Duration = Duration::from_secs(600);
+
+/// Upper bound on how long `run_send` waits, after the linger window, for
+/// any still-scheduled retransmit batches to drain before emitting
+/// `Complete`. Generous enough to cover a cooldown-deferred wake-up plus its
+/// paced batch, but bounded so a wedged TX worker can't pin the send entry
+/// forever.
+const RETRANSMIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Inputs to [`VoiceSender::send`]. All defaults are sensible; the only
 /// always-required fields are [`Self::audio`] and [`Self::codec`].
@@ -252,6 +259,16 @@ pub struct VoiceSender {
     /// the broadcast channel. High values indicate the NACK listener task
     /// cannot keep up with the message arrival rate.
     lagged_nack_count: AtomicU64,
+    /// In-flight retransmit task count per message. A retransmit is counted
+    /// from the moment it is scheduled (immediate dispatch, or a deferred
+    /// wake-up that is still sleeping) until its batch finishes draining
+    /// through the paced worker. `run_send` waits for this to hit zero before
+    /// emitting `Complete`, so subscribers never see the terminal status
+    /// while a retransmit is still enqueueing frames.
+    retransmit_inflight: Mutex<HashMap<u32, u32>>,
+    /// Pulsed whenever a retransmit task finishes, so a `run_send` waiting to
+    /// finalize can re-check the in-flight count promptly.
+    retransmit_drained: Arc<tokio::sync::Notify>,
 }
 
 impl VoiceSender {
@@ -277,6 +294,8 @@ impl VoiceSender {
             rt: rt.clone(),
             retransmit_permits: Arc::new(Semaphore::new(16)),
             lagged_nack_count: AtomicU64::new(0),
+            retransmit_inflight: Mutex::new(HashMap::new()),
+            retransmit_drained: Arc::new(tokio::sync::Notify::new()),
         });
         let weak = Arc::downgrade(&sender);
         let rx = svc.subscribe_data();
@@ -293,7 +312,7 @@ impl VoiceSender {
     /// (empty audio, oversized message). Runtime errors during the
     /// background burst surface as `SendStatus::Failed`.
     pub fn send(self: &Arc<Self>, req: SendRequest) -> Result<SendHandle, VoiceError> {
-        let message_id = random_message_id()?;
+        let message_id = self.fresh_message_id()?;
 
         // Clamp the per-chunk body size to whatever the underlying
         // transport can deliver intact in a single write. For BLE this
@@ -362,6 +381,25 @@ impl VoiceSender {
             message_id,
             status_tx,
         })
+    }
+
+    /// Allocate a `message_id` that doesn't alias an in-flight send. A
+    /// random non-zero u32 collision is astronomically unlikely, but a single
+    /// one would let two concurrent sends share a registry/active slot (the
+    /// first send would then operate on the second's frames), so re-roll on
+    /// the off chance. Bounded retries: after a few attempts we accept the
+    /// last roll rather than loop, since the id space is 2^32.
+    fn fresh_message_id(&self) -> Result<u32, VoiceError> {
+        for _ in 0..8 {
+            let id = random_message_id()?;
+            // Evaluate (and release) the active lock before touching the
+            // registry lock so the two are never held nested.
+            let in_active = self.active.lock().contains_key(&id);
+            if !in_active && !self.registry.contains(id) {
+                return Ok(id);
+            }
+        }
+        random_message_id()
     }
 
     /// Read the LoRa modem preset off the service and convert it to
@@ -451,6 +489,31 @@ impl VoiceSender {
         // we just keep the entry alive for the timer.
         tokio::time::sleep(linger).await;
 
+        // Don't finalize while a retransmit batch is still scheduled or
+        // draining: subscribers may tear down on `Complete`, and emitting it
+        // mid-retransmit would violate the documented terminal-status
+        // ordering. We stay registered (so new NACKs keep extending the
+        // count) until the in-flight retransmits drain, bounded so a stuck
+        // worker can't pin the entry indefinitely.
+        let drain_deadline = Instant::now() + RETRANSMIT_DRAIN_TIMEOUT;
+        while self.inflight_count(message_id) > 0 {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    message_id,
+                    "retransmits still in flight at drain timeout; finalizing anyway"
+                );
+                break;
+            }
+            // Cap the wait per iteration so a notification delivered before we
+            // started awaiting can't make us miss the drain.
+            let _ = tokio::time::timeout(
+                remaining.min(Duration::from_millis(100)),
+                self.retransmit_drained.notified(),
+            )
+            .await;
+        }
+
         // Check whether someone (a give_up NACK handler) already cleared
         // us out. If so, the terminal status was emitted there.
         let still_active = self.active.lock().contains_key(&message_id);
@@ -466,6 +529,37 @@ impl VoiceSender {
     fn cleanup(&self, message_id: u32) {
         self.active.lock().remove(&message_id);
         self.registry.remove(message_id);
+    }
+
+    /// Record that a retransmit task for `message_id` has been scheduled.
+    /// Paired with exactly one [`Self::inflight_dec`] via [`InflightGuard`].
+    fn inflight_inc(&self, message_id: u32) {
+        *self.retransmit_inflight.lock().entry(message_id).or_insert(0) += 1;
+    }
+
+    /// Record that a retransmit task for `message_id` has finished.
+    fn inflight_dec(&self, message_id: u32) {
+        {
+            let mut map = self.retransmit_inflight.lock();
+            if let Some(c) = map.get_mut(&message_id) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    map.remove(&message_id);
+                }
+            }
+        }
+        // Wake any run_send waiting to finalize this message.
+        self.retransmit_drained.notify_waiters();
+    }
+
+    /// Number of retransmit tasks currently scheduled or in flight for
+    /// `message_id`.
+    fn inflight_count(&self, message_id: u32) -> u32 {
+        self.retransmit_inflight
+            .lock()
+            .get(&message_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Diagnostic: number of in-flight sends.
@@ -560,101 +654,167 @@ async fn nack_listener_task(
         }
 
         let pacing = sender.current_pacing();
-        let plan = match sender
-            .registry
-            .take_retransmit(nack.message_id, &nack.missing, pacing)
-        {
-            Ok(p) => p,
-            Err(RetransmitSkipReason::CooldownActive) => {
-                // Cooldown gates the request: stash the missing list and
-                // schedule a wake-up task to retry once the previous
-                // batch has cleared the radio. Without this, a NACK
-                // arriving early in a cooldown is silently dropped and
-                // the receiver has to wait an extra round-trip (often a
-                // full backoff window) before the same chunks get
-                // serviced.
-                let deferred = sender
-                    .registry
-                    .defer_nack(nack.message_id, nack.missing.clone());
-                debug!(
-                    message_id = nack.message_id,
-                    requested = nack.missing.len(),
-                    deferred = deferred.is_some(),
-                    "voice: retransmit deferred (cooldown active)"
-                );
-                if let Some(deadline) = deferred {
-                    spawn_deferred_retransmit(
-                        Arc::downgrade(&sender),
+        // Service the NACK round. The take/defer handoff has a narrow window
+        // where the cooldown can lapse *between* take_retransmit reporting it
+        // active and defer_nack running; if that happens defer_nack reports
+        // `CooldownElapsed` and we retry the take rather than dropping the
+        // whole round (which would force the receiver to time out and re-NACK).
+        // Bounded so a pathological cooldown flap can't spin the listener.
+        for attempt in 0..3 {
+            match sender
+                .registry
+                .take_retransmit(nack.message_id, &nack.missing, pacing)
+            {
+                Ok(plan) if plan.is_empty() => {
+                    debug!(
+                        message_id = nack.message_id,
+                        requested = nack.missing.len(),
+                        "voice: no frames to retransmit (all pending)"
+                    );
+                    break;
+                }
+                Ok(plan) => {
+                    spawn_plan_dispatch(
+                        &sender,
+                        plan,
                         nack.message_id,
                         channel,
                         to,
-                        status_tx.clone(),
-                        deadline,
+                        pacing,
+                        &status_tx,
                     );
+                    break;
                 }
-                continue;
+                Err(RetransmitSkipReason::CooldownActive) => {
+                    // Cooldown gates the request: stash the missing list and
+                    // schedule a wake-up task to retry once the previous batch
+                    // has cleared the radio.
+                    match sender
+                        .registry
+                        .defer_nack(nack.message_id, nack.missing.clone())
+                    {
+                        DeferOutcome::Scheduled(deadline) => {
+                            debug!(
+                                message_id = nack.message_id,
+                                requested = nack.missing.len(),
+                                "voice: retransmit deferred (cooldown active)"
+                            );
+                            // Count the deferred wake-up as in-flight from now
+                            // (it is still sleeping) so a short linger can't
+                            // finalize the send before the deferred batch ships.
+                            sender.inflight_inc(nack.message_id);
+                            spawn_deferred_retransmit(
+                                Arc::downgrade(&sender),
+                                nack.message_id,
+                                channel,
+                                to,
+                                status_tx.clone(),
+                                deadline,
+                            );
+                            break;
+                        }
+                        DeferOutcome::AlreadyScheduled => {
+                            debug!(
+                                message_id = nack.message_id,
+                                "voice: retransmit deferred (existing wake-up will service)"
+                            );
+                            break;
+                        }
+                        DeferOutcome::CooldownElapsed => {
+                            // Cooldown lapsed mid-handoff: retry the take so
+                            // the round isn't lost.
+                            debug!(
+                                message_id = nack.message_id,
+                                attempt, "voice: cooldown lapsed mid-handoff, retrying take"
+                            );
+                            continue;
+                        }
+                        DeferOutcome::Gone => break,
+                    }
+                }
+                Err(reason) => {
+                    // Log skip reason at appropriate level for diagnostics
+                    let msg = match reason {
+                        RetransmitSkipReason::TtlExpired => "message expired",
+                        RetransmitSkipReason::BudgetExhausted => "max retransmits exceeded",
+                        RetransmitSkipReason::AllChunksPending => "all chunks already pending",
+                        RetransmitSkipReason::CooldownActive => unreachable!("handled above"),
+                    };
+                    debug!(
+                        message_id = nack.message_id,
+                        requested = nack.missing.len(),
+                        reason = msg,
+                        "voice: retransmit skipped"
+                    );
+                    break;
+                }
             }
-            Err(reason) => {
-                // Log skip reason at appropriate level for diagnostics
-                let msg = match reason {
-                    RetransmitSkipReason::TtlExpired => "message expired",
-                    RetransmitSkipReason::BudgetExhausted => "max retransmits exceeded",
-                    RetransmitSkipReason::AllChunksPending => "all chunks already pending",
-                    RetransmitSkipReason::CooldownActive => unreachable!("handled above"),
-                };
-                debug!(
-                    message_id = nack.message_id,
-                    requested = nack.missing.len(),
-                    reason = msg,
-                    "voice: retransmit skipped"
-                );
-                continue;
+        }
+    }
+}
+
+/// Decrements a message's in-flight retransmit count when dropped, so every
+/// scheduled retransmit (immediate or deferred) is balanced on every exit
+/// path of its task. Holds a `Weak` so a pending task can't keep the sender
+/// alive past its normal `Weak`-driven shutdown.
+struct InflightGuard {
+    sender: Weak<VoiceSender>,
+    message_id: u32,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.upgrade() {
+            sender.inflight_dec(self.message_id);
+        }
+    }
+}
+
+/// Emit `Retransmitting` and spawn the detached, semaphore-gated task that
+/// ships one retransmit `plan` through the paced TX worker. Detached so a slow
+/// worker doesn't block the NACK listener from processing the next inbound
+/// frame. The send is counted as in-flight until the batch drains so
+/// `run_send` won't finalize mid-retransmit. `to` reproduces the original
+/// send's addressing (unicast stays unicast, broadcast stays broadcast).
+fn spawn_plan_dispatch(
+    sender: &Arc<VoiceSender>,
+    plan: Vec<(u8, bytes::Bytes)>,
+    message_id: u32,
+    channel: u32,
+    to: Option<u32>,
+    pacing: Duration,
+    status_tx: &broadcast::Sender<SendStatus>,
+) {
+    let scheduled: Vec<u8> = plan.iter().map(|(idx, _)| *idx).collect();
+    info!(
+        message_id,
+        scheduled = scheduled.len(),
+        "voice: retransmitting"
+    );
+    let _ = status_tx.send(SendStatus::Retransmitting {
+        message_id,
+        chunks: scheduled,
+    });
+
+    sender.inflight_inc(message_id);
+    let guard = InflightGuard {
+        sender: Arc::downgrade(sender),
+        message_id,
+    };
+    let permits = Arc::clone(&sender.retransmit_permits);
+    let svc = sender.svc.clone();
+    let registry = Arc::clone(&sender.registry);
+    tokio::spawn(async move {
+        let _guard = guard;
+        let _permit = match permits.acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => {
+                warn!(message_id, "retransmit semaphore closed");
+                return;
             }
         };
-
-        // Skip empty plans to avoid unnecessary task spawn and counter update
-        if plan.is_empty() {
-            debug!(
-                message_id = nack.message_id,
-                requested = nack.missing.len(),
-                "voice: no frames to retransmit (all pending)"
-            );
-            continue;
-        }
-
-        let scheduled: Vec<u8> = plan.iter().map(|(idx, _)| *idx).collect();
-        info!(
-            message_id = nack.message_id,
-            requested = nack.missing.len(),
-            scheduled = scheduled.len(),
-            "voice: retransmitting"
-        );
-        let _ = status_tx.send(SendStatus::Retransmitting {
-            message_id: nack.message_id,
-            chunks: scheduled,
-        });
-
-        // Re-enqueue each frame on the paced TX worker. We do this in a
-        // detached task so a slow worker doesn't block the NACK
-        // listener from processing the next inbound frame. `to` for
-        // retransmits is always the *originator's* perspective: if we
-        // unicast originally, we still unicast on retransmit; if we
-        // broadcast, we still broadcast.
-        let permits = Arc::clone(&sender.retransmit_permits);
-        let svc = sender.svc.clone();
-        let registry = Arc::clone(&sender.registry);
-        let message_id = nack.message_id;
-        tokio::spawn(async move {
-            let _permit = match permits.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    warn!(message_id, "retransmit semaphore closed");
-                    return;
-                }
-            };
-            dispatch_retransmit_batch(&svc, &registry, plan, message_id, channel, to, pacing).await;
-        });
-    }
+        dispatch_retransmit_batch(&svc, &registry, plan, message_id, channel, to, pacing).await;
+    });
 }
 
 /// Push one retransmit batch through the paced TX worker, clearing
@@ -723,6 +883,12 @@ fn spawn_deferred_retransmit(
         tokio::time::sleep(wait).await;
 
         let Some(sender) = weak.upgrade() else { return };
+        // Balance the inflight_inc the scheduler did before spawning us, on
+        // every exit path from here on (so run_send's drain wait is correct).
+        let _guard = InflightGuard {
+            sender: weak.clone(),
+            message_id,
+        };
         let Some(missing) = sender.registry.take_deferred(message_id) else {
             return;
         };
@@ -734,6 +900,30 @@ fn spawn_deferred_retransmit(
         {
             Ok(p) if !p.is_empty() => p,
             Ok(_) => return,
+            Err(RetransmitSkipReason::CooldownActive) => {
+                // A newer NACK round set a fresh cooldown after we woke and
+                // already consumed the deferred list via `take_deferred`.
+                // Re-stash it and reschedule rather than dropping it, which
+                // would defeat the deferral in exactly the contended case it
+                // exists for.
+                // Scheduled: re-armed our own wake-up. AlreadyScheduled:
+                // another task will service it. CooldownElapsed: lapsed again,
+                // the receiver will re-NACK. Gone: entry GC'd.
+                if let DeferOutcome::Scheduled(new_deadline) =
+                    sender.registry.defer_nack(message_id, missing)
+                {
+                    sender.inflight_inc(message_id);
+                    spawn_deferred_retransmit(
+                        weak.clone(),
+                        message_id,
+                        channel,
+                        to,
+                        status_tx,
+                        new_deadline,
+                    );
+                }
+                return;
+            }
             Err(reason) => {
                 debug!(
                     message_id,

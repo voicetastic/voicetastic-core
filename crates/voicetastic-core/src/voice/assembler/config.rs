@@ -126,6 +126,19 @@ impl AssemblerConfig {
         if self.nack_window.is_zero() {
             return Err("nack_window must be > 0".to_string());
         }
+        // completion_memory must outlive message_timeout: the completion
+        // blacklist has to stay armed until the sender's retransmit tail
+        // (tied to message_timeout) fully drains. A shorter window prunes the
+        // blacklist while late chunks are still arriving, which resurrects the
+        // finalized slot and restarts the NACK storm. `sync_nack_cap_to_timeout`
+        // enforces this by construction; this guards hosts that set the fields
+        // directly.
+        if self.completion_memory < self.message_timeout {
+            return Err(format!(
+                "completion_memory ({:?}) must be >= message_timeout ({:?})",
+                self.completion_memory, self.message_timeout
+            ));
+        }
         Ok(())
     }
 }
@@ -190,5 +203,33 @@ mod tests {
         cfg.sync_nack_cap_to_timeout();
         // 60_000 ms / 1 ms = 60_000, capped at u16::MAX.
         assert_eq!(cfg.max_nack_rounds, 60_000);
+    }
+
+    #[test]
+    fn validate_accepts_default() {
+        assert!(AssemblerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_completion_memory_below_timeout() {
+        // A blacklist window shorter than the message timeout would let a
+        // finalized message be resurrected by late chunks (NACK storm).
+        let cfg = AssemblerConfig {
+            message_timeout: Duration::from_secs(1200),
+            completion_memory: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let err = cfg.validate().expect_err("must reject short completion_memory");
+        assert!(err.contains("completion_memory"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_accepts_completion_memory_equal_to_timeout() {
+        let cfg = AssemblerConfig {
+            message_timeout: Duration::from_secs(300),
+            completion_memory: Duration::from_secs(300),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }

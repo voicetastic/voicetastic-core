@@ -174,7 +174,17 @@ impl SerialConnection {
                                     break;
                                 }
                                 warn!(count = read_errors, ?e, "serial read error, retrying");
-                                sleep(Duration::from_millis(250 * u64::from(read_errors.min(10)))).await;
+                                // Race the backoff against shutdown so a
+                                // disconnect() during the sleep is observed
+                                // immediately instead of lingering for the
+                                // full backoff (up to ~1 s) past teardown.
+                                let backoff = Duration::from_millis(
+                                    250 * u64::from(read_errors.min(10)),
+                                );
+                                tokio::select! {
+                                    _ = shutdown_rx.changed() => break,
+                                    _ = sleep(backoff) => {}
+                                }
                             }
                             Err(_elapsed) => {
                                 // No complete frame arrived within 60 s.

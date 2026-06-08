@@ -696,6 +696,31 @@ mod policy_tests {
 // Settings API
 // ---------------------------------------------------------------------------
 
+/// Read and parse a settings file from disk.
+///
+/// A missing or unreadable file is the normal first-run / headless case and
+/// returns defaults silently. A file that exists but fails to parse (e.g. a
+/// hand-edited type mismatch) also falls back to defaults, but logs a warning
+/// first so the reset is diagnosable instead of silently dropping every
+/// setting. The on-disk file is left untouched, so fixing the typo restores
+/// the values on the next load.
+fn read_settings_at(path: &std::path::Path) -> AppSettings {
+    let Ok(s) = std::fs::read_to_string(path) else {
+        return AppSettings::default();
+    };
+    match toml::from_str(&s) {
+        Ok(data) => data,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "config.toml failed to parse; using defaults until it is fixed",
+            );
+            AppSettings::default()
+        }
+    }
+}
+
 /// Central settings facade. Cheap to clone (it's an `Arc` internally
 /// via [`SettingsApi::open`]); listeners and persistence are shared.
 pub struct SettingsApi {
@@ -703,6 +728,10 @@ pub struct SettingsApi {
     /// Persistence path. `None` means in-memory only (tests, headless).
     path: RwLock<Option<PathBuf>>,
     listeners: Mutex<Vec<Arc<dyn SettingsListener>>>,
+    /// Serializes [`Self::persist`] so concurrent setters (this API is shared
+    /// via `Arc` across the GUI and runtime) can't interleave writes into a
+    /// half-formed file.
+    persist_lock: Mutex<()>,
 }
 
 impl SettingsApi {
@@ -716,16 +745,14 @@ impl SettingsApi {
     /// Open at an explicit path. Pass `None` to run in-memory.
     pub fn open_at(path: Option<PathBuf>) -> Arc<Self> {
         let data = match path.as_ref() {
-            Some(p) => std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| toml::from_str(&s).ok())
-                .unwrap_or_default(),
+            Some(p) => read_settings_at(p),
             None => AppSettings::default(),
         };
         Arc::new(Self {
             inner: RwLock::new(data),
             path: RwLock::new(path),
             listeners: Mutex::new(Vec::new()),
+            persist_lock: Mutex::new(()),
         })
     }
 
@@ -745,10 +772,7 @@ impl SettingsApi {
     pub fn reload(&self) {
         let p = self.path.read().clone();
         let data = match p {
-            Some(p) => std::fs::read_to_string(p)
-                .ok()
-                .and_then(|s| toml::from_str(&s).ok())
-                .unwrap_or_default(),
+            Some(p) => read_settings_at(&p),
             None => AppSettings::default(),
         };
         *self.inner.write() = data;
@@ -1302,6 +1326,9 @@ impl SettingsApi {
     }
 
     fn persist(&self) -> SettingsResult<()> {
+        // Hold the persist lock across the whole snapshot-serialize-write so
+        // two concurrent setters can't interleave and produce malformed TOML.
+        let _guard = self.persist_lock.lock();
         let path = self.path.read().clone();
         let Some(path) = path else {
             return Ok(()); // in-memory only
@@ -1311,7 +1338,16 @@ impl SettingsApi {
         }
         let body = toml::to_string_pretty(&*self.inner.read())
             .map_err(|e| SettingsError::Io(std::io::Error::other(e)))?;
-        std::fs::write(&path, body)?;
+        // Write to a sibling temp file then atomically rename it over the
+        // target. A crash, power loss, or ENOSPC mid-write then leaves either
+        // the old complete file or the new complete file, never a truncated
+        // one that parses back as empty and silently resets every setting.
+        // The temp file is in the same directory so the rename is a
+        // same-filesystem atomic replace, and the persist lock means only one
+        // writer ever touches it at a time.
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
