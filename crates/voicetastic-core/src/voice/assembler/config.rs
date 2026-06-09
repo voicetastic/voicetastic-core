@@ -219,7 +219,9 @@ mod tests {
             completion_memory: Duration::from_secs(10),
             ..Default::default()
         };
-        let err = cfg.validate().expect_err("must reject short completion_memory");
+        let err = cfg
+            .validate()
+            .expect_err("must reject short completion_memory");
         assert!(err.contains("completion_memory"), "unexpected error: {err}");
     }
 

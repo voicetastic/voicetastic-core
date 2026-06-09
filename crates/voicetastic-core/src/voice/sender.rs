@@ -534,7 +534,11 @@ impl VoiceSender {
     /// Record that a retransmit task for `message_id` has been scheduled.
     /// Paired with exactly one [`Self::inflight_dec`] via [`InflightGuard`].
     fn inflight_inc(&self, message_id: u32) {
-        *self.retransmit_inflight.lock().entry(message_id).or_insert(0) += 1;
+        *self
+            .retransmit_inflight
+            .lock()
+            .entry(message_id)
+            .or_insert(0) += 1;
     }
 
     /// Record that a retransmit task for `message_id` has finished.
