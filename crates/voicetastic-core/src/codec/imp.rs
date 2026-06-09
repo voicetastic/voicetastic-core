@@ -96,6 +96,32 @@ fn codec2_mode_from_byte(b: u8) -> Result<Codec2Mode, CodecError> {
 
 const AMRNB_BYTES_PER_FRAME: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
 
+/// Total bytes (1-byte ToC + payload) for every AMR-NB frame type, indexed by
+/// the 4-bit frame type from the ToC byte. Types 0..=7 are the speech modes;
+/// type 8 is SID (comfort-noise, 5-byte payload); type 15 is NO_DATA (ToC
+/// only). Types 9..=14 are reserved with no defined size, so they're `None`
+/// and treated as undecodable. A DTX-enabled peer legitimately emits SID and
+/// NO_DATA frames (RFC 3267 / IF1), so the decoder must accept them rather
+/// than aborting the clip.
+const AMRNB_FRAME_BYTES: [Option<usize>; 16] = [
+    Some(13),
+    Some(14),
+    Some(16),
+    Some(18),
+    Some(20),
+    Some(21),
+    Some(27),
+    Some(32),
+    Some(6),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    Some(1),
+];
+
 fn amrnb_validate_mode(b: u8) -> Result<i32, CodecError> {
     if (b as usize) < AMRNB_BYTES_PER_FRAME.len() {
         Ok(b as i32)
@@ -405,11 +431,17 @@ pub fn decode(
 }
 
 fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
+    // Opus packets are self-describing and may legally carry up to 120 ms
+    // (5760 samples @ 48 kHz mono), not just the 20 ms (FRAME_SAMPLES) we
+    // encode. Size the output buffer to that legal maximum so a peer using
+    // larger frames doesn't make libopus return OPUS_BUFFER_TOO_SMALL and
+    // abort the whole clip. Matches the pure-Rust decoder path in opus_d.rs.
+    const OPUS_MAX_FRAME_SAMPLES: usize = 5760;
     let mut dec = Decoder::new(SAMPLE_RATE_HZ, Channels::Mono)
         .map_err(|e| CodecError::Codec(e.to_string()))?;
     let mut pcm: Vec<i16> = Vec::new();
     let mut i = 0;
-    let mut frame = [0i16; FRAME_SAMPLES];
+    let mut frame = [0i16; OPUS_MAX_FRAME_SAMPLES];
     while i + 2 <= payload.len() {
         let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
         i += 2;
@@ -463,8 +495,9 @@ fn decode_amrnb(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
     let mut frame = [0i16; AMRNB_SAMPLES_PER_FRAME];
     while i < payload.len() {
         let toc = payload[i];
+        // 4-bit frame type, so 0..=15 — always in bounds for the 16-entry table.
         let mode = ((toc >> 3) & 0x0F) as usize;
-        let Some(&size) = AMRNB_BYTES_PER_FRAME.get(mode) else {
+        let Some(size) = AMRNB_FRAME_BYTES[mode] else {
             return Err(CodecError::Codec(format!(
                 "amrnb: unsupported ToC byte {toc:#x}"
             )));
@@ -472,6 +505,10 @@ fn decode_amrnb(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
         if i + size > payload.len() {
             return Err(CodecError::Codec("amrnb: truncated frame".into()));
         }
+        // The decoder reads the frame type from the ToC and produces one
+        // 160-sample block for every type, including comfort noise for SID
+        // and PLC/silence for NO_DATA, so feeding the frame as-is preserves
+        // playback timing across DTX gaps.
         unsafe {
             Decoder_Interface_Decode(dec.0, payload[i..].as_ptr(), frame.as_mut_ptr(), 0);
         }

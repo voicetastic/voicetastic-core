@@ -1,14 +1,17 @@
 //! 4-byte trailing header integrity tag.
 //!
 //! Every wire frame carries a 4-byte trailing tag computed as
-//! `SHA-256(header[0..12])[..4]`. This is **integrity only**: it catches
-//! on-air bit-flips and accidental misroutes, but offers no protection
-//! against a deliberate attacker who knows the channel PSK (Meshtastic's
-//! channel encryption uses AES-CTR which is bit-flip malleable, so the
-//! header MAC also serves as a tamper-detection check on the encrypted
-//! payload bytes that carry the header).
+//! `SHA-256(header[0..12])[..4]`. This is **integrity only**, and it covers
+//! **only the 12 header bytes** - the body (codec payload, NACK bitmap) is
+//! NOT authenticated by this tag. It catches on-air bit-flips and accidental
+//! misroutes in the header itself (Meshtastic channel encryption is AES-CTR,
+//! which is bit-flip malleable, so a corrupted header could otherwise route
+//! or decode a frame against the wrong message). It offers no protection
+//! against a deliberate attacker who knows the channel PSK, and none at all
+//! for the body: an accidental bit-flip in the codec/NACK bytes passes
+//! verification and is only caught (if at all) by the codec decoder.
 //!
-//! Tag width is fixed at 4 bytes — a deliberate trade against the
+//! Tag width is fixed at 4 bytes - a deliberate trade against the
 //! 215-byte payload budget. 32 bits is sufficient for collision-resistant
 //! integrity on a 12-byte input (`2^32` random matches per chunk, well
 //! beyond per-message frame counts) without burning further LoRa airtime.

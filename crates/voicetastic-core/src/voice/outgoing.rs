@@ -61,6 +61,24 @@ pub enum RetransmitSkipReason {
     AllChunksPending,
 }
 
+/// Outcome of [`OutgoingVoiceRegistry::defer_nack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferOutcome {
+    /// Missing list stashed and no wake-up task was pending: the caller
+    /// should spawn one that fires at this deadline.
+    Scheduled(Instant),
+    /// Missing list stashed, but a wake-up task is already pending and will
+    /// pick up the fresher list. The caller does nothing.
+    AlreadyScheduled,
+    /// The cooldown already elapsed (it lapsed in the gap between the
+    /// caller's `take_retransmit` and this call, or was never set). Nothing
+    /// was stashed; the caller should retry `take_retransmit` directly
+    /// instead of dropping the round.
+    CooldownElapsed,
+    /// The message entry has been garbage-collected. The caller does nothing.
+    Gone,
+}
+
 /// Default retain TTL when the app hasn't applied settings yet. Must
 /// cover the full sender lifetime: `max_burst_duration + linger`.
 /// On LongFast (155 chunks × 900 ms ≈ 140 s) with the default linger of
@@ -192,6 +210,13 @@ impl OutgoingVoiceRegistry {
     /// Returns `true` if no outgoing messages are retained.
     pub fn is_empty(&self) -> bool {
         self.inner.lock().is_empty()
+    }
+
+    /// Returns `true` if an outgoing message with this id is currently
+    /// retained. Used to avoid handing out a `message_id` that aliases an
+    /// in-flight send.
+    pub fn contains(&self, message_id: u32) -> bool {
+        self.inner.lock().contains_key(&message_id)
     }
 
     pub fn register(
@@ -368,19 +393,25 @@ impl OutgoingVoiceRegistry {
     /// returned `Some(deadline)` tells the caller to spawn one that
     /// will consume the deferred state when cooldown expires.
     ///
-    /// Returns `None` if the entry has been GC'd, cooldown is no longer
-    /// active (the caller should retry [`take_retransmit`] directly), or
-    /// a wake-up task is already scheduled (the existing task will pick
-    /// up the newly stashed list).
-    pub fn defer_nack(&self, message_id: u32, missing: Vec<u8>) -> Option<Instant> {
+    /// See [`DeferOutcome`] for the full set of results. The
+    /// [`DeferOutcome::CooldownElapsed`] case is distinguished from
+    /// [`DeferOutcome::AlreadyScheduled`] / [`DeferOutcome::Gone`] so the
+    /// caller can retry [`take_retransmit`] directly instead of silently
+    /// dropping the NACK round when the cooldown lapsed mid-handoff.
+    pub fn defer_nack(&self, message_id: u32, missing: Vec<u8>) -> DeferOutcome {
         let mut map = self.inner.lock();
-        let entry = map.get_mut(&message_id)?;
+        let Some(entry) = map.get_mut(&message_id) else {
+            return DeferOutcome::Gone;
+        };
         let now = Instant::now();
-        let deadline = entry.cooldown_until?;
+        let Some(deadline) = entry.cooldown_until else {
+            // No cooldown set — caller should just retry take_retransmit.
+            return DeferOutcome::CooldownElapsed;
+        };
         if now >= deadline {
-            // Cooldown already elapsed — caller should just retry
-            // `take_retransmit` instead of deferring.
-            return None;
+            // Cooldown already elapsed — caller should retry take_retransmit
+            // instead of deferring.
+            return DeferOutcome::CooldownElapsed;
         }
         // Replace, don't merge: the latest NACK's bitmap supersedes any
         // older one. The receiver has at most one in-flight NACK per
@@ -389,10 +420,10 @@ impl OutgoingVoiceRegistry {
         if entry.deferred_task_scheduled {
             // A wake-up is already pending; it will pick up the fresher
             // missing list when it fires.
-            return None;
+            return DeferOutcome::AlreadyScheduled;
         }
         entry.deferred_task_scheduled = true;
-        Some(deadline)
+        DeferOutcome::Scheduled(deadline)
     }
 
     /// Consume the deferred missing list set by [`defer_nack`]. Clears
@@ -570,14 +601,15 @@ mod tests {
         );
         let first = reg.defer_nack(11, vec![1, 2]);
         assert!(
-            first.is_some(),
-            "first defer during cooldown must return a deadline"
+            matches!(first, DeferOutcome::Scheduled(_)),
+            "first defer during cooldown must schedule a wake-up, got {first:?}"
         );
         // Third NACK during the same cooldown — task already scheduled,
-        // return None but update the stashed list.
+        // return AlreadyScheduled but update the stashed list.
         let second = reg.defer_nack(11, vec![1, 2, 3]);
-        assert!(
-            second.is_none(),
+        assert_eq!(
+            second,
+            DeferOutcome::AlreadyScheduled,
             "second defer during cooldown must not double-schedule"
         );
         // The most recent missing list wins; the older one is replaced.
@@ -587,28 +619,28 @@ mod tests {
         assert!(reg.take_deferred(11).is_none());
         let again = reg.defer_nack(11, vec![4]);
         assert!(
-            again.is_some(),
-            "after take_deferred, a fresh defer must re-schedule"
+            matches!(again, DeferOutcome::Scheduled(_)),
+            "after take_deferred, a fresh defer must re-schedule, got {again:?}"
         );
     }
 
     #[test]
-    fn defer_nack_on_unknown_message_returns_none() {
+    fn defer_nack_on_unknown_message_returns_gone() {
         let reg = OutgoingVoiceRegistry::default();
-        assert!(reg.defer_nack(0xDEAD, vec![0, 1]).is_none());
+        assert_eq!(reg.defer_nack(0xDEAD, vec![0, 1]), DeferOutcome::Gone);
         assert!(reg.take_deferred(0xDEAD).is_none());
     }
 
     /// `defer_nack` is meant for the CooldownActive branch; if cooldown
-    /// is not active it returns None and the caller is expected to retry
-    /// `take_retransmit` directly.
+    /// is not active it returns CooldownElapsed and the caller is expected
+    /// to retry `take_retransmit` directly.
     #[test]
     fn defer_nack_without_active_cooldown_is_noop() {
         let reg = OutgoingVoiceRegistry::default();
         let encoded = build_encoded(0);
         reg.register(13, &encoded, 0, None);
         // No prior take ⇒ no cooldown set.
-        assert!(reg.defer_nack(13, vec![0]).is_none());
+        assert_eq!(reg.defer_nack(13, vec![0]), DeferOutcome::CooldownElapsed);
         assert!(reg.take_deferred(13).is_none());
     }
 }

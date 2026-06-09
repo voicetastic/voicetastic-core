@@ -373,7 +373,20 @@ impl AppSettings {
         let Ok(s) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        toml::from_str(&s).unwrap_or_default()
+        match toml::from_str(&s) {
+            Ok(data) => data,
+            Err(e) => {
+                // A parse failure (e.g. one hand-edited field with the wrong
+                // type) discards every setting; log it so the reset isn't
+                // silent. The on-disk file is left intact for the user to fix.
+                tracing::warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "config.toml failed to parse; using defaults until it is fixed",
+                );
+                Self::default()
+            }
+        }
     }
 
     /// Persist to the config path. Returns `Err` if the directory can't be

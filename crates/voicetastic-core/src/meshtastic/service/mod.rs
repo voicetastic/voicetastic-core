@@ -18,7 +18,7 @@ mod voice_tx;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, broadcast, mpsc, watch};
@@ -109,6 +109,18 @@ struct Inner {
     /// disconnect site. Defaults to [`usize::MAX`] so the absence of a
     /// transport doesn't artificially throttle chunk sizing in tests.
     transport_max_tx_payload: AtomicUsize,
+    /// Monotonic connection generation, bumped on every connect and
+    /// disconnect. Each inbound reader task captures the generation it was
+    /// spawned for and only performs teardown (clearing the transport slot,
+    /// setting `Disconnected`, auto-reconnect) while it still matches. This
+    /// stops a stale reader from a superseded connection from tearing down a
+    /// healthy newer transport when its own inbound stream finally ends.
+    conn_generation: AtomicU64,
+    /// Monotonic want-config-round generation, bumped each time a config
+    /// watchdog is armed. A watchdog captures its round at spawn and bails if
+    /// a newer round has since started, so overlapping watchdogs (connect +
+    /// `refresh_config` + reconnect) can't revert a progressing connection.
+    config_generation: AtomicU64,
     /// Canonical device config/identity snapshot (sans-IO). The watch
     /// channels below mirror it for the subscriber API; this is the single
     /// source of truth, and the one a non-tokio (browser) driver would read.
@@ -225,6 +237,8 @@ impl MeshtasticService {
             ble: tokio::sync::OnceCell::new(),
             transport: Mutex::new(None),
             transport_max_tx_payload: AtomicUsize::new(usize::MAX),
+            conn_generation: AtomicU64::new(0),
+            config_generation: AtomicU64::new(0),
             state: parking_lot::Mutex::new(protocol::ProtocolState::default()),
             state_tx,
             my_info_tx,
@@ -496,11 +510,20 @@ impl MeshtasticService {
         inbound: mpsc::Receiver<Vec<u8>>,
         settle_delay: Duration,
     ) -> Result<()> {
+        // Claim a fresh connection generation up front. Any reader still
+        // alive from a prior connection now holds an older generation and
+        // will skip its teardown, so it can't clobber the transport we're
+        // about to install.
+        let generation = self.inner.conn_generation.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut slot = self.inner.transport.lock().await;
             self.inner
                 .transport_max_tx_payload
                 .store(transport.max_tx_payload(), Ordering::Relaxed);
+            // Reset the firmware queue snapshot to "assume room" so a stale
+            // low-water value left over from the previous session doesn't
+            // stall the first voice burst until the next QueueStatus arrives.
+            *self.inner.radio_queue_free.lock() = u32::MAX;
             *slot = Some(transport);
         }
         self.set_state(ConnectionState::Connected);
@@ -559,13 +582,29 @@ impl MeshtasticService {
                     }
                 }
             }
+            // Only tear down if we're still the current connection. A newer
+            // connect_with_transport (manual re-connect, device switch, or an
+            // auto-reconnect race) bumps conn_generation; in that case this
+            // stream just ended for an already-superseded transport and the
+            // slot now holds the healthy new one, so we must not touch it.
+            // The generation is checked while holding the transport slot lock
+            // so it can't change between the check and the clear (a competing
+            // connect bumps the generation before it takes this same lock).
+            {
+                let mut slot = svc.inner.transport.lock().await;
+                if svc.inner.conn_generation.load(Ordering::SeqCst) != generation {
+                    debug!(
+                        generation,
+                        "inbound reader for superseded connection exiting without teardown"
+                    );
+                    return;
+                }
+                *slot = None;
+                svc.inner
+                    .transport_max_tx_payload
+                    .store(usize::MAX, Ordering::Relaxed);
+            }
             svc.set_state(ConnectionState::Disconnected);
-            let mut slot = svc.inner.transport.lock().await;
-            *slot = None;
-            svc.inner
-                .transport_max_tx_payload
-                .store(usize::MAX, Ordering::Relaxed);
-            drop(slot);
             // Auto-reconnect so the user doesn't have to manually
             // reconnect after a USB CDC ACM endpoint stall or a BLE drop.
             svc.try_reconnect().await;
@@ -665,6 +704,11 @@ impl MeshtasticService {
         *self.inner.reconnect_config.lock().await = None;
         let transport = {
             let mut slot = self.inner.transport.lock().await;
+            // Bump the generation so the reader for this transport skips its
+            // own teardown when its inbound stream ends: we do the teardown
+            // synchronously here, and an unguarded reader would otherwise fire
+            // a spurious reconnect afterwards.
+            self.inner.conn_generation.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .transport_max_tx_payload
                 .store(usize::MAX, Ordering::Relaxed);
@@ -727,9 +771,19 @@ impl MeshtasticService {
     /// Cheap to call repeatedly; tasks self-exit if state has already moved on.
     fn spawn_config_watchdog(&self) {
         let svc = self.clone();
+        // Claim a fresh want-config round. If another watchdog is armed after
+        // us (a second refresh_config, a reconnect), it bumps this again and
+        // we bail at each wake, so only the newest round can act on the state.
+        let round = self.inner.config_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // True while this is still the current round AND we're still waiting
+        // on the config burst. Guards every state-reverting decision below.
+        let still_current = move |svc: &MeshtasticService| {
+            svc.inner.config_generation.load(Ordering::SeqCst) == round
+                && *svc.inner.state_tx.borrow() == ConnectionState::Configuring
+        };
         tokio::spawn(async move {
             tokio::time::sleep(CONFIG_BURST_TIMEOUT).await;
-            if *svc.inner.state_tx.borrow() != ConnectionState::Configuring {
+            if !still_current(&svc) {
                 return;
             }
             warn!(
@@ -738,11 +792,13 @@ impl MeshtasticService {
             );
             if let Err(e) = svc.send_want_config().await {
                 warn!(?e, "config-burst retry send failed; reverting to Connected");
-                svc.set_state(ConnectionState::Connected);
+                if still_current(&svc) {
+                    svc.set_state(ConnectionState::Connected);
+                }
                 return;
             }
             tokio::time::sleep(CONFIG_BURST_TIMEOUT).await;
-            if *svc.inner.state_tx.borrow() == ConnectionState::Configuring {
+            if still_current(&svc) {
                 warn!(
                     timeout_s = CONFIG_BURST_TIMEOUT.as_secs() * 2,
                     "config burst still incomplete after retry; reverting to Connected"
