@@ -51,7 +51,7 @@ Protobuf definitions are pulled from the upstream
 submodule. Make sure to initialise it:
 
 ```bash
-git clone --recurse-submodules https://github.com/<you>/voicetastic-desktop.git
+git clone --recurse-submodules https://github.com/<you>/voicetastic-core.git
 # or, if already cloned:
 git submodule update --init
 ```
