@@ -406,7 +406,7 @@ pub struct AssemblerConfig {
 
 impl From<AssemblerConfig> for v::AssemblerConfig {
     fn from(c: AssemblerConfig) -> Self {
-        Self {
+        let mut cfg = Self {
             message_timeout: Duration::from_millis(c.message_timeout_ms),
             partial_play_on_timeout: c.partial_play_on_timeout,
             max_nack_rounds: c.max_nack_rounds,
@@ -423,7 +423,18 @@ impl From<AssemblerConfig> for v::AssemblerConfig {
             // known codec, defer codec-mismatch errors to playback.
             supported_codecs: None,
             dead_sender_timeout: v::consts::DEAD_SENDER_TIMEOUT,
-        }
+        };
+        // Tie the consecutive-silence round cap to `message_timeout`, just
+        // like the GUI and CLI hosts do after building their configs. The
+        // host-supplied `max_nack_rounds` is otherwise easy to get wrong
+        // (early Android builds shipped a literal `32`, the exact value
+        // core retired for tripping well before the timeout and producing
+        // spurious "partial: N/M chunks" finalizes). This also lifts
+        // `completion_memory` to `>= message_timeout` so that invariant
+        // holds. NACK is always enabled here (backoff_base is hard-coded
+        // non-zero above), so the sync is unconditional.
+        cfg.sync_nack_cap_to_timeout();
+        cfg
     }
 }
 
