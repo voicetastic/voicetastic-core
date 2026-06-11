@@ -4413,6 +4413,7 @@ dependencies = [
  "opus",
  "opus-decoder",
  "parking_lot 0.12.5",
+ "pkg-config",
  "prost",
  "prost-build",
  "reed-solomon-erasure",
@@ -4429,6 +4430,13 @@ dependencies = [
  "web-time",
  "x25519-dalek",
  "zbus",
+]
+
+[[package]]
+name = "voicetastic-esp32-bridge"
+version = "0.0.0-git"
+dependencies = [
+ "voicetastic-core",
 ]
 
 [[package]]

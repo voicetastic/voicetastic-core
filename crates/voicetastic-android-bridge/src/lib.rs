@@ -45,6 +45,8 @@ pub enum VoiceError {
     BadTotal,
     #[error("parity_count exceeds MAX_PARITY_PER_MESSAGE")]
     TooMuchParity,
+    #[error("data + parity shards exceed Reed-Solomon limit of 256")]
+    TooManyShards,
     #[error("chunk_index out of range")]
     BadIndex,
     #[error("audio too large for one message")]
@@ -96,6 +98,7 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::ZeroMessageId => Self::ZeroMessageId,
             v::VoiceError::BadTotal(_) => Self::BadTotal,
             v::VoiceError::TooMuchParity(_) => Self::TooMuchParity,
+            v::VoiceError::TooManyShards { .. } => Self::TooManyShards,
             v::VoiceError::BadIndex { .. } => Self::BadIndex,
             v::VoiceError::AudioTooLarge { .. } => Self::AudioTooLarge,
             v::VoiceError::ChunkTooSmall(_) => Self::ChunkTooSmall,
@@ -242,6 +245,13 @@ pub fn build_nack(cfg: NackConfig) -> Vec<u8> {
 // Receive side: messages + events
 // -----------------------------------------------------------------------------
 
+/// A byte range in [`VoiceMessageOut::audio`] that is missing-chunk padding.
+#[derive(Debug)]
+pub struct GapRange {
+    pub start: u32,
+    pub end: u32,
+}
+
 #[derive(Debug)]
 pub struct VoiceMessageOut {
     pub message_id: u32,
@@ -252,6 +262,7 @@ pub struct VoiceMessageOut {
     pub codec: VoiceCodec,
     pub codec_param: u8,
     pub audio: Vec<u8>,
+    pub gaps: Vec<GapRange>,
     pub timestamp_ms: i64,
     pub is_complete: bool,
     pub total_data: u8,
@@ -266,6 +277,14 @@ impl From<v::VoiceMessage> for VoiceMessageOut {
             v::VoiceDestination::Broadcast => (true, 0),
             v::VoiceDestination::Node(n) => (false, n.as_u32()),
         };
+        let gaps = m
+            .gaps
+            .iter()
+            .map(|r| GapRange {
+                start: r.start as u32,
+                end: r.end as u32,
+            })
+            .collect();
         Self {
             message_id: m.message_id,
             from: m.from,
@@ -275,6 +294,7 @@ impl From<v::VoiceMessage> for VoiceMessageOut {
             codec: m.codec.into(),
             codec_param: m.codec_param,
             audio: m.audio,
+            gaps,
             timestamp_ms: m.timestamp.timestamp_millis(),
             is_complete: m.is_complete,
             total_data: m.total_data,

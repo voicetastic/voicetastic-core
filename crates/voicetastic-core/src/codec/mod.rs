@@ -33,6 +33,8 @@
 //!   The actual encode/decode work goes through `libopencore-amrnb` over
 //!   raw FFI.
 
+pub(crate) mod frames;
+
 mod denoise;
 mod error;
 mod resampler;
@@ -127,51 +129,68 @@ fn codec2_frame_sizes(mode: u8) -> Option<(usize, usize)> {
     }
 }
 
-/// Total bytes (ToC + speech) per AMR-NB frame for each mode index `0..=7`.
-const AMRNB_BYTES_PER_FRAME_LOOKUP: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
-
 /// Best-effort estimate of the wall-clock duration of an encoded payload,
 /// in milliseconds. Returns 0 for unknown codec parameters.
+///
+/// Opus duration is derived from the TOC byte of each packet (RFC 6716 §3.1)
+/// rather than assuming 20 ms per packet, so non-standard frame sizes are
+/// handled correctly. AMR-NB correctly counts SID and NO_DATA frames as 20 ms
+/// each (they produce one 160-sample block through the decoder).
 pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -> u32 {
     match codec {
         VoiceCodec::Opus => {
-            let mut i = 0;
-            let mut packets: u32 = 0;
-            while i + 2 <= payload.len() {
-                let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-                i += 2;
-                if i + len > payload.len() {
-                    break;
-                }
-                i += len;
-                packets += 1;
+            let mut total_samples: u64 = 0;
+            for pkt in frames::OpusPackets::new(payload) {
+                total_samples += frames::opus_packet_samples_48k(pkt).unwrap_or(960) as u64;
             }
-            packets * 20
+            (total_samples / 48) as u32
         }
         VoiceCodec::Codec2 => {
             let Some((samples, bytes)) = codec2_frame_sizes(codec_param) else {
                 return 0;
             };
-            let frames = (payload.len() / bytes) as u32;
-            frames * (samples as u32) / 8
+            let frame_count = (payload.len() / bytes) as u32;
+            frame_count * (samples as u32) / 8
         }
         VoiceCodec::AmrNb => {
-            let mut i = 0;
-            let mut frames: u32 = 0;
-            while i < payload.len() {
-                let mode = ((payload[i] >> 3) & 0x0F) as usize;
-                let Some(&size) = AMRNB_BYTES_PER_FRAME_LOOKUP.get(mode) else {
-                    break;
-                };
-                if i + size > payload.len() {
-                    break;
-                }
-                i += size;
-                frames += 1;
-            }
-            frames * 20
+            // Each AMR-NB frame (speech, SID, or NO_DATA) covers 20 ms.
+            frames::AmrnbFrames::new(payload).count() as u32 * 20
         }
         _ => 0,
+    }
+}
+
+/// Like [`payload_duration_ms`] but correct for partial payloads with zero-
+/// padded gaps. The total duration is independent of which chunks arrived
+/// (silence still occupies its slot on the timeline), so this only changes
+/// how frames are *counted*, never the result for a complete payload.
+///
+/// For AMR-NB the per-frame walker would misread zero-padded gap bytes as
+/// 13-byte mode-0 frames; since the encoder runs a fixed mode (DTX off) every
+/// frame is the same size, so we count `len / frame_size(codec_param)` instead.
+/// Other codecs delegate to [`payload_duration_ms`] (Codec2 already derives
+/// the count from the fixed frame size; Opus is best-effort / deprecated).
+pub fn payload_duration_ms_with_gaps(
+    payload: &[u8],
+    gaps: &[std::ops::Range<usize>],
+    codec: VoiceCodec,
+    codec_param: u8,
+) -> u32 {
+    if gaps.is_empty() {
+        return payload_duration_ms(payload, codec, codec_param);
+    }
+    match codec {
+        VoiceCodec::AmrNb => {
+            match frames::AMRNB_FRAME_BYTES
+                .get(codec_param as usize)
+                .copied()
+                .flatten()
+            {
+                Some(frame_bytes) if frame_bytes > 0 => (payload.len() / frame_bytes) as u32 * 20,
+                _ => payload_duration_ms(payload, codec, codec_param),
+            }
+        }
+        _ => payload_duration_ms(payload, codec, codec_param),
     }
 }
 
@@ -182,7 +201,7 @@ pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -
 #[cfg(feature = "codecs")]
 mod imp;
 #[cfg(feature = "codecs")]
-pub use imp::{Encoder, decode};
+pub use imp::{Encoder, decode, decode_with_gaps};
 
 // One-shot Codec2 (pure Rust, wasm-safe). Available whenever `codec2` is on —
 // which `codecs` implies, and which wasm consumers enable on its own.
@@ -250,6 +269,15 @@ mod disabled {
     ) -> Result<Vec<i16>, CodecError> {
         Err(CodecError::FeatureDisabled)
     }
+
+    pub fn decode_with_gaps(
+        _payload: &[u8],
+        _gaps: &[std::ops::Range<usize>],
+        _codec_id: VoiceCodec,
+        _codec_param: u8,
+    ) -> Result<Vec<i16>, CodecError> {
+        Err(CodecError::FeatureDisabled)
+    }
 }
 #[cfg(not(feature = "codecs"))]
-pub use disabled::{Encoder, decode};
+pub use disabled::{Encoder, decode, decode_with_gaps};

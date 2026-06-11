@@ -140,6 +140,7 @@ denoise = ["dep:nnnoiseless"]
 
 [build-dependencies]
 prost-build = { workspace = true }
+pkg-config = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

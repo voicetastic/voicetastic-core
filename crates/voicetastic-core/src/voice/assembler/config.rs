@@ -112,6 +112,27 @@ impl AssemblerConfig {
         self.completion_memory = self.completion_memory.max(self.message_timeout);
     }
 
+    /// Return a copy with all invariants restored by clamping out-of-range fields.
+    ///
+    /// - `message_timeout`, `nack_window`, `dead_sender_timeout`: floored to 1 ms.
+    /// - `dead_sender_timeout`: clamped to `<= message_timeout` (equal is safe:
+    ///   the hard-timeout check fires before the dead-sender check).
+    /// - `completion_memory`: raised to `>= message_timeout`.
+    pub fn clamped(self) -> Self {
+        let one_ms = Duration::from_millis(1);
+        let message_timeout = self.message_timeout.max(one_ms);
+        let nack_window = self.nack_window.max(one_ms);
+        let dead_sender_timeout = self.dead_sender_timeout.max(one_ms).min(message_timeout);
+        let completion_memory = self.completion_memory.max(message_timeout);
+        Self {
+            message_timeout,
+            nack_window,
+            dead_sender_timeout,
+            completion_memory,
+            ..self
+        }
+    }
+
     /// Validate config invariants. Returns `Ok(())` if valid, else a descriptive error.
     pub fn validate(&self) -> Result<(), String> {
         if self.message_timeout.is_zero() {
@@ -236,5 +257,22 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn clamped_restores_invariants() {
+        // dead_sender_timeout > message_timeout and completion_memory < message_timeout.
+        let cfg = AssemblerConfig {
+            message_timeout: Duration::from_millis(50),
+            completion_memory: Duration::from_millis(10),
+            dead_sender_timeout: Duration::from_secs(120),
+            nack_window: Duration::ZERO,
+            ..Default::default()
+        }
+        .clamped();
+        assert!(cfg.message_timeout >= Duration::from_millis(1));
+        assert!(cfg.nack_window >= Duration::from_millis(1));
+        assert!(cfg.dead_sender_timeout <= cfg.message_timeout);
+        assert!(cfg.completion_memory >= cfg.message_timeout);
     }
 }

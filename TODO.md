@@ -73,11 +73,6 @@ Ordered roughly by user impact / payoff.
   Touches: `crates/voicetastic-gui/src/state.rs`,
   `crates/voicetastic-gui/src/watchers.rs`.
 
-- [ ] **Forward-compatible `AppSettings::save`**
-  `ui/devices.rs` builds a fresh `AppSettings { last_device, .. }` on every
-  Connect, dropping any future fields. Load → mutate → save.
-  Touches: `crates/voicetastic-gui/src/ui/devices.rs`.
-
 - [ ] **GUI architecture: snapshot-per-frame**
   Replace per-card `shared.lock()` calls with a single snapshot at the top
   of `App::update()` and a `Vec<Mutation>` applied at end-of-frame. Reduces

@@ -362,45 +362,6 @@ impl AppSettings {
             _ => DEFAULT_THEME_CONTRAST,
         }
     }
-
-    /// Load from the config path, or return defaults if the file is missing
-    /// or unparseable. Errors are intentionally swallowed — corrupt config
-    /// must never block app startup.
-    pub fn load() -> Self {
-        let Some(path) = config_path() else {
-            return Self::default();
-        };
-        let Ok(s) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
-        match toml::from_str(&s) {
-            Ok(data) => data,
-            Err(e) => {
-                // A parse failure (e.g. one hand-edited field with the wrong
-                // type) discards every setting; log it so the reset isn't
-                // silent. The on-disk file is left intact for the user to fix.
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "config.toml failed to parse; using defaults until it is fixed",
-                );
-                Self::default()
-            }
-        }
-    }
-
-    /// Persist to the config path. Returns `Err` if the directory can't be
-    /// created or the write fails; callers may choose to surface or ignore.
-    pub fn save(&self) -> std::io::Result<()> {
-        let path = config_path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no config dir available")
-        })?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let body = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(&path, body)
-    }
 }
 
 /// Resolve `$XDG_CONFIG_HOME/voicetastic/config.toml`, falling back to

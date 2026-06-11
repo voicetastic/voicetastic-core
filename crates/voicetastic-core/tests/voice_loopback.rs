@@ -86,6 +86,49 @@ fn loopback_fec_recovers_one_loss_without_nack() {
     assert_eq!(m.audio, audio);
 }
 
+/// Regression for the RS `data + parity <= 256` limit: a long broadcast
+/// recording with Auto FEC (50 % parity) used to fail `build_message`
+/// outright once `total_data` passed ~171. With parity clamped against the
+/// shard-sum limit it now builds, and FEC still recovers dropped chunks.
+#[test]
+fn loopback_heavy_fec_near_max_chunks_roundtrips() {
+    use voicetastic_core::settings::VoiceFecMode;
+
+    // ~200 data chunks at the minimum chunk size.
+    let chunk_size = 16;
+    let total_data = 200usize;
+    let audio = synth(chunk_size * total_data);
+    let parity = VoiceFecMode::Auto.resolve(true, None, total_data);
+    assert!(
+        total_data + parity as usize <= 256,
+        "resolve must keep the shard sum within the RS limit"
+    );
+
+    let enc = build_message(&audio, &cfg(chunk_size, parity)).expect("should build with FEC");
+    let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+    // Drop a handful of interior data frames; FEC has plenty of parity to
+    // recover. (The final data chunk, index 199, is left intact: a missing
+    // final chunk with unknown trimmed length deliberately defers FEC.)
+    let lost: HashSet<usize> = [3, 7, 50, 120, 198].into_iter().collect();
+    let mut completed = None;
+    for (i, f) in enc.frames.iter().enumerate() {
+        if lost.contains(&i) {
+            continue;
+        }
+        match asm.accept(FROM, VoiceDestination::Broadcast, CHANNEL, f) {
+            AssemblyEvent::Pending { .. }
+            | AssemblyEvent::Duplicate
+            | AssemblyEvent::Rejected(_) => {}
+            AssemblyEvent::Complete(m) => completed = Some(m),
+            AssemblyEvent::Nack(_) => panic!("broadcast must not NACK"),
+        }
+    }
+    let m = completed.expect("FEC should complete the message");
+    assert!(m.is_complete);
+    assert_eq!(m.audio, audio);
+}
+
 /// NACK-driven retransmit round-trip.
 #[test]
 fn loopback_nack_retransmit_completes_message() {

@@ -68,14 +68,16 @@ use crate::voice::nack::parse_nack_body;
 use crate::voice::outgoing::{DeferOutcome, OutgoingVoiceRegistry, RetransmitSkipReason};
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
-/// Default linger window after the initial burst. Matches the
-/// receiver-side `AssemblerConfig::message_timeout` default (10 min)
-/// so the sender stays alive to service NACK rounds for as long as the
-/// receiver is willing to try. The previous value of 60 s was too short
-/// for slow modem presets: on LongFast (900 ms pacing) a 155-frame burst
-/// alone takes ~140 s, leaving only a 60 s window for potentially dozens
-/// of NACK rounds, each subject to a multi-second retransmit cooldown.
-pub const DEFAULT_LINGER: Duration = Duration::from_secs(600);
+/// Default linger window after the initial burst. Kept in sync with
+/// `DEFAULT_RETAIN_TTL` (the outgoing registry's retain TTL) and the
+/// receiver-side `AssemblerConfig::message_timeout` default so the
+/// sender stays alive to service NACK rounds for as long as the receiver
+/// is willing to try, and the registry keeps the chunks available for the
+/// full duration. The previous value of 600 s was too short: on LongFast
+/// (900 ms pacing) a 155-frame burst alone takes ~140 s, and subsequent
+/// NACK recovery rounds with multi-second cooldowns can easily consume
+/// another 600 s before all missing chunks arrive.
+pub const DEFAULT_LINGER: Duration = crate::voice::outgoing::DEFAULT_RETAIN_TTL;
 
 /// Upper bound on how long `run_send` waits, after the linger window, for
 /// any still-scheduled retransmit batches to drain before emitting
@@ -448,6 +450,15 @@ impl VoiceSender {
             .data_count(message_id)
             .unwrap_or(total_frames as u8);
         for (i, frame) in frames.into_iter().enumerate() {
+            // A give-up NACK arriving mid-burst removes the active entry and
+            // emits `GaveUp`. Stop enqueueing the rest of the burst rather
+            // than burning airtime the receiver explicitly asked us to stop
+            // (on slow presets the burst can run for minutes). The give-up
+            // handler already emitted the terminal status, so we just return.
+            if !self.active.lock().contains_key(&message_id) {
+                debug!(message_id, "voice: send cancelled mid-burst (give-up NACK)");
+                return;
+            }
             match self
                 .svc
                 .enqueue_voice_frame_with_id(frame, channel, to, want_ack, pacing)
@@ -514,13 +525,17 @@ impl VoiceSender {
             .await;
         }
 
-        // Check whether someone (a give_up NACK handler) already cleared
-        // us out. If so, the terminal status was emitted there.
-        let still_active = self.active.lock().contains_key(&message_id);
-        if still_active {
+        // Atomically claim the terminal status: whoever removes the active
+        // entry owns it. A give_up NACK handler running concurrently does the
+        // same `active.remove`, so exactly one of us emits a terminal status —
+        // this closes the check-then-act race that could emit both `GaveUp`
+        // and `Complete`. `registry.remove` is idempotent, so it is safe to
+        // call regardless of who claimed.
+        let claimed = self.active.lock().remove(&message_id).is_some();
+        if claimed {
             let _ = status_tx.send(SendStatus::Complete { message_id });
-            self.cleanup(message_id);
         }
+        self.registry.remove(message_id);
         // Prune expired outgoing entries to keep memory usage low.
         self.registry.prune_expired();
     }
@@ -597,6 +612,16 @@ impl VoiceSender {
 /// NACK frames addressed to one of our in-flight messages, and
 /// dispatches retransmits.
 ///
+/// A NACK is only trusted if it comes from the node we unicast to.
+///
+/// `to` is the destination of our send (`None` = broadcast). Broadcast
+/// sends are never NACKed by a conforming receiver, so any NACK against a
+/// broadcast send is dropped; for a unicast send only the destination node
+/// may NACK.
+fn nack_source_allowed(to: Option<u32>, nack_from: u32) -> bool {
+    matches!(to, Some(dest) if dest == nack_from)
+}
+
 /// Uses `Weak<VoiceSender>` so that dropping the last external sender
 /// clone terminates the task on the next message.
 async fn nack_listener_task(
@@ -647,6 +672,22 @@ async fn nack_listener_task(
         let Ok(nack) = parse_nack_body(&header, body) else {
             continue;
         };
+
+        // Only trust a NACK from the node we are unicasting to. Broadcast
+        // sends are never NACKed by a conforming receiver (the assembler
+        // suppresses broadcast NACKs), so any NACK against a broadcast send
+        // is forged or stale. Without this, any third node could observe an
+        // on-air message_id, compute the unkeyed header MAC, and forge a
+        // give-up NACK to cancel someone else's send (or drive retransmits).
+        if !nack_source_allowed(to, data.from) {
+            debug!(
+                message_id,
+                from = data.from,
+                ?to,
+                "voice: dropping NACK from untrusted source"
+            );
+            continue;
+        }
 
         if nack.give_up {
             info!(message_id = nack.message_id, "voice: receiver gave up");
@@ -1001,6 +1042,37 @@ mod tests {
                 parity_count: 0
             }
             .is_terminal()
+        );
+    }
+
+    #[test]
+    fn nack_source_allowed_unicast_only_from_dest() {
+        assert!(nack_source_allowed(Some(7), 7));
+        assert!(!nack_source_allowed(Some(7), 8));
+    }
+
+    #[test]
+    fn nack_source_allowed_broadcast_rejects_all() {
+        assert!(!nack_source_allowed(None, 7));
+        assert!(!nack_source_allowed(None, 0));
+    }
+
+    /// DEFAULT_LINGER, DEFAULT_RETAIN_TTL, and the AssemblerConfig
+    /// message_timeout default must all be equal so the sender stays alive
+    /// to service every NACK round the receiver will attempt, and the
+    /// outgoing registry keeps chunks available for the whole window.
+    #[test]
+    fn linger_retain_ttl_and_timeout_are_aligned() {
+        use crate::voice::assembler::AssemblerConfig;
+        use crate::voice::outgoing::DEFAULT_RETAIN_TTL;
+        assert_eq!(
+            DEFAULT_LINGER, DEFAULT_RETAIN_TTL,
+            "sender linger must equal outgoing registry retain TTL"
+        );
+        assert_eq!(
+            DEFAULT_LINGER,
+            AssemblerConfig::default().message_timeout,
+            "sender linger must equal assembler default message_timeout"
         );
     }
 

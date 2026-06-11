@@ -116,6 +116,7 @@ enum VoiceError {
     "ZeroMessageId",
     "BadTotal",
     "TooMuchParity",
+    "TooManyShards",
     "BadIndex",
     "AudioTooLarge",
     "ChunkTooSmall",
@@ -169,6 +170,13 @@ dictionary EncodedMessage {
     u8 parity_count;
 };
 
+/// A byte range within [`VoiceMessageOut.audio`] that is missing-chunk
+/// padding (not received audio). Half-open: `[start, end)`.
+dictionary GapRange {
+    u32 start;
+    u32 end;
+};
+
 /// Reassembled voice message emitted by the assembler.
 dictionary VoiceMessageOut {
     u32 message_id;
@@ -181,6 +189,10 @@ dictionary VoiceMessageOut {
     VoiceCodec codec;
     u8 codec_param;
     bytes audio;
+    /// Byte ranges in [`audio`] that are zero padding for missing chunks.
+    /// Empty when [`is_complete`]. Consumers may conceal these on playback;
+    /// Android currently gates partial playback on this being empty.
+    sequence<GapRange> gaps;
     i64 timestamp_ms;
     boolean is_complete;
     u8 total_data;

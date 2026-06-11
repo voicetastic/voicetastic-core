@@ -248,6 +248,12 @@ pub fn voice_codec_kind_from_id(s: &str) -> Option<VoiceCodecKind> {
     VoiceCodecKind::from_id(s)
 }
 
+impl Default for VoiceCodecKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_CODEC).expect("DEFAULT_VOICE_CODEC is always a valid id")
+    }
+}
+
 /// Typed mirror of the `voice.opus_bandwidth` string id. Only the two
 /// modes useful for LoRa-voice are exposed; super-wide and full-band
 /// are deliberately omitted.
@@ -282,6 +288,12 @@ pub fn opus_bandwidth_kind_to_id(k: OpusBandwidthKind) -> &'static str {
 
 pub fn opus_bandwidth_kind_from_id(s: &str) -> Option<OpusBandwidthKind> {
     OpusBandwidthKind::from_id(s)
+}
+
+impl Default for OpusBandwidthKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_OPUS_BANDWIDTH).expect("DEFAULT_OPUS_BANDWIDTH is always a valid id")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -335,15 +347,19 @@ impl VoiceFecMode {
     /// rely on NACK recovery. `preset` is consulted only for `Auto` on
     /// unicast; manual modes ignore it.
     ///
-    /// Returned value is clamped to `[0, min(total_data, MAX_PARITY_PER_MESSAGE)]`
-    /// so callers never need to re-check the protocol cap.
+    /// Returned value is clamped to
+    /// `[0, min(total_data, MAX_PARITY_PER_MESSAGE, MAX_TOTAL_SHARDS - total_data)]`
+    /// so callers never need to re-check the protocol cap — including the
+    /// Reed-Solomon `data + parity <= 256` limit, which `total_data` near the
+    /// `MAX_CHUNKS_PER_MESSAGE` ceiling would otherwise blow past on a 50 %
+    /// (broadcast / Heavy) parity ratio.
     pub fn resolve(
         self,
         broadcast: bool,
         preset: Option<crate::voice::ModemPreset>,
         total_data: usize,
     ) -> u8 {
-        use crate::voice::{MAX_PARITY_PER_MESSAGE, ModemPreset};
+        use crate::voice::{MAX_PARITY_PER_MESSAGE, MAX_TOTAL_SHARDS, ModemPreset};
         let pct = match (self, broadcast) {
             (Self::Off, _) => 0,
             (Self::Light, _) => 10,
@@ -365,7 +381,10 @@ impl VoiceFecMode {
             },
         };
         let raw = (total_data * pct).div_ceil(100);
-        let cap = total_data.min(MAX_PARITY_PER_MESSAGE).min(u8::MAX as usize);
+        let cap = total_data
+            .min(MAX_PARITY_PER_MESSAGE)
+            .min(MAX_TOTAL_SHARDS.saturating_sub(total_data))
+            .min(u8::MAX as usize);
         raw.min(cap) as u8
     }
 }
@@ -376,6 +395,12 @@ pub fn voice_fec_mode_to_id(m: VoiceFecMode) -> &'static str {
 
 pub fn voice_fec_mode_from_id(s: &str) -> Option<VoiceFecMode> {
     VoiceFecMode::from_id(s)
+}
+
+impl Default for VoiceFecMode {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_FEC_MODE).expect("DEFAULT_VOICE_FEC_MODE is always a valid id")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +534,13 @@ pub fn voice_nack_mode_from_id(s: &str) -> Option<VoiceNackMode> {
     VoiceNackMode::from_id(s)
 }
 
+impl Default for VoiceNackMode {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_NACK_MODE)
+            .expect("DEFAULT_VOICE_NACK_MODE is always a valid id")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Theme mode + contrast (desktop GUI only — Android has its own theme path)
 // ---------------------------------------------------------------------------
@@ -552,6 +584,12 @@ pub fn theme_mode_kind_from_id(s: &str) -> Option<ThemeModeKind> {
     ThemeModeKind::from_id(s)
 }
 
+impl Default for ThemeModeKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_THEME_MODE).expect("DEFAULT_THEME_MODE is always a valid id")
+    }
+}
+
 /// Typed mirror of the `theme.contrast` string id. `Standard` uses the
 /// M3 TonalSpot palette; `High` opts into the HighContrast variant that
 /// mirrors the firmware `meshtastic-device-ui` theme.
@@ -584,6 +622,12 @@ pub fn theme_contrast_kind_to_id(k: ThemeContrastKind) -> &'static str {
 
 pub fn theme_contrast_kind_from_id(s: &str) -> Option<ThemeContrastKind> {
     ThemeContrastKind::from_id(s)
+}
+
+impl Default for ThemeContrastKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_THEME_CONTRAST).expect("DEFAULT_THEME_CONTRAST is always a valid id")
+    }
 }
 
 #[cfg(test)]
@@ -646,12 +690,30 @@ mod policy_tests {
     }
 
     #[test]
-    fn fec_resolve_caps_at_max_parity() {
-        // 50% of 255 (max total_data) ceils to 128 — exactly the protocol
-        // cap. Any larger total_data is impossible (u8 wraps), so this is
-        // the edge that exercises the cap clamp.
+    fn fec_resolve_caps_at_rs_sum_limit() {
+        use crate::voice::MAX_TOTAL_SHARDS;
+        // At the max total_data, the RS `data + parity <= 256` limit leaves
+        // room for only one parity shard, even though Heavy asks for 50%.
         let p = VoiceFecMode::Heavy.resolve(false, None, 255);
-        assert_eq!(p as usize, crate::voice::MAX_PARITY_PER_MESSAGE);
+        assert_eq!(p, 1);
+        assert!(255 + p as usize <= MAX_TOTAL_SHARDS);
+    }
+
+    #[test]
+    fn fec_auto_broadcast_never_exceeds_rs_limit() {
+        use crate::voice::MAX_TOTAL_SHARDS;
+        // Auto broadcast forces 50% parity — the worst case for the RS sum.
+        // No total_data may produce data + parity > 256.
+        for total_data in 1..=255usize {
+            let p = VoiceFecMode::Auto.resolve(true, None, total_data) as usize;
+            assert!(
+                total_data + p <= MAX_TOTAL_SHARDS,
+                "total_data={total_data} parity={p} exceeds RS limit"
+            );
+        }
+        // Spot-check the historical failure point: 171 data + 50% would be 86
+        // (= 257), now clamped to 85.
+        assert_eq!(VoiceFecMode::Auto.resolve(true, None, 171), 85);
     }
 
     #[test]
@@ -696,27 +758,48 @@ mod policy_tests {
 // Settings API
 // ---------------------------------------------------------------------------
 
+/// Whether loading the settings file succeeded or produced degraded defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadStatus {
+    /// File was missing (first run) or parsed successfully.
+    Clean,
+    /// File existed but could not be read (e.g. EACCES) or failed to parse.
+    /// Defaults are in use; the broken file will be backed up before the next
+    /// successful persist so it is never silently overwritten.
+    Degraded,
+}
+
 /// Read and parse a settings file from disk.
 ///
-/// A missing or unreadable file is the normal first-run / headless case and
-/// returns defaults silently. A file that exists but fails to parse (e.g. a
-/// hand-edited type mismatch) also falls back to defaults, but logs a warning
-/// first so the reset is diagnosable instead of silently dropping every
-/// setting. The on-disk file is left untouched, so fixing the typo restores
-/// the values on the next load.
-fn read_settings_at(path: &std::path::Path) -> AppSettings {
-    let Ok(s) = std::fs::read_to_string(path) else {
-        return AppSettings::default();
-    };
-    match toml::from_str(&s) {
-        Ok(data) => data,
+/// Returns defaults + `LoadStatus::Clean` when the file is missing (first run)
+/// or on a successful parse. Returns defaults + `LoadStatus::Degraded` when
+/// the file exists but cannot be read (e.g. EACCES) or fails to parse. In
+/// the degraded case a warning is logged; the on-disk file is left intact so
+/// the user can fix it manually.
+fn read_settings_at(path: &std::path::Path) -> (AppSettings, LoadStatus) {
+    let s = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (AppSettings::default(), LoadStatus::Clean);
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "config.toml failed to parse; using defaults until it is fixed",
+                "config.toml could not be read; using defaults",
             );
-            AppSettings::default()
+            return (AppSettings::default(), LoadStatus::Degraded);
+        }
+    };
+    match toml::from_str(&s) {
+        Ok(data) => (data, LoadStatus::Clean),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "config.toml failed to parse; using defaults until fixed or replaced",
+            );
+            (AppSettings::default(), LoadStatus::Degraded)
         }
     }
 }
@@ -732,6 +815,10 @@ pub struct SettingsApi {
     /// via `Arc` across the GUI and runtime) can't interleave writes into a
     /// half-formed file.
     persist_lock: Mutex<()>,
+    /// Set when the on-disk config could not be read or parsed. In degraded
+    /// mode `persist()` renames the broken file to `config.toml.broken-<ts>`
+    /// before writing so the user can recover their settings manually.
+    degraded: std::sync::atomic::AtomicBool,
 }
 
 impl SettingsApi {
@@ -744,15 +831,16 @@ impl SettingsApi {
 
     /// Open at an explicit path. Pass `None` to run in-memory.
     pub fn open_at(path: Option<PathBuf>) -> Arc<Self> {
-        let data = match path.as_ref() {
+        let (data, status) = match path.as_ref() {
             Some(p) => read_settings_at(p),
-            None => AppSettings::default(),
+            None => (AppSettings::default(), LoadStatus::Clean),
         };
         Arc::new(Self {
             inner: RwLock::new(data),
             path: RwLock::new(path),
             listeners: Mutex::new(Vec::new()),
             persist_lock: Mutex::new(()),
+            degraded: std::sync::atomic::AtomicBool::new(status == LoadStatus::Degraded),
         })
     }
 
@@ -768,17 +856,30 @@ impl SettingsApi {
         *self.path.write() = path;
     }
 
-    /// Reload from disk, discarding any in-memory edits.
+    /// Reload from disk, discarding any in-memory edits. Clears the degraded
+    /// flag if the file now parses successfully.
     pub fn reload(&self) {
         let p = self.path.read().clone();
-        let data = match p {
+        let (data, status) = match p {
             Some(p) => read_settings_at(&p),
-            None => AppSettings::default(),
+            None => (AppSettings::default(), LoadStatus::Clean),
         };
+        self.degraded.store(
+            status == LoadStatus::Degraded,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *self.inner.write() = data;
         for k in SettingKey::all() {
             self.notify(*k);
         }
+    }
+
+    /// Returns `true` when the settings file existed but could not be read or
+    /// parsed at last open/reload. In degraded mode the first successful
+    /// [`persist`] will rename the broken file to `config.toml.broken-<ts>`
+    /// before writing so it can be recovered manually.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Subscribe to value changes.
@@ -808,7 +909,7 @@ impl SettingsApi {
     }
 
     pub fn voice_codec(&self) -> VoiceCodecKind {
-        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or(VoiceCodecKind::AmrNb)
+        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or_default()
     }
 
     pub fn voice_codec2_mode(&self) -> u8 {
@@ -824,8 +925,7 @@ impl SettingsApi {
     }
 
     pub fn voice_opus_bandwidth(&self) -> OpusBandwidthKind {
-        OpusBandwidthKind::from_id(self.inner.read().voice_opus_bandwidth())
-            .unwrap_or(OpusBandwidthKind::Wide)
+        OpusBandwidthKind::from_id(self.inner.read().voice_opus_bandwidth()).unwrap_or_default()
     }
 
     pub fn voice_denoise_enabled(&self) -> bool {
@@ -833,37 +933,40 @@ impl SettingsApi {
     }
 
     pub fn voice_fec_mode(&self) -> VoiceFecMode {
-        VoiceFecMode::from_id(self.inner.read().voice_fec_mode()).unwrap_or(VoiceFecMode::Auto)
+        VoiceFecMode::from_id(self.inner.read().voice_fec_mode()).unwrap_or_default()
     }
 
     pub fn voice_nack_mode(&self) -> VoiceNackMode {
-        VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or(VoiceNackMode::Auto)
+        VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or_default()
     }
 
     pub fn theme_mode(&self) -> ThemeModeKind {
-        ThemeModeKind::from_id(self.inner.read().theme_mode()).unwrap_or(ThemeModeKind::Dark)
+        ThemeModeKind::from_id(self.inner.read().theme_mode()).unwrap_or_default()
     }
 
     pub fn theme_contrast(&self) -> ThemeContrastKind {
-        ThemeContrastKind::from_id(self.inner.read().theme_contrast())
-            .unwrap_or(ThemeContrastKind::Standard)
+        ThemeContrastKind::from_id(self.inner.read().theme_contrast()).unwrap_or_default()
     }
 
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `VoiceCodecParam` the voice protocol layer wants.
+    ///
+    /// Takes a single lock snapshot so codec and parameter are always
+    /// consistent even if a setter fires between two separate reads.
     pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
-        match self.voice_codec() {
+        let inner = self.inner.read();
+        match VoiceCodecKind::from_id(inner.voice_codec()).unwrap_or_default() {
             VoiceCodecKind::Opus => VoiceCodecParam {
                 codec: VoiceCodec::Opus,
-                param: self.voice_opus_bitrate_kbps(),
+                param: inner.voice_opus_bitrate_kbps(),
             },
             VoiceCodecKind::Codec2 => VoiceCodecParam {
                 codec: VoiceCodec::Codec2,
-                param: self.voice_codec2_mode(),
+                param: inner.voice_codec2_mode(),
             },
             VoiceCodecKind::AmrNb => VoiceCodecParam {
                 codec: VoiceCodec::AmrNb,
-                param: self.voice_amrnb_mode(),
+                param: inner.voice_amrnb_mode(),
             },
         }
     }
@@ -1013,11 +1116,11 @@ impl SettingsApi {
     /// Reset every field at once.
     pub fn reset_all(&self) -> SettingsResult<()> {
         *self.inner.write() = AppSettings::default();
-        self.persist()?;
+        let result = self.persist();
         for k in SettingKey::all() {
             self.notify(*k);
         }
-        Ok(())
+        result
     }
 
     // -----------------------------------------------------------------
@@ -1320,9 +1423,9 @@ impl SettingsApi {
     // -----------------------------------------------------------------
 
     fn persist_and_notify(&self, key: SettingKey) -> SettingsResult<()> {
-        self.persist()?;
+        let result = self.persist();
         self.notify(key);
-        Ok(())
+        result
     }
 
     fn persist(&self) -> SettingsResult<()> {
@@ -1338,17 +1441,42 @@ impl SettingsApi {
         }
         let body = toml::to_string_pretty(&*self.inner.read())
             .map_err(|e| SettingsError::Io(std::io::Error::other(e)))?;
-        // Write to a sibling temp file then atomically rename it over the
-        // target. A crash, power loss, or ENOSPC mid-write then leaves either
-        // the old complete file or the new complete file, never a truncated
-        // one that parses back as empty and silently resets every setting.
-        // The temp file is in the same directory so the rename is a
-        // same-filesystem atomic replace, and the persist lock means only one
-        // writer ever touches it at a time.
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        // In degraded mode the broken config is still on disk. Rename it to a
+        // dated backup before writing so it is never silently clobbered. If the
+        // rename itself fails (e.g. EACCES on a read-only filesystem) return an
+        // error without touching anything: the broken file is safer than nothing.
+        if self.degraded.load(std::sync::atomic::Ordering::Relaxed) && path.exists() {
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let backup = path.with_extension(format!("toml.broken-{ts}"));
+            std::fs::rename(&path, &backup)?;
+        }
+        // PID-suffixed tmp name: if two processes (e.g. a running GUI and a
+        // CLI invocation) both write config they won't stomp on the same temp
+        // file. The persist lock already serialises concurrent writers within
+        // one process.
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let result: SettingsResult<()> = (|| {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            // Flush kernel write buffers to the device before renaming. A
+            // kernel crash between write and rename without this could leave
+            // the renamed file empty on remount. We deliberately omit a
+            // parent-directory fsync: it would block on slow media and is
+            // only needed for directory-entry durability on power loss, which
+            // is an acceptable trade-off for a settings file.
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        } else {
+            self.degraded
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        result
     }
 
     fn notify(&self, key: SettingKey) {
@@ -1360,11 +1488,14 @@ impl SettingsApi {
 }
 
 fn parse_u32(key: SettingKey, value: &str) -> SettingsResult<u32> {
-    value.parse::<u32>().map_err(|e| SettingsError::Invalid {
-        key: key.id(),
-        value: value.to_string(),
-        reason: e.to_string(),
-    })
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| SettingsError::Invalid {
+            key: key.id(),
+            value: value.to_string(),
+            reason: e.to_string(),
+        })
 }
 
 fn parse_bool(key: SettingKey, value: &str) -> SettingsResult<bool> {
@@ -1431,6 +1562,103 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    #[test]
+    fn missing_file_is_not_degraded() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-missing.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let api = SettingsApi::open_at(Some(path));
+        assert!(
+            !api.is_degraded(),
+            "missing file must be Clean not Degraded"
+        );
+    }
+
+    #[test]
+    fn garbage_file_is_degraded_then_cleared_on_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-garbage.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"this is not valid toml }{").unwrap();
+        let api = SettingsApi::open_at(Some(path.clone()));
+        assert!(api.is_degraded(), "unreadable file must be Degraded");
+        // A setter should back up the broken file and write a valid one.
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        assert!(
+            !api.is_degraded(),
+            "degraded flag must clear after successful persist"
+        );
+        // The new config file must be valid.
+        let api2 = SettingsApi::open_at(Some(path.clone()));
+        assert!(!api2.is_degraded());
+        assert_eq!(api2.voice_codec(), VoiceCodecKind::Opus);
+        // A .broken-* backup must exist alongside the new file.
+        let dir = path.parent().unwrap();
+        let has_backup = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                name.to_string_lossy().contains(".broken-")
+            });
+        assert!(has_backup, "a .broken-<ts> backup file must exist");
+        // Cleanup: remove both the config and any backup.
+        let _ = std::fs::remove_file(&path);
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            if e.file_name().to_string_lossy().contains(".broken-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    #[test]
+    fn reload_clears_degraded_after_manual_fix() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-fix.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not valid toml").unwrap();
+        let api = SettingsApi::open_at(Some(path.clone()));
+        assert!(api.is_degraded());
+        // Simulate user manually fixing the file.
+        std::fs::write(&path, b"").unwrap(); // empty = valid defaults TOML
+        api.reload();
+        assert!(
+            !api.is_degraded(),
+            "reload with valid file must clear degraded"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn persist_leaves_no_tmp_sibling() {
+        let config = std::env::temp_dir().join(format!(
+            "voicetastic-atomic-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config);
+        let api = SettingsApi::open_at(Some(config.clone()));
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        let dir = config.parent().unwrap();
+        let stem = config.file_stem().unwrap().to_string_lossy();
+        let has_tmp = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with(stem.as_ref()) && s.contains(".tmp")
+            });
+        assert!(
+            !has_tmp,
+            "no .tmp sibling should remain after a successful persist"
+        );
+        let _ = std::fs::remove_file(&config);
+    }
+
     struct Counter(std::sync::atomic::AtomicUsize);
     impl SettingsListener for Counter {
         fn on_change(&self, _key: SettingKey) {
@@ -1446,6 +1674,45 @@ mod tests {
         api.set_voice_max_secs(20).unwrap();
         api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
         assert_eq!(c.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Listeners must fire even when persist() returns an error (e.g. when the
+    /// settings directory is read-only). Memory is already updated before persist
+    /// is called; skipping notify would leave live state desynced from memory.
+    #[test]
+    #[cfg(unix)]
+    fn listener_fires_even_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("voicetastic-notify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let api = SettingsApi::open_at(Some(path));
+        // Initial write to establish the file.
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        // Make the directory read-only so future writes fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let c = Arc::new(Counter(Default::default()));
+        api.subscribe(c.clone());
+        let result = api.set_voice_codec(VoiceCodecKind::AmrNb);
+        // Restore permissions before any assertion so cleanup always runs.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            result.is_err(),
+            "persist should have failed on read-only dir"
+        );
+        assert_eq!(
+            c.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "listener must fire even when persist errors"
+        );
+        assert_eq!(
+            api.voice_codec(),
+            VoiceCodecKind::AmrNb,
+            "memory must be updated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1480,5 +1747,41 @@ mod tests {
             .set_str(SettingKey::ThemeContrast, "extra-high")
             .expect_err("garbage contrast must be rejected");
         assert!(matches!(err, SettingsError::Invalid { .. }));
+    }
+
+    /// Default impls for the six enum types must match the corresponding
+    /// DEFAULT_* constants so fallback values can't drift from constants.
+    #[test]
+    fn fallback_defaults_match_data_constants() {
+        use super::super::data::{
+            DEFAULT_OPUS_BANDWIDTH, DEFAULT_THEME_CONTRAST, DEFAULT_THEME_MODE,
+            DEFAULT_VOICE_CODEC, DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_NACK_MODE,
+        };
+        assert_eq!(VoiceCodecKind::default().id(), DEFAULT_VOICE_CODEC);
+        assert_eq!(OpusBandwidthKind::default().id(), DEFAULT_OPUS_BANDWIDTH);
+        assert_eq!(VoiceFecMode::default().id(), DEFAULT_VOICE_FEC_MODE);
+        assert_eq!(VoiceNackMode::default().id(), DEFAULT_VOICE_NACK_MODE);
+        assert_eq!(ThemeModeKind::default().id(), DEFAULT_THEME_MODE);
+        assert_eq!(ThemeContrastKind::default().id(), DEFAULT_THEME_CONTRAST);
+    }
+
+    /// voice_codec_for_protocol must return codec and param from the same
+    /// consistent snapshot (single lock acquisition).
+    #[test]
+    fn voice_codec_for_protocol_returns_consistent_pair() {
+        let api = SettingsApi::in_memory();
+        let pair = api.voice_codec_for_protocol();
+        assert_eq!(pair.codec, VoiceCodec::AmrNb);
+        assert_eq!(pair.param, api.voice_amrnb_mode());
+    }
+
+    /// parse_u32 (via set_str) must accept whitespace-padded values just
+    /// like parse_bool does.
+    #[test]
+    fn set_str_trims_whitespace_for_u32() {
+        let api = SettingsApi::in_memory();
+        api.set_str(SettingKey::VoiceMaxDurationSecs, "  30  ")
+            .expect("set_str must accept padded integer");
+        assert_eq!(api.voice_max_secs(), 30);
     }
 }

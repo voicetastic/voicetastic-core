@@ -105,10 +105,10 @@ impl SerialConnection {
     /// The caller sees [`Error::WriteTimeout`] and should retry or reconnect.
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_PAYLOAD {
-            return Err(Error::Other(format!(
-                "payload too large: {} > {MAX_PAYLOAD}",
-                bytes.len()
-            )));
+            return Err(Error::PayloadTooLarge {
+                len: bytes.len(),
+                max: MAX_PAYLOAD,
+            });
         }
         let len = bytes.len() as u16;
         let header = [START1, START2, (len >> 8) as u8, (len & 0xFF) as u8];
@@ -155,19 +155,22 @@ impl SerialConnection {
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    result = tokio::time::timeout(
-                        Duration::from_secs(60),
-                        read_frame(&mut reader),
-                    ) => {
+                    // No outer timeout: every byte inside read_frame is
+                    // already bounded by FRAME_BYTE_TIMEOUT (10 s). An
+                    // outer 60 s wrapper can cancel read_frame mid-frame,
+                    // losing the bytes already read and desynchronising
+                    // the parser. The silence probe in connect_with_transport
+                    // detects a dead link at ~180 s without this wrapper.
+                    result = read_frame(&mut reader) => {
                         match result {
-                            Ok(Ok(Some(payload))) => {
+                            Ok(Some(payload)) => {
                                 read_errors = 0;
                                 if tx.send(payload).await.is_err() {
                                     break;
                                 }
                             }
-                            Ok(Ok(None)) => break, // EOF
-                            Ok(Err(e)) => {
+                            Ok(None) => break, // EOF
+                            Err(e) => {
                                 read_errors += 1;
                                 if read_errors >= 5 {
                                     warn!(count = read_errors, ?e, "serial read: too many consecutive errors, giving up");
@@ -185,16 +188,6 @@ impl SerialConnection {
                                     _ = shutdown_rx.changed() => break,
                                     _ = sleep(backoff) => {}
                                 }
-                            }
-                            Err(_elapsed) => {
-                                // No complete frame arrived within 60 s.
-                                // The firmware should never go this long
-                                // without sending *something* (QueueStatus,
-                                // NodeInfo, …). Re-arm the frame scanner
-                                // without counting toward the retry limit
-                                // so the read task keeps trying instead of
-                                // parking in `read_byte` forever.
-                                debug!("serial read frame: 60 s timeout, rescanning");
                             }
                         }
                     }
@@ -446,6 +439,33 @@ mod tests {
         let mut buf: &[u8] = &frame(&payload);
         let frames = read_all(&mut buf).await;
         assert_eq!(frames, vec![payload]);
+    }
+
+    // Test that read_frame returns a full frame even when the bytes arrive
+    // in two separate writes (header then payload), which simulates the
+    // per-byte-bounded reads inside read_frame on a slow link.
+    #[tokio::test]
+    async fn read_frame_spans_two_writes() {
+        use tokio::io::AsyncWriteExt as _;
+        let payload = b"hello split";
+        let len = payload.len() as u16;
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // Write header first, then payload in a separate task so the
+        // reader can make progress between the two writes.
+        let jh = tokio::spawn(async move {
+            writer
+                .write_all(&[START1, START2, (len >> 8) as u8, (len & 0xff) as u8])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            writer.write_all(payload).await.unwrap();
+        });
+
+        let frame = read_frame(&mut reader).await.unwrap();
+        jh.await.unwrap();
+        assert_eq!(frame, Some(payload.to_vec()));
     }
 
     #[test]

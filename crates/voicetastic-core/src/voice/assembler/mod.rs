@@ -21,7 +21,8 @@ use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use super::consts::{
-    MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MIN_CHUNK_SIZE,
+    MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_TOTAL_SHARDS,
+    MIN_CHUNK_SIZE,
 };
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
@@ -72,6 +73,10 @@ pub struct VoiceAssembler {
 
 impl VoiceAssembler {
     pub fn new(cfg: AssemblerConfig) -> Self {
+        if let Err(e) = cfg.validate() {
+            warn!("AssemblerConfig has invalid values ({e}); clamping to safe defaults");
+        }
+        let cfg = cfg.clamped();
         Self {
             inner: Mutex::new(AssemblerInner {
                 in_progress: HashMap::new(),
@@ -159,9 +164,11 @@ impl VoiceAssembler {
             return Err(VoiceError::Blacklisted);
         }
 
-        // Apply per-sender / global caps only when this is a *new* message.
+        // Per-sender cap on new messages. Read-only: an invalid frame that is
+        // rejected below must not have changed any state. The global-cap
+        // eviction happens later, at the actual insert point.
         if !inner.in_progress.contains_key(&key) {
-            apply_caps(&mut inner, &key.0, now)?;
+            check_per_sender_cap(&inner, &key.0)?;
         }
 
         // Reject unknown codecs (spec §3.2).
@@ -175,6 +182,16 @@ impl VoiceAssembler {
         {
             return Err(VoiceError::UnsupportedCodec(header.codec));
         }
+        // A header advertising data + parity > 256 can never be FEC-decoded
+        // (the RS coder rejects the combination). Reject every such frame
+        // before we create or touch a slot — this also guards the
+        // parity-growth resize branch below, since it runs on every frame.
+        if header.total_data as usize + header.parity_count as usize > MAX_TOTAL_SHARDS {
+            return Err(VoiceError::TooManyShards {
+                data: header.total_data,
+                parity: header.parity_count,
+            });
+        }
 
         // V3 carries plaintext bodies (Meshtastic channel encryption
         // provides confidentiality on the wire). We hand the body bytes
@@ -186,6 +203,12 @@ impl VoiceAssembler {
         let state = match inner.in_progress.get_mut(&key) {
             Some(s) => s,
             None => {
+                // This frame will definitely create a new entry: every
+                // per-frame validation above has passed. Only now may we
+                // evict the oldest entry to honour the global cap, so a
+                // frame that was going to be rejected never displaces a
+                // legitimate in-progress assembly.
+                evict_for_global_cap(&mut inner, now);
                 let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
                 *cnt = cnt.saturating_add(1);
                 inner
@@ -207,8 +230,7 @@ impl VoiceAssembler {
             state.validation_strikes = state.validation_strikes.saturating_add(1);
             if state.validation_strikes >= MAX_VALIDATION_STRIKES {
                 inner.in_progress.remove(&key);
-                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-                *cnt = cnt.saturating_sub(1);
+                inner.per_sender_dec(&key.0);
                 push_blacklist(&mut inner.blacklist, key, now);
             }
             return Err(err);
@@ -273,8 +295,7 @@ impl VoiceAssembler {
                     channel,
                 });
             };
-            let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-            *cnt = cnt.saturating_sub(1);
+            inner.per_sender_dec(&key.0);
             push_blacklist(&mut inner.blacklist, key.clone(), now);
             let msg = finalize(from, &key, state, true);
             return Ok(AssemblyEvent::Complete(Box::new(msg)));
@@ -363,8 +384,7 @@ impl VoiceAssembler {
                 let Some(state) = inner.in_progress.remove(&key) else {
                     continue;
                 };
-                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-                *cnt = cnt.saturating_sub(1);
+                inner.per_sender_dec(&key.0);
                 push_blacklist(&mut inner.blacklist, key.clone(), now);
                 if cfg.partial_play_on_timeout {
                     finalized_msgs.push(finalize(&key.0, &key, state, false));
@@ -447,14 +467,24 @@ fn prune_blacklist(bl: &mut Vec<(SenderKey, Instant)>, now: Instant, ttl: std::t
     bl.retain(|(_, t)| now.duration_since(*t) < ttl);
 }
 
-/// Enforce per-sender and global in-progress caps. May evict the globally
-/// oldest entry to make room.
-fn apply_caps(inner: &mut AssemblerInner, from: &Arc<str>, now: Instant) -> Result<()> {
+/// Read-only per-sender cap check. Has no side effects, so it is safe to run
+/// before per-frame validation (an invalid frame that is later rejected must
+/// not have evicted or blacklisted anything).
+fn check_per_sender_cap(inner: &AssemblerInner, from: &Arc<str>) -> Result<()> {
     let in_use = *inner.per_sender.get(from).unwrap_or(&0);
     if in_use >= MAX_IN_PROGRESS_PER_SENDER {
         warn!(from = %from, "voice per-sender cap reached; dropping new message");
         return Err(VoiceError::PerSenderCap(from.to_string()));
     }
+    Ok(())
+}
+
+/// Evict the globally oldest in-progress entry if the table is full, to make
+/// room for a new insert. MUST be called only at the point a new entry is
+/// actually about to be inserted (i.e. after all per-frame validation has
+/// passed) — otherwise a frame that is subsequently rejected would have
+/// evicted and blacklisted a legitimate assembly on its behalf.
+fn evict_for_global_cap(inner: &mut AssemblerInner, now: Instant) {
     if inner.in_progress.len() >= MAX_IN_PROGRESS_GLOBAL
         && let Some(victim) = inner
             .in_progress
@@ -464,12 +494,10 @@ fn apply_caps(inner: &mut AssemblerInner, from: &Arc<str>, now: Instant) -> Resu
     {
         debug!(victim_from = %victim.0, victim_id = victim.1, "voice global cap; evicting");
         if inner.in_progress.remove(&victim).is_some() {
-            let cnt = inner.per_sender.entry(Arc::clone(&victim.0)).or_default();
-            *cnt = cnt.saturating_sub(1);
+            inner.per_sender_dec(&victim.0);
         }
         push_blacklist(&mut inner.blacklist, victim, now);
     }
-    Ok(())
 }
 
 /// Initial `chunk_size` to seed a new `AssemblyState` with, derived from
@@ -533,6 +561,43 @@ fn validate_template(state: &AssemblyState, header: &ChunkHeader) -> Result<()> 
     Ok(())
 }
 
+/// Pin or validate `chunk_size` against `len`.
+///
+/// When `chunk_size` is already known, `len` must match exactly (wrong-size
+/// retransmits are rejected). When it is not yet known, `len` becomes the new
+/// `chunk_size` after a range check.
+///
+/// After pinning, if the previously-stored final DATA shard is longer than the
+/// now-established `chunk_size`, it is evicted: FEC would reconstruct it at the
+/// correct length, but the stored oversized bytes would corrupt the decoded tail.
+/// The shard will be re-requested via NACK.
+fn pin_chunk_size(state: &mut AssemblyState, len: usize) -> Result<()> {
+    match state.chunk_size {
+        Some(expected) if len != expected => {
+            return Err(VoiceError::BodyLenMismatch { got: len, expected });
+        }
+        None => {
+            if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&len) {
+                return Err(VoiceError::ChunkTooLarge {
+                    got: len,
+                    max: MAX_BODY_SIZE,
+                });
+            }
+            state.chunk_size = Some(len);
+            let last_idx = state.header_template.total_data as usize - 1;
+            if let Some(stored) = &state.data_shards[last_idx]
+                && stored.len() > len
+            {
+                state.data_shards[last_idx] = None;
+                state.received_data = state.received_data.saturating_sub(1);
+                state.last_data_len = None;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Ingest a DATA frame's body into `state`. Returns `Some(event)` for
 /// early-return cases (duplicate); `None` means the caller should continue
 /// the pipeline (FEC + completion check).
@@ -552,26 +617,7 @@ fn ingest_data(
     }
 
     if !is_last {
-        // Full (non-final) chunks must equal chunk_size, and they fix it
-        // if not yet known.
-        match state.chunk_size {
-            Some(expected) if plain_body.len() != expected => {
-                return Err(VoiceError::BodyLenMismatch {
-                    got: plain_body.len(),
-                    expected,
-                });
-            }
-            None => {
-                if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
-                    return Err(VoiceError::ChunkTooLarge {
-                        got: plain_body.len(),
-                        max: MAX_BODY_SIZE,
-                    });
-                }
-                state.chunk_size = Some(plain_body.len());
-            }
-            _ => {}
-        }
+        pin_chunk_size(state, plain_body.len())?;
     } else {
         // Final DATA chunk may be shorter than chunk_size, but never longer.
         if let Some(expected) = state.chunk_size
@@ -600,24 +646,7 @@ fn ingest_parity(
     if state.parity_shards[idx].is_some() {
         return Ok(Some(AssemblyEvent::Duplicate));
     }
-    match state.chunk_size {
-        Some(expected) if plain_body.len() != expected => {
-            return Err(VoiceError::BodyLenMismatch {
-                got: plain_body.len(),
-                expected,
-            });
-        }
-        None => {
-            if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
-                return Err(VoiceError::ChunkTooLarge {
-                    got: plain_body.len(),
-                    max: MAX_BODY_SIZE,
-                });
-            }
-            state.chunk_size = Some(plain_body.len());
-        }
-        _ => {}
-    }
+    pin_chunk_size(state, plain_body.len())?;
     state.parity_shards[idx] = Some(plain_body);
     state.received_parity = state.received_parity.saturating_add(1);
     Ok(None)
@@ -651,6 +680,39 @@ mod tests {
     /// `VoiceDestination::Broadcast` directly.
     fn unicast_dest() -> VoiceDestination {
         VoiceDestination::Node(NodeId::from_u32(0xDEAD_BEEF))
+    }
+
+    #[test]
+    fn rejects_frame_with_data_plus_parity_over_rs_limit() {
+        // A header advertising 200 + 100 = 300 shards can never be
+        // FEC-decoded; the frame must be rejected without creating a slot.
+        let header = ChunkHeader {
+            packet_type: PacketType::Data,
+            last_in_stream: false,
+            message_id: 0xCAFEBABE,
+            codec: VoiceCodec::Opus,
+            codec_param: 16,
+            stream_seq: 0,
+            chunk_index: 0,
+            total_data: 200,
+            parity_count: 100,
+        };
+        let mut frame = header.serialize().to_vec();
+        frame.extend_from_slice(&[0u8; 64]);
+
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+        let res = asm.accept("!cc", unicast_dest(), 0, &frame);
+        assert!(
+            matches!(
+                res,
+                AssemblyEvent::Rejected(VoiceError::TooManyShards {
+                    data: 200,
+                    parity: 100
+                })
+            ),
+            "got {res:?}"
+        );
+        assert!(asm.inner.lock().in_progress.is_empty());
     }
 
     #[test]
@@ -983,5 +1045,213 @@ mod tests {
                 "round {round}: expected 1 NACK with backoff_base=2"
             );
         }
+    }
+
+    #[test]
+    fn per_sender_entry_removed_on_completion() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+        let mut completed = false;
+        for f in &enc.frames {
+            if let AssemblyEvent::Complete(_) = asm.accept("!cc", unicast_dest(), 0, f) {
+                completed = true;
+            }
+        }
+        assert!(completed, "message should complete");
+        assert!(
+            asm.inner.lock().per_sender.is_empty(),
+            "per_sender must drop the sender entry at zero after completion"
+        );
+    }
+
+    #[test]
+    fn per_sender_entry_removed_on_timeout_finalize() {
+        let audio: Vec<u8> = (0..(64 * 6)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            message_timeout: Duration::from_millis(1),
+            partial_play_on_timeout: true,
+            ..Default::default()
+        });
+        // Only deliver the first chunk, then let the message time out.
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.started_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        let _ = asm.tick();
+        assert!(
+            asm.inner.lock().in_progress.is_empty(),
+            "timed-out message should be removed"
+        );
+        assert!(
+            asm.inner.lock().per_sender.is_empty(),
+            "per_sender must drop the sender entry at zero after timeout finalize"
+        );
+    }
+
+    #[test]
+    fn invalid_frame_does_not_evict_at_global_cap() {
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+        // Fill the global table to capacity with valid first frames from
+        // distinct senders (16 senders × 4 messages = 64 = the per-sender
+        // cap × global cap).
+        let enc = build_message(
+            &(0..(64 * 3)).map(|i| (i & 0xff) as u8).collect::<Vec<_>>(),
+            &cfg(0),
+        )
+        .unwrap();
+        // Parse the template frame once (valid MAC) to read its fields and body.
+        // Each fill frame is then built from a fresh ChunkHeader so the new MAC
+        // is computed over the correct bytes; patching bytes [2..6] after
+        // serialization would invalidate the trailing MAC tag.
+        let (tmpl, tmpl_body) = ChunkHeader::parse(&enc.frames[0]).unwrap();
+        let body_bytes: Vec<u8> = tmpl_body.to_vec();
+        let mut count = 0;
+        'fill: for s in 0..16u32 {
+            let from = format!("!{s:08x}");
+            for m in 0..MAX_IN_PROGRESS_PER_SENDER {
+                // Distinct non-zero message_id per (sender, slot).
+                let h = ChunkHeader {
+                    message_id: 0x0100_0000 | s << 8 | m as u32,
+                    ..tmpl
+                };
+                let mut rebuilt = h.serialize().to_vec();
+                rebuilt.extend_from_slice(&body_bytes);
+                let _ = asm.accept(&from, unicast_dest(), 0, &rebuilt);
+                count += 1;
+                if count >= MAX_IN_PROGRESS_GLOBAL {
+                    break 'fill;
+                }
+            }
+        }
+        let before = asm.inner.lock().in_progress.len();
+        assert_eq!(before, MAX_IN_PROGRESS_GLOBAL, "table should be full");
+
+        // A structurally valid header from a new sender whose body is too
+        // short to derive a chunk_size is rejected by derive_initial_chunk_size.
+        let bad_header = ChunkHeader {
+            packet_type: PacketType::Data,
+            last_in_stream: false,
+            message_id: 0xFEED_F00D,
+            codec: VoiceCodec::Opus,
+            codec_param: 16,
+            stream_seq: 0,
+            chunk_index: 0,
+            total_data: 3,
+            parity_count: 0,
+        };
+        let mut bad = bad_header.serialize().to_vec();
+        bad.extend_from_slice(&[0u8; 4]); // below MIN_CHUNK_SIZE
+        let res = asm.accept("!newsender", unicast_dest(), 0, &bad);
+        assert!(matches!(res, AssemblyEvent::Rejected(_)), "got {res:?}");
+        assert_eq!(
+            asm.inner.lock().in_progress.len(),
+            MAX_IN_PROGRESS_GLOBAL,
+            "a rejected frame must not have evicted any in-progress assembly"
+        );
+        assert!(
+            asm.inner.lock().blacklist.is_empty(),
+            "a rejected frame must not have blacklisted any assembly"
+        );
+    }
+
+    /// VoiceAssembler::new must not panic when the config violates invariants;
+    /// it clamps the config to safe values instead.
+    #[test]
+    fn new_clamps_invalid_config() {
+        let cfg = AssemblerConfig {
+            message_timeout: Duration::from_millis(1),
+            completion_memory: Duration::ZERO,
+            dead_sender_timeout: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let asm = VoiceAssembler::new(cfg);
+        let c = asm.cfg.lock();
+        assert!(
+            c.dead_sender_timeout <= c.message_timeout,
+            "dead_sender_timeout must be clamped to <= message_timeout"
+        );
+        assert!(
+            c.completion_memory >= c.message_timeout,
+            "completion_memory must be clamped to >= message_timeout"
+        );
+    }
+
+    /// A final DATA shard accepted before chunk_size is pinned may be longer
+    /// than the real chunk_size. When a non-final chunk later pins chunk_size,
+    /// the oversized final shard must be evicted so FEC cannot smuggle garbage
+    /// bytes into the decoded audio tail. The real final shard re-arrives via
+    /// NACK and the message completes with the correct payload.
+    #[test]
+    fn pin_evicts_oversized_stored_final_shard() {
+        // 2 full 64-byte chunks + 20-byte tail => 3 data shards.
+        let audio: Vec<u8> = (0..(64 * 2 + 20)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        // enc.frames: [chunk0=64B, chunk1=64B, chunk2=20B]
+
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+        // Build a forged final frame: correct header, body inflated to 100B.
+        let (hdr2, _) = ChunkHeader::parse(&enc.frames[2]).unwrap();
+        let mut forged = hdr2.serialize().to_vec();
+        forged.extend_from_slice(&[0xFFu8; 100]);
+
+        // Deliver the forged final chunk first (chunk_size not yet pinned).
+        let res = asm.accept("!cc", unicast_dest(), 0, &forged);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        {
+            let inner = asm.inner.lock();
+            let state = inner.in_progress.values().next().unwrap();
+            assert!(
+                state.data_shards[2].is_some(),
+                "oversized final shard must be stored"
+            );
+            assert_eq!(state.received_data, 1);
+            assert!(state.chunk_size.is_none(), "chunk_size not yet pinned");
+        }
+
+        // Deliver chunk0 (64B, non-final): pins chunk_size=64, evicts oversized shard.
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        {
+            let inner = asm.inner.lock();
+            let state = inner.in_progress.values().next().unwrap();
+            assert_eq!(
+                state.chunk_size,
+                Some(64),
+                "chunk_size must be pinned after non-final chunk"
+            );
+            assert!(
+                state.data_shards[2].is_none(),
+                "oversized final shard must be evicted"
+            );
+            assert_eq!(
+                state.received_data, 1,
+                "received_data decremented after eviction"
+            );
+            assert!(
+                state.last_data_len.is_none(),
+                "last_data_len cleared after eviction"
+            );
+        }
+
+        // Deliver the remaining real chunks; message completes with the correct audio.
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[1]);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[2]);
+        let m = match res {
+            AssemblyEvent::Complete(m) => m,
+            other => panic!("expected Complete, got {other:?}"),
+        };
+        assert!(m.is_complete);
+        assert_eq!(
+            m.audio, audio,
+            "audio must round-trip correctly after shard eviction"
+        );
     }
 }

@@ -27,18 +27,15 @@ pub const MAX_CHUNKS_PER_MESSAGE: usize = 255;
 pub const MAX_MESSAGE_BYTES: usize = MAX_CHUNKS_PER_MESSAGE * MAX_BODY_SIZE;
 /// Maximum parity chunks per message (Reed-Solomon coder limit).
 pub const MAX_PARITY_PER_MESSAGE: usize = 128;
+/// Reed-Solomon GF(2^8) hard limit on `data + parity` shards per message.
+/// `MAX_CHUNKS_PER_MESSAGE` and `MAX_PARITY_PER_MESSAGE` bound each side
+/// individually, but the coder also rejects any combination whose sum
+/// exceeds the field order, so parity must be clamped against this too.
+pub const MAX_TOTAL_SHARDS: usize = 256;
 /// Global cap on concurrent in-progress reassemblies.
 pub const MAX_IN_PROGRESS_GLOBAL: usize = 64;
 /// Per-sender cap on concurrent in-progress reassemblies.
 pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
-/// Default for [`crate::voice::AssemblerConfig::completion_memory`]:
-/// how long the receiver remembers that a given `(from, message_id)`
-/// already completed, so late chunks still rattling out of the sender's
-/// firmware queue (or arriving over a long retransmit tail) don't
-/// resurrect a phantom partial reassembly. Set comfortably above the
-/// realistic worst-case sender airtime — Long Slow on a near-MTU clip
-/// can take 2–3 minutes — so the blacklist outlives the actual TX.
-pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 /// Recently-completed blacklist max entries.
 pub const BLACKLIST_MAX: usize = 100;
 /// **Experimental (flood-control).** Heuristic safety valve, not a

@@ -79,6 +79,11 @@ pub struct InboundCtx<'a> {
     /// The driver's current node roster — used to look up the sender's
     /// public key when attempting PKC decrypt.
     pub nodes: &'a HashMap<u32, NodeInfo>,
+    /// Ring buffer of recently host-decrypted PKC `(from, packet_id)` pairs.
+    /// Passed in from the driver so the decoder can check and update it while
+    /// `ProtocolState` is already locked (the two mutexes are independent).
+    /// `None` in tests and in the wasm build that has no PKC.
+    pub pkc_seen: Option<&'a parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>>>,
 }
 
 /// A decoded inbound effect for the driver to apply to its channels.
@@ -419,10 +424,25 @@ fn try_pkc_decrypt(
     let mut peer_public = [0u8; 32];
     peer_public.copy_from_slice(&peer_user.public_key);
 
+    // Dedup: firmware flood-retransmits may re-deliver the same ciphertext
+    // multiple times. Check before the (cheap but non-free) decrypt so
+    // replays short-circuit immediately.
+    let mut seen_guard = ctx.pkc_seen.map(|s| s.lock());
+    if seen_guard.as_ref().is_some_and(|g| g.contains(&(from, id))) {
+        tracing::debug!(from, id, "drop PKC DM: replay dedup");
+        return None;
+    }
+
     let plaintext = pkc::decrypt(our_private, &peer_public, from, id, ciphertext)?;
     match Data::decode(plaintext.as_slice()) {
         Ok(d) => {
             tracing::debug!(from, id, portnum = d.portnum, "host-decrypted PKC DM",);
+            if let Some(ref mut g) = seen_guard {
+                g.push_front((from, id));
+                if g.len() > 64 {
+                    g.pop_back();
+                }
+            }
             Some(d)
         }
         Err(e) => {
@@ -744,6 +764,7 @@ mod tests {
             my_node_num,
             our_private_key: None,
             nodes,
+            pkc_seen: None,
         }
     }
 
@@ -961,6 +982,7 @@ mod tests {
             my_node_num: Some(our_node_num),
             our_private_key: Some(&our_private),
             nodes: &nodes,
+            pkc_seen: None,
         };
         let ev = decode_inbound(&bytes, &cx).unwrap();
 
@@ -975,6 +997,68 @@ mod tests {
         let text = text.expect("expected IncomingText after host-side PKC decrypt");
         assert_eq!(text.text, "test");
         assert_eq!(text.channel, 0);
+    }
+
+    /// A PKC DM whose (from, id) pair is already in the seen-set is dropped
+    /// as a replay without re-decrypting. Firmware flood-routing can deliver
+    /// the same ciphertext multiple times; only the first should surface.
+    #[test]
+    fn pkc_replay_is_deduplicated() {
+        // Reuse the same packet bytes from `host_decrypts_pkc_dm_to_us`.
+        let our_node_num = 0xfeed_face_u32;
+        let sender = 0x0929_u32;
+        let packet_id = 0x13b2_d662_u32;
+        let our_private = {
+            let mut k = [0u8; 32];
+            k.copy_from_slice(
+                &hex::decode("a00330633e63522f8a4d81ec6d9d1e6617f6c8ffd3a4c698229537d44e522277")
+                    .unwrap(),
+            );
+            k
+        };
+        let peer_public =
+            hex::decode("db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457")
+                .unwrap();
+        let ciphertext = hex::decode("40df24abfcc30a17a3d9046726099e796a1c036a792b").unwrap();
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            sender,
+            NodeInfo {
+                num: sender,
+                user: Some(User {
+                    public_key: peer_public,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let pkt = MeshPacket {
+            from: sender,
+            to: our_node_num,
+            id: packet_id,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Encrypted(ciphertext)),
+            ..Default::default()
+        };
+        let bytes = encode(from_radio::PayloadVariant::Packet(pkt));
+
+        // Pre-populate the seen set with this (from, id) pair.
+        let seen: parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>> =
+            parking_lot::Mutex::new(std::collections::VecDeque::new());
+        seen.lock().push_front((sender, packet_id));
+
+        let cx = InboundCtx {
+            my_node_num: Some(our_node_num),
+            our_private_key: Some(&our_private),
+            nodes: &nodes,
+            pkc_seen: Some(&seen),
+        };
+        let ev = decode_inbound(&bytes, &cx).unwrap();
+        assert!(
+            ev.is_empty(),
+            "replay PKC DM must be dropped silently; got {} events",
+            ev.len()
+        );
     }
 
     /// Encrypted packet not addressed to us → dropped without an attempt.

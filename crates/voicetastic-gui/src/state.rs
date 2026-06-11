@@ -83,6 +83,11 @@ pub struct VoicePayload {
     /// mode index). Required to drive the right decoder on playback.
     pub codec_param: u8,
     pub bytes: Vec<u8>,
+    /// Byte ranges in `bytes` that are missing-chunk padding (from
+    /// [`voicetastic_core::voice::VoiceMessage::gaps`]). Empty for complete
+    /// messages and local recordings. Passed to the gap-aware decoder so
+    /// partial clips play silence/PLC over the gaps instead of garbage.
+    pub gaps: Vec<std::ops::Range<usize>>,
     #[allow(dead_code)] // displayed only in tooltips today; surface for future
     pub duration_ms: u32,
 }
