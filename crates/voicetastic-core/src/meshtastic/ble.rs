@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+use crate::transport::Transport as _;
 
 /// Meshtastic BLE service UUID.
 pub const SERVICE_UUID: Uuid = Uuid::from_u128(0x6ba1b218_15a8_461f_9fa8_5dcae273eafd);
@@ -423,6 +424,11 @@ impl Connection {
     /// down. Pick the `WriteType` from the characteristic's declared
     /// properties so we match whichever flag the firmware exposes.
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
+        let max = self.max_tx_payload();
+        if bytes.len() > max {
+            warn!(len = bytes.len(), max, "BLE write_to_radio: payload exceeds ATT MTU limit");
+            return Err(Error::PayloadTooLarge { len: bytes.len(), max });
+        }
         let _g = self.write_lock.lock().await;
         let kind = if self
             .to_radio

@@ -29,6 +29,9 @@ pub enum Error {
     #[error("BLE write timed out")]
     WriteTimeout,
 
+    #[error("payload too large: {len} bytes exceeds transport limit of {max} bytes")]
+    PayloadTooLarge { len: usize, max: usize },
+
     #[error("voice protocol error: {0}")]
     Voice(#[from] crate::voice::VoiceError),
 
