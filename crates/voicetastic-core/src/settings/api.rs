@@ -759,27 +759,48 @@ mod policy_tests {
 // Settings API
 // ---------------------------------------------------------------------------
 
+/// Whether loading the settings file succeeded or produced degraded defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadStatus {
+    /// File was missing (first run) or parsed successfully.
+    Clean,
+    /// File existed but could not be read (e.g. EACCES) or failed to parse.
+    /// Defaults are in use; the broken file will be backed up before the next
+    /// successful persist so it is never silently overwritten.
+    Degraded,
+}
+
 /// Read and parse a settings file from disk.
 ///
-/// A missing or unreadable file is the normal first-run / headless case and
-/// returns defaults silently. A file that exists but fails to parse (e.g. a
-/// hand-edited type mismatch) also falls back to defaults, but logs a warning
-/// first so the reset is diagnosable instead of silently dropping every
-/// setting. The on-disk file is left untouched, so fixing the typo restores
-/// the values on the next load.
-fn read_settings_at(path: &std::path::Path) -> AppSettings {
-    let Ok(s) = std::fs::read_to_string(path) else {
-        return AppSettings::default();
-    };
-    match toml::from_str(&s) {
-        Ok(data) => data,
+/// Returns defaults + `LoadStatus::Clean` when the file is missing (first run)
+/// or on a successful parse. Returns defaults + `LoadStatus::Degraded` when
+/// the file exists but cannot be read (e.g. EACCES) or fails to parse. In
+/// the degraded case a warning is logged; the on-disk file is left intact so
+/// the user can fix it manually.
+fn read_settings_at(path: &std::path::Path) -> (AppSettings, LoadStatus) {
+    let s = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (AppSettings::default(), LoadStatus::Clean);
+        }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 path = %path.display(),
-                "config.toml failed to parse; using defaults until it is fixed",
+                "config.toml could not be read; using defaults",
             );
-            AppSettings::default()
+            return (AppSettings::default(), LoadStatus::Degraded);
+        }
+    };
+    match toml::from_str(&s) {
+        Ok(data) => (data, LoadStatus::Clean),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "config.toml failed to parse; using defaults until fixed or replaced",
+            );
+            (AppSettings::default(), LoadStatus::Degraded)
         }
     }
 }
@@ -795,6 +816,10 @@ pub struct SettingsApi {
     /// via `Arc` across the GUI and runtime) can't interleave writes into a
     /// half-formed file.
     persist_lock: Mutex<()>,
+    /// Set when the on-disk config could not be read or parsed. In degraded
+    /// mode `persist()` renames the broken file to `config.toml.broken-<ts>`
+    /// before writing so the user can recover their settings manually.
+    degraded: std::sync::atomic::AtomicBool,
 }
 
 impl SettingsApi {
@@ -807,15 +832,16 @@ impl SettingsApi {
 
     /// Open at an explicit path. Pass `None` to run in-memory.
     pub fn open_at(path: Option<PathBuf>) -> Arc<Self> {
-        let data = match path.as_ref() {
+        let (data, status) = match path.as_ref() {
             Some(p) => read_settings_at(p),
-            None => AppSettings::default(),
+            None => (AppSettings::default(), LoadStatus::Clean),
         };
         Arc::new(Self {
             inner: RwLock::new(data),
             path: RwLock::new(path),
             listeners: Mutex::new(Vec::new()),
             persist_lock: Mutex::new(()),
+            degraded: std::sync::atomic::AtomicBool::new(status == LoadStatus::Degraded),
         })
     }
 
@@ -831,17 +857,28 @@ impl SettingsApi {
         *self.path.write() = path;
     }
 
-    /// Reload from disk, discarding any in-memory edits.
+    /// Reload from disk, discarding any in-memory edits. Clears the degraded
+    /// flag if the file now parses successfully.
     pub fn reload(&self) {
         let p = self.path.read().clone();
-        let data = match p {
+        let (data, status) = match p {
             Some(p) => read_settings_at(&p),
-            None => AppSettings::default(),
+            None => (AppSettings::default(), LoadStatus::Clean),
         };
+        self.degraded
+            .store(status == LoadStatus::Degraded, std::sync::atomic::Ordering::Relaxed);
         *self.inner.write() = data;
         for k in SettingKey::all() {
             self.notify(*k);
         }
+    }
+
+    /// Returns `true` when the settings file existed but could not be read or
+    /// parsed at last open/reload. In degraded mode the first successful
+    /// [`persist`] will rename the broken file to `config.toml.broken-<ts>`
+    /// before writing so it can be recovered manually.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Subscribe to value changes.
@@ -1403,6 +1440,15 @@ impl SettingsApi {
         }
         let body = toml::to_string_pretty(&*self.inner.read())
             .map_err(|e| SettingsError::Io(std::io::Error::other(e)))?;
+        // In degraded mode the broken config is still on disk. Rename it to a
+        // dated backup before writing so it is never silently clobbered. If the
+        // rename itself fails (e.g. EACCES on a read-only filesystem) return an
+        // error without touching anything: the broken file is safer than nothing.
+        if self.degraded.load(std::sync::atomic::Ordering::Relaxed) && path.exists() {
+            let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+            let backup = path.with_extension(format!("toml.broken-{ts}"));
+            std::fs::rename(&path, &backup)?;
+        }
         // PID-suffixed tmp name: if two processes (e.g. a running GUI and a
         // CLI invocation) both write config they won't stomp on the same temp
         // file. The persist lock already serialises concurrent writers within
@@ -1425,6 +1471,9 @@ impl SettingsApi {
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        } else {
+            self.degraded
+                .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         result
     }
@@ -1507,6 +1556,68 @@ mod tests {
         let api = SettingsApi::open_at(Some(tmp.clone()));
         assert_eq!(api.voice_codec(), VoiceCodecKind::Opus);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn missing_file_is_not_degraded() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-missing.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let api = SettingsApi::open_at(Some(path));
+        assert!(!api.is_degraded(), "missing file must be Clean not Degraded");
+    }
+
+    #[test]
+    fn garbage_file_is_degraded_then_cleared_on_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-garbage.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"this is not valid toml }{").unwrap();
+        let api = SettingsApi::open_at(Some(path.clone()));
+        assert!(api.is_degraded(), "unreadable file must be Degraded");
+        // A setter should back up the broken file and write a valid one.
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        assert!(!api.is_degraded(), "degraded flag must clear after successful persist");
+        // The new config file must be valid.
+        let api2 = SettingsApi::open_at(Some(path.clone()));
+        assert!(!api2.is_degraded());
+        assert_eq!(api2.voice_codec(), VoiceCodecKind::Opus);
+        // A .broken-* backup must exist alongside the new file.
+        let dir = path.parent().unwrap();
+        let has_backup = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                name.to_string_lossy().contains(".broken-")
+            });
+        assert!(has_backup, "a .broken-<ts> backup file must exist");
+        // Cleanup: remove both the config and any backup.
+        let _ = std::fs::remove_file(&path);
+        for e in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+            if e.file_name().to_string_lossy().contains(".broken-") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+
+    #[test]
+    fn reload_clears_degraded_after_manual_fix() {
+        let path = std::env::temp_dir().join(format!(
+            "voicetastic-degraded-test-{}-fix.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"not valid toml").unwrap();
+        let api = SettingsApi::open_at(Some(path.clone()));
+        assert!(api.is_degraded());
+        // Simulate user manually fixing the file.
+        std::fs::write(&path, b"").unwrap(); // empty = valid defaults TOML
+        api.reload();
+        assert!(!api.is_degraded(), "reload with valid file must clear degraded");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
