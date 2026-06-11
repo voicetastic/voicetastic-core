@@ -1,23 +1,23 @@
-/// Per-codec frame-walking primitives shared by the encoder, decoder, and
-/// duration estimator. Pure parsing; no native deps, no codec features required.
-///
-/// # AMR-NB IF1 frame layout
-///
-/// Each frame starts with a 1-byte ToC header:
-/// ```text
-/// bit 7      : unused (0)
-/// bits 6..3  : FT (frame type, 0-15)
-/// bit 2      : Q (quality flag)
-/// bits 1..0  : padding
-/// ```
-/// The remainder (0 to 31 bytes) is the encoded payload. Total frame size
-/// (ToC included) is given by [`AMRNB_FRAME_BYTES`].
-///
-/// # Opus length-prefix wire format
-///
-/// ```text
-/// [u16 BE length][packet bytes] [u16 BE length][packet bytes] ...
-/// ```
+//! Per-codec frame-walking primitives shared by the encoder, decoder, and
+//! duration estimator. Pure parsing; no native deps, no codec features required.
+//!
+//! # AMR-NB IF1 frame layout
+//!
+//! Each frame starts with a 1-byte ToC header:
+//! ```text
+//! bit 7      : unused (0)
+//! bits 6..3  : FT (frame type, 0-15)
+//! bit 2      : Q (quality flag)
+//! bits 1..0  : padding
+//! ```
+//! The remainder (0 to 31 bytes) is the encoded payload. Total frame size
+//! (ToC included) is given by [`AMRNB_FRAME_BYTES`].
+//!
+//! # Opus length-prefix wire format
+//!
+//! ```text
+//! [u16 BE length][packet bytes] [u16 BE length][packet bytes] ...
+//! ```
 
 // ---------------------------------------------------------------------------
 // AMR-NB frame size table
@@ -219,11 +219,8 @@ mod tests {
 
     #[test]
     fn amrnb_frame_bytes_reserved_are_none() {
-        for mode in 9..=14 {
-            assert!(
-                AMRNB_FRAME_BYTES[mode].is_none(),
-                "mode {mode} should be None"
-            );
+        for (mode, entry) in AMRNB_FRAME_BYTES.iter().enumerate().take(15).skip(9) {
+            assert!(entry.is_none(), "mode {mode} should be None");
         }
     }
 
@@ -287,7 +284,7 @@ mod tests {
         let mut out = Vec::new();
         for &len in lengths {
             out.extend_from_slice(&len.to_be_bytes());
-            out.extend(std::iter::repeat(0xCC).take(len as usize));
+            out.extend(std::iter::repeat_n(0xCC, len as usize));
         }
         out
     }

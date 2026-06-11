@@ -585,12 +585,12 @@ fn pin_chunk_size(state: &mut AssemblyState, len: usize) -> Result<()> {
             }
             state.chunk_size = Some(len);
             let last_idx = state.header_template.total_data as usize - 1;
-            if let Some(stored) = &state.data_shards[last_idx] {
-                if stored.len() > len {
-                    state.data_shards[last_idx] = None;
-                    state.received_data = state.received_data.saturating_sub(1);
-                    state.last_data_len = None;
-                }
+            if let Some(stored) = &state.data_shards[last_idx]
+                && stored.len() > len
+            {
+                state.data_shards[last_idx] = None;
+                state.received_data = state.received_data.saturating_sub(1);
+                state.last_data_len = None;
             }
         }
         _ => {}

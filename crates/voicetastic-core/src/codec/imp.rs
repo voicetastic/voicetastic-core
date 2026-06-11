@@ -450,7 +450,8 @@ fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
     let mut pcm: Vec<i16> = Vec::new();
     let mut frame = [0i16; OPUS_MAX_FRAME_SAMPLES];
     let mut packets = super::frames::OpusPackets::new(payload);
-    while let Some(pkt) = packets.next() {
+    // `by_ref()` so `packets` stays usable for the truncation check below.
+    for pkt in packets.by_ref() {
         let n = dec
             .decode(pkt, &mut frame[..], false)
             .map_err(|e| CodecError::Codec(e.to_string()))?;
@@ -517,7 +518,8 @@ fn decode_amrnb(
     if gaps.is_empty() {
         // Complete payload: walk the self-describing IF1 stream as before.
         let mut iter = super::frames::AmrnbFrames::new(payload);
-        while let Some(frame_bytes) = iter.next() {
+        // `by_ref()` so `iter` stays usable for the truncation check below.
+        for frame_bytes in iter.by_ref() {
             // The decoder reads the frame type from the ToC and produces one
             // 160-sample block for every type, including comfort noise for SID
             // and PLC/silence for NO_DATA, so feeding the frame as-is preserves

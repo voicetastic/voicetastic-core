@@ -60,7 +60,8 @@ fn codec2_full_gap_is_silence_same_length() {
     let payload = encode(VoiceCodec::Codec2, param);
     let baseline = codec::decode(&payload, VoiceCodec::Codec2, param).expect("decode");
 
-    let gaps = [0..payload.len()];
+    let whole = 0..payload.len();
+    let gaps = [whole]; // one whole-payload gap
     let out = codec::decode_with_gaps(&payload, &gaps, VoiceCodec::Codec2, param).expect("gaps");
 
     assert_eq!(out.len(), baseline.len(), "timing (length) preserved");
@@ -81,7 +82,8 @@ fn codec2_partial_gap_is_silent_over_missing_span() {
 
     // Gap over the second half; the first half stays present.
     let gap_start = payload.len() / 2;
-    let gaps = [gap_start..payload.len()];
+    let second_half = gap_start..payload.len();
+    let gaps = [second_half];
     let out = codec::decode_with_gaps(&payload, &gaps, VoiceCodec::Codec2, param).expect("gaps");
 
     assert_eq!(out.len(), baseline.len(), "length/timing preserved");
@@ -112,7 +114,8 @@ fn amrnb_gap_preserves_length() {
     let payload = encode(VoiceCodec::AmrNb, param);
     let baseline = codec::decode(&payload, VoiceCodec::AmrNb, param).expect("decode");
 
-    let gaps = [0..payload.len()];
+    let whole = 0..payload.len();
+    let gaps = [whole];
     let out = codec::decode_with_gaps(&payload, &gaps, VoiceCodec::AmrNb, param).expect("gaps");
 
     assert_eq!(out.len(), baseline.len(), "timing (length) preserved");
