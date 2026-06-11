@@ -1115,11 +1115,11 @@ impl SettingsApi {
     /// Reset every field at once.
     pub fn reset_all(&self) -> SettingsResult<()> {
         *self.inner.write() = AppSettings::default();
-        self.persist()?;
+        let result = self.persist();
         for k in SettingKey::all() {
             self.notify(*k);
         }
-        Ok(())
+        result
     }
 
     // -----------------------------------------------------------------
@@ -1422,9 +1422,9 @@ impl SettingsApi {
     // -----------------------------------------------------------------
 
     fn persist_and_notify(&self, key: SettingKey) -> SettingsResult<()> {
-        self.persist()?;
+        let result = self.persist();
         self.notify(key);
-        Ok(())
+        result
     }
 
     fn persist(&self) -> SettingsResult<()> {
@@ -1658,6 +1658,38 @@ mod tests {
         api.set_voice_max_secs(20).unwrap();
         api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
         assert_eq!(c.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Listeners must fire even when persist() returns an error (e.g. when the
+    /// settings directory is read-only). Memory is already updated before persist
+    /// is called; skipping notify would leave live state desynced from memory.
+    #[test]
+    #[cfg(unix)]
+    fn listener_fires_even_when_persist_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir()
+            .join(format!("voicetastic-notify-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let api = SettingsApi::open_at(Some(path));
+        // Initial write to establish the file.
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        // Make the directory read-only so future writes fail.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let c = Arc::new(Counter(Default::default()));
+        api.subscribe(c.clone());
+        let result = api.set_voice_codec(VoiceCodecKind::AmrNb);
+        // Restore permissions before any assertion so cleanup always runs.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "persist should have failed on read-only dir");
+        assert_eq!(
+            c.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "listener must fire even when persist errors"
+        );
+        assert_eq!(api.voice_codec(), VoiceCodecKind::AmrNb, "memory must be updated");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
