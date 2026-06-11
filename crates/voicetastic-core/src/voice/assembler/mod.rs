@@ -73,6 +73,10 @@ pub struct VoiceAssembler {
 
 impl VoiceAssembler {
     pub fn new(cfg: AssemblerConfig) -> Self {
+        if let Err(e) = cfg.validate() {
+            warn!("AssemblerConfig has invalid values ({e}); clamping to safe defaults");
+        }
+        let cfg = cfg.clamped();
         Self {
             inner: Mutex::new(AssemblerInner {
                 in_progress: HashMap::new(),
@@ -1147,6 +1151,28 @@ mod tests {
         assert!(
             asm.inner.lock().blacklist.is_empty(),
             "a rejected frame must not have blacklisted any assembly"
+        );
+    }
+
+    /// VoiceAssembler::new must not panic when the config violates invariants;
+    /// it clamps the config to safe values instead.
+    #[test]
+    fn new_clamps_invalid_config() {
+        let cfg = AssemblerConfig {
+            message_timeout: Duration::from_millis(1),
+            completion_memory: Duration::ZERO,
+            dead_sender_timeout: Duration::from_secs(999),
+            ..Default::default()
+        };
+        let asm = VoiceAssembler::new(cfg);
+        let c = asm.cfg.lock();
+        assert!(
+            c.dead_sender_timeout <= c.message_timeout,
+            "dead_sender_timeout must be clamped to <= message_timeout"
+        );
+        assert!(
+            c.completion_memory >= c.message_timeout,
+            "completion_memory must be clamped to >= message_timeout"
         );
     }
 
