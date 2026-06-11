@@ -248,6 +248,12 @@ pub fn voice_codec_kind_from_id(s: &str) -> Option<VoiceCodecKind> {
     VoiceCodecKind::from_id(s)
 }
 
+impl Default for VoiceCodecKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_CODEC).expect("DEFAULT_VOICE_CODEC is always a valid id")
+    }
+}
+
 /// Typed mirror of the `voice.opus_bandwidth` string id. Only the two
 /// modes useful for LoRa-voice are exposed; super-wide and full-band
 /// are deliberately omitted.
@@ -282,6 +288,12 @@ pub fn opus_bandwidth_kind_to_id(k: OpusBandwidthKind) -> &'static str {
 
 pub fn opus_bandwidth_kind_from_id(s: &str) -> Option<OpusBandwidthKind> {
     OpusBandwidthKind::from_id(s)
+}
+
+impl Default for OpusBandwidthKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_OPUS_BANDWIDTH).expect("DEFAULT_OPUS_BANDWIDTH is always a valid id")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +395,12 @@ pub fn voice_fec_mode_to_id(m: VoiceFecMode) -> &'static str {
 
 pub fn voice_fec_mode_from_id(s: &str) -> Option<VoiceFecMode> {
     VoiceFecMode::from_id(s)
+}
+
+impl Default for VoiceFecMode {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_FEC_MODE).expect("DEFAULT_VOICE_FEC_MODE is always a valid id")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +534,13 @@ pub fn voice_nack_mode_from_id(s: &str) -> Option<VoiceNackMode> {
     VoiceNackMode::from_id(s)
 }
 
+impl Default for VoiceNackMode {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_VOICE_NACK_MODE)
+            .expect("DEFAULT_VOICE_NACK_MODE is always a valid id")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Theme mode + contrast (desktop GUI only — Android has its own theme path)
 // ---------------------------------------------------------------------------
@@ -559,6 +584,12 @@ pub fn theme_mode_kind_from_id(s: &str) -> Option<ThemeModeKind> {
     ThemeModeKind::from_id(s)
 }
 
+impl Default for ThemeModeKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_THEME_MODE).expect("DEFAULT_THEME_MODE is always a valid id")
+    }
+}
+
 /// Typed mirror of the `theme.contrast` string id. `Standard` uses the
 /// M3 TonalSpot palette; `High` opts into the HighContrast variant that
 /// mirrors the firmware `meshtastic-device-ui` theme.
@@ -591,6 +622,13 @@ pub fn theme_contrast_kind_to_id(k: ThemeContrastKind) -> &'static str {
 
 pub fn theme_contrast_kind_from_id(s: &str) -> Option<ThemeContrastKind> {
     ThemeContrastKind::from_id(s)
+}
+
+impl Default for ThemeContrastKind {
+    fn default() -> Self {
+        Self::from_id(DEFAULT_THEME_CONTRAST)
+            .expect("DEFAULT_THEME_CONTRAST is always a valid id")
+    }
 }
 
 #[cfg(test)]
@@ -833,7 +871,7 @@ impl SettingsApi {
     }
 
     pub fn voice_codec(&self) -> VoiceCodecKind {
-        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or(VoiceCodecKind::AmrNb)
+        VoiceCodecKind::from_id(self.inner.read().voice_codec()).unwrap_or_default()
     }
 
     pub fn voice_codec2_mode(&self) -> u8 {
@@ -849,8 +887,7 @@ impl SettingsApi {
     }
 
     pub fn voice_opus_bandwidth(&self) -> OpusBandwidthKind {
-        OpusBandwidthKind::from_id(self.inner.read().voice_opus_bandwidth())
-            .unwrap_or(OpusBandwidthKind::Wide)
+        OpusBandwidthKind::from_id(self.inner.read().voice_opus_bandwidth()).unwrap_or_default()
     }
 
     pub fn voice_denoise_enabled(&self) -> bool {
@@ -858,37 +895,40 @@ impl SettingsApi {
     }
 
     pub fn voice_fec_mode(&self) -> VoiceFecMode {
-        VoiceFecMode::from_id(self.inner.read().voice_fec_mode()).unwrap_or(VoiceFecMode::Auto)
+        VoiceFecMode::from_id(self.inner.read().voice_fec_mode()).unwrap_or_default()
     }
 
     pub fn voice_nack_mode(&self) -> VoiceNackMode {
-        VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or(VoiceNackMode::Auto)
+        VoiceNackMode::from_id(self.inner.read().voice_nack_mode()).unwrap_or_default()
     }
 
     pub fn theme_mode(&self) -> ThemeModeKind {
-        ThemeModeKind::from_id(self.inner.read().theme_mode()).unwrap_or(ThemeModeKind::Dark)
+        ThemeModeKind::from_id(self.inner.read().theme_mode()).unwrap_or_default()
     }
 
     pub fn theme_contrast(&self) -> ThemeContrastKind {
-        ThemeContrastKind::from_id(self.inner.read().theme_contrast())
-            .unwrap_or(ThemeContrastKind::Standard)
+        ThemeContrastKind::from_id(self.inner.read().theme_contrast()).unwrap_or_default()
     }
 
     /// Convenience: resolve `voice.codec` + per-codec mode to the
     /// `VoiceCodecParam` the voice protocol layer wants.
+    ///
+    /// Takes a single lock snapshot so codec and parameter are always
+    /// consistent even if a setter fires between two separate reads.
     pub fn voice_codec_for_protocol(&self) -> VoiceCodecParam {
-        match self.voice_codec() {
+        let inner = self.inner.read();
+        match VoiceCodecKind::from_id(inner.voice_codec()).unwrap_or_default() {
             VoiceCodecKind::Opus => VoiceCodecParam {
                 codec: VoiceCodec::Opus,
-                param: self.voice_opus_bitrate_kbps(),
+                param: inner.voice_opus_bitrate_kbps(),
             },
             VoiceCodecKind::Codec2 => VoiceCodecParam {
                 codec: VoiceCodec::Codec2,
-                param: self.voice_codec2_mode(),
+                param: inner.voice_codec2_mode(),
             },
             VoiceCodecKind::AmrNb => VoiceCodecParam {
                 codec: VoiceCodec::AmrNb,
-                param: self.voice_amrnb_mode(),
+                param: inner.voice_amrnb_mode(),
             },
         }
     }
@@ -1385,7 +1425,7 @@ impl SettingsApi {
 }
 
 fn parse_u32(key: SettingKey, value: &str) -> SettingsResult<u32> {
-    value.parse::<u32>().map_err(|e| SettingsError::Invalid {
+    value.trim().parse::<u32>().map_err(|e| SettingsError::Invalid {
         key: key.id(),
         value: value.to_string(),
         reason: e.to_string(),
@@ -1505,5 +1545,41 @@ mod tests {
             .set_str(SettingKey::ThemeContrast, "extra-high")
             .expect_err("garbage contrast must be rejected");
         assert!(matches!(err, SettingsError::Invalid { .. }));
+    }
+
+    /// Default impls for the six enum types must match the corresponding
+    /// DEFAULT_* constants so fallback values can't drift from constants.
+    #[test]
+    fn fallback_defaults_match_data_constants() {
+        use super::super::data::{
+            DEFAULT_OPUS_BANDWIDTH, DEFAULT_THEME_CONTRAST, DEFAULT_THEME_MODE,
+            DEFAULT_VOICE_CODEC, DEFAULT_VOICE_FEC_MODE, DEFAULT_VOICE_NACK_MODE,
+        };
+        assert_eq!(VoiceCodecKind::default().id(), DEFAULT_VOICE_CODEC);
+        assert_eq!(OpusBandwidthKind::default().id(), DEFAULT_OPUS_BANDWIDTH);
+        assert_eq!(VoiceFecMode::default().id(), DEFAULT_VOICE_FEC_MODE);
+        assert_eq!(VoiceNackMode::default().id(), DEFAULT_VOICE_NACK_MODE);
+        assert_eq!(ThemeModeKind::default().id(), DEFAULT_THEME_MODE);
+        assert_eq!(ThemeContrastKind::default().id(), DEFAULT_THEME_CONTRAST);
+    }
+
+    /// voice_codec_for_protocol must return codec and param from the same
+    /// consistent snapshot (single lock acquisition).
+    #[test]
+    fn voice_codec_for_protocol_returns_consistent_pair() {
+        let api = SettingsApi::in_memory();
+        let pair = api.voice_codec_for_protocol();
+        assert_eq!(pair.codec, VoiceCodec::AmrNb);
+        assert_eq!(pair.param, api.voice_amrnb_mode());
+    }
+
+    /// parse_u32 (via set_str) must accept whitespace-padded values just
+    /// like parse_bool does.
+    #[test]
+    fn set_str_trims_whitespace_for_u32() {
+        let api = SettingsApi::in_memory();
+        api.set_str(SettingKey::VoiceMaxDurationSecs, "  30  ")
+            .expect("set_str must accept padded integer");
+        assert_eq!(api.voice_max_secs(), 30);
     }
 }
