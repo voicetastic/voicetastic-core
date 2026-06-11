@@ -5,11 +5,7 @@ type BuildResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn main() {
     if let Err(e) = build() {
-        eprintln!("\nerror: voicetastic-core build script failed: {e}");
-        eprintln!(
-            "hint: ensure `protoc` is installed and the proto submodule is initialised\n      \
-             (`git submodule update --init --recursive`)\n"
-        );
+        eprintln!("\nerror: voicetastic-core build script failed\n\n{e}\n");
         std::process::exit(1);
     }
 }
@@ -18,7 +14,23 @@ fn build() -> BuildResult<()> {
     // Verify protoc is available before doing any work so the user gets a
     // friendly diagnostic instead of a panic from prost-build.
     if Command::new("protoc").arg("--version").output().is_err() {
-        return Err("`protoc` was not found in PATH (install Protocol Buffers compiler)".into());
+        return Err(
+            "`protoc` was not found in PATH.\n\
+             hint: install the Protocol Buffers compiler and initialise the proto submodule:\n\
+             \n\
+             Debian/Ubuntu:  sudo apt install protobuf-compiler\n\
+             Homebrew:       brew install protobuf\n\
+             \n\
+             Then run: git submodule update --init --recursive"
+                .into(),
+        );
+    }
+
+    // When the `codecs` feature is enabled, the native AMR-NB encoder/decoder
+    // in src/codec/imp.rs links against libopencore-amrnb. Probe for it here so
+    // the user gets a friendly diagnostic instead of an inscrutable linker error.
+    if std::env::var_os("CARGO_FEATURE_CODECS").is_some() {
+        probe_opencore_amrnb()?;
     }
 
     // Compile from inside the proto root so protoc resolves both the file path
@@ -80,5 +92,36 @@ fn build() -> BuildResult<()> {
     config
         .compile_protos(&rel_protos, std::slice::from_ref(&proto_root))
         .map_err(|e| format!("failed to compile meshtastic protos: {e}"))?;
+    Ok(())
+}
+
+// Resolve libopencore-amrnb for the `codecs` feature.
+//
+// Priority:
+//   1. OPENCORE_AMRNB_LIB_DIR - emit a native search path and let the
+//      #[link(name = "opencore-amrnb")] attribute in codec/imp.rs do the rest.
+//      Useful for cross-compilation or non-standard install prefixes.
+//   2. pkg-config - probe "opencore-amrnb" and emit link flags automatically.
+fn probe_opencore_amrnb() -> BuildResult<()> {
+    println!("cargo:rerun-if-env-changed=OPENCORE_AMRNB_LIB_DIR");
+
+    if let Some(dir) = std::env::var_os("OPENCORE_AMRNB_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={}", dir.to_string_lossy());
+        return Ok(());
+    }
+
+    pkg_config::probe_library("opencore-amrnb").map_err(|e| {
+        format!(
+            "libopencore-amrnb not found via pkg-config: {e}\n\
+             hint: install the development package:\n\
+             \n\
+             Debian/Ubuntu:  sudo apt install libopencore-amrnb-dev\n\
+             Fedora/RHEL:    sudo dnf install opencore-amr-devel\n\
+             Homebrew:       brew install opencore-amr\n\
+             \n\
+             Or set OPENCORE_AMRNB_LIB_DIR to the directory containing the library\n\
+             if it is installed in a non-standard prefix."
+        )
+    })?;
     Ok(())
 }
