@@ -102,7 +102,7 @@ fn campaign_should_reset(
     connected_at: Option<std::time::Instant>,
     window: Duration,
 ) -> bool {
-    connected_at.map_or(false, |t| t.elapsed() >= window)
+    connected_at.is_some_and(|t| t.elapsed() >= window)
 }
 
 /// Service handle. Cheap to clone — internally `Arc`'d.

@@ -428,11 +428,9 @@ fn try_pkc_decrypt(
     // multiple times. Check before the (cheap but non-free) decrypt so
     // replays short-circuit immediately.
     let mut seen_guard = ctx.pkc_seen.map(|s| s.lock());
-    if let Some(ref g) = seen_guard {
-        if g.contains(&(from, id)) {
-            tracing::debug!(from, id, "drop PKC DM: replay dedup");
-            return None;
-        }
+    if seen_guard.as_ref().is_some_and(|g| g.contains(&(from, id))) {
+        tracing::debug!(from, id, "drop PKC DM: replay dedup");
+        return None;
     }
 
     let plaintext = pkc::decrypt(our_private, &peer_public, from, id, ciphertext)?;
