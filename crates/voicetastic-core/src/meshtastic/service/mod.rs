@@ -83,14 +83,27 @@ enum ReconnectConfig {
     Ble { address: String },
 }
 
-/// Exponential backoff bounds for the auto-reconnect watcher: start at
-/// 1 s after a disconnect, double on each failed retry, cap at 30 s.
-/// Only used by the watcher's spawn block, which is itself gated on
-/// having at least one transport feature compiled in.
+/// Backoff bounds for the auto-reconnect watcher.
 #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// A connection is considered "stable" (and the backoff campaign reset) if it
+/// stayed up for at least this long before dropping. Below this threshold the
+/// device is treated as flapping and the previous campaign's longer delays are
+/// continued, so a pathological device can't keep hammering at 1 s forever.
+#[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+const RECONNECT_STABILITY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Returns `true` if a connection established at `connected_at` was stable
+/// long enough to justify resetting the reconnect backoff campaign.
+#[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+fn campaign_should_reset(
+    connected_at: Option<std::time::Instant>,
+    window: Duration,
+) -> bool {
+    connected_at.map_or(false, |t| t.elapsed() >= window)
+}
 
 /// Service handle. Cheap to clone — internally `Arc`'d.
 #[derive(Clone)]
@@ -298,12 +311,44 @@ impl MeshtasticService {
         {
             let weak = Arc::downgrade(&inner);
             tokio::spawn(async move {
+                use super::reconnect::{BleReconnectConfig, BleReconnectPolicy};
+                let mut policy = BleReconnectPolicy::new(BleReconnectConfig {
+                    initial_delay: RECONNECT_INITIAL_DELAY,
+                    backoff_num: 2,
+                    backoff_den: 1,
+                    max_delay: RECONNECT_MAX_DELAY,
+                    max_attempts: Some(10),
+                });
+                let mut last_connected_at: Option<std::time::Instant> = None;
                 loop {
                     reconnect_request.notified().await;
                     let Some(inner) = weak.upgrade() else { return };
-                    drop(inner); // grabbed it again each iteration below
-                    let mut delay = RECONNECT_INITIAL_DELAY;
+                    drop(inner);
+                    // Reset backoff if the connection that just dropped had
+                    // been stable long enough; otherwise continue the current
+                    // campaign's longer delays (anti-flap).
+                    if campaign_should_reset(
+                        last_connected_at.take(),
+                        RECONNECT_STABILITY_WINDOW,
+                    ) {
+                        policy.reset();
+                    }
                     loop {
+                        // Check give-up BEFORE sleeping so the user gets the
+                        // Disconnected state immediately on the 10th failure
+                        // rather than one extra delay later.
+                        if policy.should_give_up() {
+                            warn!(
+                                attempts = policy.attempts(),
+                                "auto-reconnect: max attempts reached, giving up"
+                            );
+                            let Some(inner) = weak.upgrade() else { return };
+                            let svc = MeshtasticService { inner };
+                            *svc.inner.reconnect_config.lock().await = None;
+                            svc.set_state(ConnectionState::Disconnected);
+                            break;
+                        }
+                        let delay = policy.next_delay();
                         tokio::time::sleep(delay).await;
                         let Some(inner) = weak.upgrade() else { return };
                         // Re-check intent after sleep: the user may have
@@ -335,6 +380,8 @@ impl MeshtasticService {
                                 // connection we just brought up.
                                 if svc.inner.reconnect_config.lock().await.is_none() {
                                     let _ = svc.disconnect().await;
+                                } else {
+                                    last_connected_at = Some(std::time::Instant::now());
                                 }
                                 break;
                             }
@@ -344,8 +391,7 @@ impl MeshtasticService {
                                     delay_s = delay.as_secs(),
                                     "auto-reconnect failed; retrying"
                                 );
-                                delay = (delay * 2).min(RECONNECT_MAX_DELAY);
-                                // Loop iterates with the new (longer) delay.
+                                policy.record_failure();
                             }
                         }
                     }
@@ -1133,6 +1179,25 @@ mod tests {
             prev_state,
             "state must revert when refresh fails"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // campaign_should_reset (3.B stability window)
+    // -------------------------------------------------------------------------
+
+    #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
+    #[test]
+    fn campaign_should_reset_after_stability_window() {
+        let window = Duration::from_millis(100);
+        // No prior connect: don't reset.
+        assert!(!campaign_should_reset(None, window));
+        // Connected just now: not stable yet.
+        assert!(!campaign_should_reset(Some(std::time::Instant::now()), window));
+        // Connected long enough ago: reset.
+        let old = std::time::Instant::now()
+            .checked_sub(window + Duration::from_millis(1))
+            .unwrap();
+        assert!(campaign_should_reset(Some(old), window));
     }
 
     // -------------------------------------------------------------------------
