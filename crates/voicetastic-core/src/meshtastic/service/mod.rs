@@ -318,15 +318,26 @@ impl MeshtasticService {
                         let result = match cfg {
                             #[cfg(feature = "serial-tokio")]
                             ReconnectConfig::Serial { path, baud } => {
-                                svc.connect_by_serial_baud(&path, baud).await
+                                svc.set_state(ConnectionState::Connecting);
+                                svc.connect_by_serial_baud_inner(&path, baud).await
                             }
                             #[cfg(feature = "ble-btleplug")]
                             ReconnectConfig::Ble { address } => {
-                                svc.connect_by_address(&address).await
+                                svc.set_state(ConnectionState::Connecting);
+                                svc.connect_by_address_inner(&address).await
                             }
                         };
                         match result {
-                            Ok(()) => break,
+                            Ok(()) => {
+                                // The user may have disconnected while the
+                                // attempt was in flight. If reconnect_config
+                                // was cleared, honour it by tearing down the
+                                // connection we just brought up.
+                                if svc.inner.reconnect_config.lock().await.is_none() {
+                                    let _ = svc.disconnect().await;
+                                }
+                                break;
+                            }
                             Err(e) => {
                                 warn!(
                                     ?e,
@@ -510,13 +521,17 @@ impl MeshtasticService {
         inbound: mpsc::Receiver<Vec<u8>>,
         settle_delay: Duration,
     ) -> Result<()> {
-        // Claim a fresh connection generation up front. Any reader still
-        // alive from a prior connection now holds an older generation and
-        // will skip its teardown, so it can't clobber the transport we're
-        // about to install.
-        let generation = self.inner.conn_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        // Claim a generation number and install the transport under the same
+        // lock so both operations are atomic from any reader's perspective.
+        // A reader that grabs this lock will either see the old generation
+        // (it is the current owner) or the new one (we won the slot) - never
+        // an in-between state where the generation advanced but the slot
+        // wasn't yet replaced.
+        let generation;
+        let old_transport;
         {
             let mut slot = self.inner.transport.lock().await;
+            generation = self.inner.conn_generation.fetch_add(1, Ordering::SeqCst) + 1;
             self.inner
                 .transport_max_tx_payload
                 .store(transport.max_tx_payload(), Ordering::Relaxed);
@@ -524,7 +539,13 @@ impl MeshtasticService {
             // low-water value left over from the previous session doesn't
             // stall the first voice burst until the next QueueStatus arrives.
             *self.inner.radio_queue_free.lock() = u32::MAX;
-            *slot = Some(transport);
+            old_transport = slot.replace(transport);
+        }
+        // Actively shut down any superseded transport so its OS resources
+        // (BLE GATT connection, serial port fd) are released promptly rather
+        // than waiting for its inbound stream to drain to EOF.
+        if let Some(old) = old_transport {
+            let _ = old.disconnect().await;
         }
         self.set_state(ConnectionState::Connected);
 
@@ -614,9 +635,39 @@ impl MeshtasticService {
             tokio::time::sleep(settle_delay).await;
         }
         self.set_state(ConnectionState::Configuring);
-        self.send_want_config().await?;
+        if let Err(e) = self.send_want_config().await {
+            // Unwind the half-connected state so the caller sees a clean
+            // Disconnected status and the transport slot doesn't leak.
+            if let Some(t) = self.teardown_generation(generation).await {
+                let _ = t.disconnect().await;
+            }
+            return Err(e);
+        }
         self.spawn_config_watchdog();
         Ok(())
+    }
+
+    /// Unwind the connection installed by `connect_with_transport` for
+    /// `generation`. Bumps `conn_generation` so the spawned inbound reader
+    /// skips its own teardown when its stream closes. Returns the transport
+    /// that was in the slot so the caller can disconnect it outside the lock.
+    async fn teardown_generation(&self, generation: u64) -> Option<Arc<dyn Transport>> {
+        let transport = {
+            let mut slot = self.inner.transport.lock().await;
+            // Only act if we're still the current generation: a concurrent
+            // connect_with_transport may have already superseded this one.
+            if self.inner.conn_generation.load(Ordering::SeqCst) == generation {
+                self.inner.conn_generation.fetch_add(1, Ordering::SeqCst);
+                self.inner
+                    .transport_max_tx_payload
+                    .store(usize::MAX, Ordering::Relaxed);
+                slot.take()
+            } else {
+                None
+            }
+        };
+        self.set_state(ConnectionState::Disconnected);
+        transport
     }
 
     /// Connect to a peripheral by BLE address (`AA:BB:CC:DD:EE:FF`).
@@ -633,6 +684,19 @@ impl MeshtasticService {
         *self.inner.reconnect_config.lock().await = Some(ReconnectConfig::Ble {
             address: address.to_string(),
         });
+        if let Err(e) = self.connect_by_address_inner(address).await {
+            // Revert to Disconnected if nothing else has since changed state
+            // (e.g. a concurrent connect that succeeded must not be clobbered).
+            if *self.inner.state_tx.borrow() == ConnectionState::Connecting {
+                self.set_state(ConnectionState::Disconnected);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "ble-btleplug")]
+    async fn connect_by_address_inner(&self, address: &str) -> Result<()> {
         let ble = self.ble().await?;
         let peripheral = ble.peripheral_by_address(address).await?;
         let conn = match Connection::open(peripheral).await {
@@ -679,6 +743,17 @@ impl MeshtasticService {
             path: path.to_string(),
             baud,
         });
+        if let Err(e) = self.connect_by_serial_baud_inner(path, baud).await {
+            if *self.inner.state_tx.borrow() == ConnectionState::Connecting {
+                self.set_state(ConnectionState::Disconnected);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "serial-tokio")]
+    async fn connect_by_serial_baud_inner(&self, path: &str, baud: u32) -> Result<()> {
         let serial = Arc::new(SerialConnection::open(path, baud).await?);
         let inbound = serial.subscribe_inbound().await?;
         // Serial port is fully ready after `open` — no settle delay needed.
@@ -1057,6 +1132,155 @@ mod tests {
             *svc.inner.state_tx.borrow(),
             prev_state,
             "state must revert when refresh fails"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // MockTransport - lifecycle tests (M1, M2, M6)
+    // -------------------------------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    struct MockTransport {
+        disconnect_count: Arc<AtomicUsize>,
+        fail_writes: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn write_to_radio(&self, _bytes: &[u8]) -> crate::error::Result<()> {
+            if self.fail_writes {
+                return Err(crate::error::Error::Other(
+                    "mock write failure".to_string(),
+                ));
+            }
+            Ok(())
+        }
+
+        async fn disconnect(&self) -> crate::error::Result<()> {
+            self.disconnect_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn make_mock(fail: bool) -> (Arc<MockTransport>, Arc<AtomicUsize>) {
+        let dc = Arc::new(AtomicUsize::new(0));
+        let t = Arc::new(MockTransport {
+            disconnect_count: dc.clone(),
+            fail_writes: fail,
+        });
+        (t, dc)
+    }
+
+    #[tokio::test]
+    async fn connect_failure_unwinds_transport_and_state() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+        let (t, dc) = make_mock(true); // write_to_radio always fails
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let result = svc
+            .connect_with_transport(t as Arc<dyn Transport>, rx, Duration::ZERO)
+            .await;
+        assert!(result.is_err(), "expected Err from failing transport");
+        // Slot must be cleared and state must be Disconnected.
+        assert!(
+            svc.inner.transport.lock().await.is_none(),
+            "transport slot must be empty after failure"
+        );
+        assert_eq!(
+            *svc.inner.state_tx.borrow(),
+            ConnectionState::Disconnected,
+            "state must be Disconnected after failed connect"
+        );
+        // The transport must have been disconnected during unwind.
+        assert_eq!(
+            dc.load(Ordering::Relaxed),
+            1,
+            "disconnect() must be called once during failure unwind"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_connect_disconnects_previous_transport() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+
+        let (t1, dc1) = make_mock(false);
+        let (_tx1, rx1) = tokio::sync::mpsc::channel(1);
+        svc.connect_with_transport(t1 as Arc<dyn Transport>, rx1, Duration::ZERO)
+            .await
+            .expect("first connect must succeed");
+
+        let (t2, _dc2) = make_mock(false);
+        let (_tx2, rx2) = tokio::sync::mpsc::channel(1);
+        svc.connect_with_transport(t2 as Arc<dyn Transport>, rx2, Duration::ZERO)
+            .await
+            .expect("second connect must succeed");
+
+        // T1 must have been actively disconnected when T2 took the slot.
+        assert_eq!(
+            dc1.load(Ordering::Relaxed),
+            1,
+            "superseded transport must be disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reader_does_not_tear_down_new_connection() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+
+        let (t1, _dc1) = make_mock(false);
+        let (tx1, rx1) = tokio::sync::mpsc::channel(1);
+        svc.connect_with_transport(t1 as Arc<dyn Transport>, rx1, Duration::ZERO)
+            .await
+            .expect("first connect");
+
+        // Install a second transport, which bumps the generation.
+        let (t2, _dc2) = make_mock(false);
+        let (_tx2, rx2) = tokio::sync::mpsc::channel(1);
+        svc.connect_with_transport(t2 as Arc<dyn Transport>, rx2, Duration::ZERO)
+            .await
+            .expect("second connect");
+
+        // Close T1's inbound channel. Its reader task will see EOF, then
+        // observe that conn_generation != its generation and exit cleanly.
+        drop(tx1);
+        // Yield to let the reader task run.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // T2 must still be in the slot.
+        assert!(
+            svc.inner.transport.lock().await.is_some(),
+            "T2 must still be in the slot after T1's stale reader exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_reconnect_config() {
+        let svc = make_service().await;
+        let _g = keep_alive(&svc);
+
+        let (t, _dc) = make_mock(false);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        svc.connect_with_transport(t as Arc<dyn Transport>, rx, Duration::ZERO)
+            .await
+            .expect("connect");
+
+        // Arm reconnect_config as connect_by_address/serial would.
+        *svc.inner.reconnect_config.lock().await =
+            Some(ReconnectConfig::Serial { path: "/dev/fake".into(), baud: 115200 });
+
+        svc.disconnect().await.expect("disconnect");
+
+        assert!(
+            svc.inner.reconnect_config.lock().await.is_none(),
+            "disconnect must clear reconnect_config"
+        );
+        assert!(
+            svc.inner.transport.lock().await.is_none(),
+            "disconnect must clear transport slot"
         );
     }
 }
