@@ -1403,17 +1403,30 @@ impl SettingsApi {
         }
         let body = toml::to_string_pretty(&*self.inner.read())
             .map_err(|e| SettingsError::Io(std::io::Error::other(e)))?;
-        // Write to a sibling temp file then atomically rename it over the
-        // target. A crash, power loss, or ENOSPC mid-write then leaves either
-        // the old complete file or the new complete file, never a truncated
-        // one that parses back as empty and silently resets every setting.
-        // The temp file is in the same directory so the rename is a
-        // same-filesystem atomic replace, and the persist lock means only one
-        // writer ever touches it at a time.
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, body)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        // PID-suffixed tmp name: if two processes (e.g. a running GUI and a
+        // CLI invocation) both write config they won't stomp on the same temp
+        // file. The persist lock already serialises concurrent writers within
+        // one process.
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let result: SettingsResult<()> = (|| {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            // Flush kernel write buffers to the device before renaming. A
+            // kernel crash between write and rename without this could leave
+            // the renamed file empty on remount. We deliberately omit a
+            // parent-directory fsync: it would block on slow media and is
+            // only needed for directory-entry durability on power loss, which
+            // is an acceptable trade-off for a settings file.
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp); // best-effort cleanup
+        }
+        result
     }
 
     fn notify(&self, key: SettingKey) {
@@ -1494,6 +1507,29 @@ mod tests {
         let api = SettingsApi::open_at(Some(tmp.clone()));
         assert_eq!(api.voice_codec(), VoiceCodecKind::Opus);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn persist_leaves_no_tmp_sibling() {
+        let config = std::env::temp_dir().join(format!(
+            "voicetastic-atomic-test-{}.toml",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&config);
+        let api = SettingsApi::open_at(Some(config.clone()));
+        api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
+        let dir = config.parent().unwrap();
+        let stem = config.file_stem().unwrap().to_string_lossy();
+        let has_tmp = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with(stem.as_ref()) && s.contains(".tmp")
+            });
+        assert!(!has_tmp, "no .tmp sibling should remain after a successful persist");
+        let _ = std::fs::remove_file(&config);
     }
 
     struct Counter(std::sync::atomic::AtomicUsize);
