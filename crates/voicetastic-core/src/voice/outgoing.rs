@@ -79,12 +79,22 @@ pub enum DeferOutcome {
     Gone,
 }
 
+/// **Experimental (resource-bounding).** Heuristic safety valve, not a
+/// wire-format value: tuned empirically and may change between releases
+/// without a protocol-version bump.
+///
 /// Default retain TTL when the app hasn't applied settings yet. Must
 /// cover the full sender lifetime: `max_burst_duration + linger`.
 /// On LongFast (155 chunks × 900 ms ≈ 140 s) with the default linger of
 /// 600 s the total is 740 s. LongSlow at 155 chunks × 1800 ms ≈ 279 s
 /// plus 600 s linger gives 879 s. 1200 s comfortably exceeds both.
 pub const DEFAULT_RETAIN_TTL: Duration = Duration::from_secs(1200);
+/// **Experimental (flood-control).** Heuristic safety valve, not a
+/// wire-format value: tuned empirically and may change between releases
+/// without a protocol-version bump. Caps how many retransmit rounds a
+/// single message can trigger so a peer NACKing in a loop can't keep the
+/// sender flooding the channel indefinitely.
+///
 /// Maximum number of NACK rounds we'll honour per outgoing message.
 /// Sized to cover the receiver's worst-case `NACK_MAX_ROUNDS` budget at
 /// the top of the configurable reassembly-timeout range
