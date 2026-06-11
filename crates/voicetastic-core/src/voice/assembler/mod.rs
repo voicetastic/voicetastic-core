@@ -557,6 +557,46 @@ fn validate_template(state: &AssemblyState, header: &ChunkHeader) -> Result<()> 
     Ok(())
 }
 
+/// Pin or validate `chunk_size` against `len`.
+///
+/// When `chunk_size` is already known, `len` must match exactly (wrong-size
+/// retransmits are rejected). When it is not yet known, `len` becomes the new
+/// `chunk_size` after a range check.
+///
+/// After pinning, if the previously-stored final DATA shard is longer than the
+/// now-established `chunk_size`, it is evicted: FEC would reconstruct it at the
+/// correct length, but the stored oversized bytes would corrupt the decoded tail.
+/// The shard will be re-requested via NACK.
+fn pin_chunk_size(state: &mut AssemblyState, len: usize) -> Result<()> {
+    match state.chunk_size {
+        Some(expected) if len != expected => {
+            return Err(VoiceError::BodyLenMismatch {
+                got: len,
+                expected,
+            });
+        }
+        None => {
+            if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&len) {
+                return Err(VoiceError::ChunkTooLarge {
+                    got: len,
+                    max: MAX_BODY_SIZE,
+                });
+            }
+            state.chunk_size = Some(len);
+            let last_idx = state.header_template.total_data as usize - 1;
+            if let Some(stored) = &state.data_shards[last_idx] {
+                if stored.len() > len {
+                    state.data_shards[last_idx] = None;
+                    state.received_data = state.received_data.saturating_sub(1);
+                    state.last_data_len = None;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Ingest a DATA frame's body into `state`. Returns `Some(event)` for
 /// early-return cases (duplicate); `None` means the caller should continue
 /// the pipeline (FEC + completion check).
@@ -576,26 +616,7 @@ fn ingest_data(
     }
 
     if !is_last {
-        // Full (non-final) chunks must equal chunk_size, and they fix it
-        // if not yet known.
-        match state.chunk_size {
-            Some(expected) if plain_body.len() != expected => {
-                return Err(VoiceError::BodyLenMismatch {
-                    got: plain_body.len(),
-                    expected,
-                });
-            }
-            None => {
-                if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
-                    return Err(VoiceError::ChunkTooLarge {
-                        got: plain_body.len(),
-                        max: MAX_BODY_SIZE,
-                    });
-                }
-                state.chunk_size = Some(plain_body.len());
-            }
-            _ => {}
-        }
+        pin_chunk_size(state, plain_body.len())?;
     } else {
         // Final DATA chunk may be shorter than chunk_size, but never longer.
         if let Some(expected) = state.chunk_size
@@ -624,24 +645,7 @@ fn ingest_parity(
     if state.parity_shards[idx].is_some() {
         return Ok(Some(AssemblyEvent::Duplicate));
     }
-    match state.chunk_size {
-        Some(expected) if plain_body.len() != expected => {
-            return Err(VoiceError::BodyLenMismatch {
-                got: plain_body.len(),
-                expected,
-            });
-        }
-        None => {
-            if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&plain_body.len()) {
-                return Err(VoiceError::ChunkTooLarge {
-                    got: plain_body.len(),
-                    max: MAX_BODY_SIZE,
-                });
-            }
-            state.chunk_size = Some(plain_body.len());
-        }
-        _ => {}
-    }
+    pin_chunk_size(state, plain_body.len())?;
     state.parity_shards[idx] = Some(plain_body);
     state.received_parity = state.received_parity.saturating_add(1);
     Ok(None)
@@ -1144,5 +1148,59 @@ mod tests {
             asm.inner.lock().blacklist.is_empty(),
             "a rejected frame must not have blacklisted any assembly"
         );
+    }
+
+    /// A final DATA shard accepted before chunk_size is pinned may be longer
+    /// than the real chunk_size. When a non-final chunk later pins chunk_size,
+    /// the oversized final shard must be evicted so FEC cannot smuggle garbage
+    /// bytes into the decoded audio tail. The real final shard re-arrives via
+    /// NACK and the message completes with the correct payload.
+    #[test]
+    fn pin_evicts_oversized_stored_final_shard() {
+        // 2 full 64-byte chunks + 20-byte tail => 3 data shards.
+        let audio: Vec<u8> = (0..(64 * 2 + 20)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        // enc.frames: [chunk0=64B, chunk1=64B, chunk2=20B]
+
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+        // Build a forged final frame: correct header, body inflated to 100B.
+        let (hdr2, _) = ChunkHeader::parse(&enc.frames[2]).unwrap();
+        let mut forged = hdr2.serialize().to_vec();
+        forged.extend_from_slice(&[0xFFu8; 100]);
+
+        // Deliver the forged final chunk first (chunk_size not yet pinned).
+        let res = asm.accept("!cc", unicast_dest(), 0, &forged);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        {
+            let inner = asm.inner.lock();
+            let state = inner.in_progress.values().next().unwrap();
+            assert!(state.data_shards[2].is_some(), "oversized final shard must be stored");
+            assert_eq!(state.received_data, 1);
+            assert!(state.chunk_size.is_none(), "chunk_size not yet pinned");
+        }
+
+        // Deliver chunk0 (64B, non-final): pins chunk_size=64, evicts oversized shard.
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        {
+            let inner = asm.inner.lock();
+            let state = inner.in_progress.values().next().unwrap();
+            assert_eq!(state.chunk_size, Some(64), "chunk_size must be pinned after non-final chunk");
+            assert!(state.data_shards[2].is_none(), "oversized final shard must be evicted");
+            assert_eq!(state.received_data, 1, "received_data decremented after eviction");
+            assert!(state.last_data_len.is_none(), "last_data_len cleared after eviction");
+        }
+
+        // Deliver the remaining real chunks; message completes with the correct audio.
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[1]);
+        assert!(matches!(res, AssemblyEvent::Pending { .. }), "got {res:?}");
+        let res = asm.accept("!cc", unicast_dest(), 0, &enc.frames[2]);
+        let m = match res {
+            AssemblyEvent::Complete(m) => m,
+            other => panic!("expected Complete, got {other:?}"),
+        };
+        assert!(m.is_complete);
+        assert_eq!(m.audio, audio, "audio must round-trip correctly after shard eviction");
     }
 }
