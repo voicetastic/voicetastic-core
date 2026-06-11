@@ -160,9 +160,11 @@ impl VoiceAssembler {
             return Err(VoiceError::Blacklisted);
         }
 
-        // Apply per-sender / global caps only when this is a *new* message.
+        // Per-sender cap on new messages. Read-only: an invalid frame that is
+        // rejected below must not have changed any state. The global-cap
+        // eviction happens later, at the actual insert point.
         if !inner.in_progress.contains_key(&key) {
-            apply_caps(&mut inner, &key.0, now)?;
+            check_per_sender_cap(&inner, &key.0)?;
         }
 
         // Reject unknown codecs (spec §3.2).
@@ -197,6 +199,12 @@ impl VoiceAssembler {
         let state = match inner.in_progress.get_mut(&key) {
             Some(s) => s,
             None => {
+                // This frame will definitely create a new entry: every
+                // per-frame validation above has passed. Only now may we
+                // evict the oldest entry to honour the global cap, so a
+                // frame that was going to be rejected never displaces a
+                // legitimate in-progress assembly.
+                evict_for_global_cap(&mut inner, now);
                 let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
                 *cnt = cnt.saturating_add(1);
                 inner
@@ -218,8 +226,7 @@ impl VoiceAssembler {
             state.validation_strikes = state.validation_strikes.saturating_add(1);
             if state.validation_strikes >= MAX_VALIDATION_STRIKES {
                 inner.in_progress.remove(&key);
-                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-                *cnt = cnt.saturating_sub(1);
+                inner.per_sender_dec(&key.0);
                 push_blacklist(&mut inner.blacklist, key, now);
             }
             return Err(err);
@@ -284,8 +291,7 @@ impl VoiceAssembler {
                     channel,
                 });
             };
-            let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-            *cnt = cnt.saturating_sub(1);
+            inner.per_sender_dec(&key.0);
             push_blacklist(&mut inner.blacklist, key.clone(), now);
             let msg = finalize(from, &key, state, true);
             return Ok(AssemblyEvent::Complete(Box::new(msg)));
@@ -374,8 +380,7 @@ impl VoiceAssembler {
                 let Some(state) = inner.in_progress.remove(&key) else {
                     continue;
                 };
-                let cnt = inner.per_sender.entry(Arc::clone(&key.0)).or_default();
-                *cnt = cnt.saturating_sub(1);
+                inner.per_sender_dec(&key.0);
                 push_blacklist(&mut inner.blacklist, key.clone(), now);
                 if cfg.partial_play_on_timeout {
                     finalized_msgs.push(finalize(&key.0, &key, state, false));
@@ -458,14 +463,24 @@ fn prune_blacklist(bl: &mut Vec<(SenderKey, Instant)>, now: Instant, ttl: std::t
     bl.retain(|(_, t)| now.duration_since(*t) < ttl);
 }
 
-/// Enforce per-sender and global in-progress caps. May evict the globally
-/// oldest entry to make room.
-fn apply_caps(inner: &mut AssemblerInner, from: &Arc<str>, now: Instant) -> Result<()> {
+/// Read-only per-sender cap check. Has no side effects, so it is safe to run
+/// before per-frame validation (an invalid frame that is later rejected must
+/// not have evicted or blacklisted anything).
+fn check_per_sender_cap(inner: &AssemblerInner, from: &Arc<str>) -> Result<()> {
     let in_use = *inner.per_sender.get(from).unwrap_or(&0);
     if in_use >= MAX_IN_PROGRESS_PER_SENDER {
         warn!(from = %from, "voice per-sender cap reached; dropping new message");
         return Err(VoiceError::PerSenderCap(from.to_string()));
     }
+    Ok(())
+}
+
+/// Evict the globally oldest in-progress entry if the table is full, to make
+/// room for a new insert. MUST be called only at the point a new entry is
+/// actually about to be inserted (i.e. after all per-frame validation has
+/// passed) — otherwise a frame that is subsequently rejected would have
+/// evicted and blacklisted a legitimate assembly on its behalf.
+fn evict_for_global_cap(inner: &mut AssemblerInner, now: Instant) {
     if inner.in_progress.len() >= MAX_IN_PROGRESS_GLOBAL
         && let Some(victim) = inner
             .in_progress
@@ -475,12 +490,10 @@ fn apply_caps(inner: &mut AssemblerInner, from: &Arc<str>, now: Instant) -> Resu
     {
         debug!(victim_from = %victim.0, victim_id = victim.1, "voice global cap; evicting");
         if inner.in_progress.remove(&victim).is_some() {
-            let cnt = inner.per_sender.entry(Arc::clone(&victim.0)).or_default();
-            *cnt = cnt.saturating_sub(1);
+            inner.per_sender_dec(&victim.0);
         }
         push_blacklist(&mut inner.blacklist, victim, now);
     }
-    Ok(())
 }
 
 /// Initial `chunk_size` to seed a new `AssemblyState` with, derived from
@@ -1024,5 +1037,112 @@ mod tests {
                 "round {round}: expected 1 NACK with backoff_base=2"
             );
         }
+    }
+
+    #[test]
+    fn per_sender_entry_removed_on_completion() {
+        let audio: Vec<u8> = (0..(64 * 3)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+
+        let mut completed = false;
+        for f in &enc.frames {
+            if let AssemblyEvent::Complete(_) = asm.accept("!cc", unicast_dest(), 0, f) {
+                completed = true;
+            }
+        }
+        assert!(completed, "message should complete");
+        assert!(
+            asm.inner.lock().per_sender.is_empty(),
+            "per_sender must drop the sender entry at zero after completion"
+        );
+    }
+
+    #[test]
+    fn per_sender_entry_removed_on_timeout_finalize() {
+        let audio: Vec<u8> = (0..(64 * 6)).map(|i| (i & 0xff) as u8).collect();
+        let enc = build_message(&audio, &cfg(0)).unwrap();
+        let asm = VoiceAssembler::new(AssemblerConfig {
+            message_timeout: Duration::from_millis(1),
+            partial_play_on_timeout: true,
+            ..Default::default()
+        });
+        // Only deliver the first chunk, then let the message time out.
+        let _ = asm.accept("!cc", unicast_dest(), 0, &enc.frames[0]);
+        {
+            let mut inner = asm.inner.lock();
+            for (_, st) in inner.in_progress.iter_mut() {
+                st.started_at = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        let _ = asm.tick();
+        assert!(
+            asm.inner.lock().in_progress.is_empty(),
+            "timed-out message should be removed"
+        );
+        assert!(
+            asm.inner.lock().per_sender.is_empty(),
+            "per_sender must drop the sender entry at zero after timeout finalize"
+        );
+    }
+
+    #[test]
+    fn invalid_frame_does_not_evict_at_global_cap() {
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+        // Fill the global table to capacity with valid first frames from
+        // distinct senders (16 senders × 4 messages = 64 = the per-sender
+        // cap × global cap).
+        let enc = build_message(&(0..(64 * 3)).map(|i| (i & 0xff) as u8).collect::<Vec<_>>(), &cfg(0))
+            .unwrap();
+        // Parse the template frame once (valid MAC) to read its fields and body.
+        // Each fill frame is then built from a fresh ChunkHeader so the new MAC
+        // is computed over the correct bytes; patching bytes [2..6] after
+        // serialization would invalidate the trailing MAC tag.
+        let (tmpl, tmpl_body) = ChunkHeader::parse(&enc.frames[0]).unwrap();
+        let body_bytes: Vec<u8> = tmpl_body.to_vec();
+        let mut count = 0;
+        'fill: for s in 0..16u32 {
+            let from = format!("!{s:08x}");
+            for m in 0..MAX_IN_PROGRESS_PER_SENDER {
+                // Distinct non-zero message_id per (sender, slot).
+                let h = ChunkHeader { message_id: 0x0100_0000 | s << 8 | m as u32, ..tmpl };
+                let mut rebuilt = h.serialize().to_vec();
+                rebuilt.extend_from_slice(&body_bytes);
+                let _ = asm.accept(&from, unicast_dest(), 0, &rebuilt);
+                count += 1;
+                if count >= MAX_IN_PROGRESS_GLOBAL {
+                    break 'fill;
+                }
+            }
+        }
+        let before = asm.inner.lock().in_progress.len();
+        assert_eq!(before, MAX_IN_PROGRESS_GLOBAL, "table should be full");
+
+        // A structurally valid header from a new sender whose body is too
+        // short to derive a chunk_size is rejected by derive_initial_chunk_size.
+        let bad_header = ChunkHeader {
+            packet_type: PacketType::Data,
+            last_in_stream: false,
+            message_id: 0xFEED_F00D,
+            codec: VoiceCodec::Opus,
+            codec_param: 16,
+            stream_seq: 0,
+            chunk_index: 0,
+            total_data: 3,
+            parity_count: 0,
+        };
+        let mut bad = bad_header.serialize().to_vec();
+        bad.extend_from_slice(&[0u8; 4]); // below MIN_CHUNK_SIZE
+        let res = asm.accept("!newsender", unicast_dest(), 0, &bad);
+        assert!(matches!(res, AssemblyEvent::Rejected(_)), "got {res:?}");
+        assert_eq!(
+            asm.inner.lock().in_progress.len(),
+            MAX_IN_PROGRESS_GLOBAL,
+            "a rejected frame must not have evicted any in-progress assembly"
+        );
+        assert!(
+            asm.inner.lock().blacklist.is_empty(),
+            "a rejected frame must not have blacklisted any assembly"
+        );
     }
 }

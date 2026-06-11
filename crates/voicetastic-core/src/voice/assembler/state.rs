@@ -182,6 +182,21 @@ pub(super) struct AssemblerInner {
     pub(super) blacklist: Vec<(SenderKey, Instant)>,
 }
 
+impl AssemblerInner {
+    /// Decrement the per-sender in-progress count, dropping the entry once it
+    /// reaches zero. The key is the remote-controlled sender id, so leaving
+    /// zero entries behind would let a peer cycling spoofed ids grow this map
+    /// without bound for the life of the process.
+    pub(super) fn per_sender_dec(&mut self, from: &Arc<str>) {
+        if let Some(cnt) = self.per_sender.get_mut(from) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                self.per_sender.remove(from);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
