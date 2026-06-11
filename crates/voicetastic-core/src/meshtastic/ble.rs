@@ -446,8 +446,14 @@ impl Connection {
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
         let max = self.max_tx_payload();
         if bytes.len() > max {
-            warn!(len = bytes.len(), max, "BLE write_to_radio: payload exceeds ATT MTU limit");
-            return Err(Error::PayloadTooLarge { len: bytes.len(), max });
+            warn!(
+                len = bytes.len(),
+                max, "BLE write_to_radio: payload exceeds ATT MTU limit"
+            );
+            return Err(Error::PayloadTooLarge {
+                len: bytes.len(),
+                max,
+            });
         }
         let _g = self.write_lock.lock().await;
         let kind = if self

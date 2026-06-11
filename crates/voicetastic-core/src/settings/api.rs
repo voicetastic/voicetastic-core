@@ -626,8 +626,7 @@ pub fn theme_contrast_kind_from_id(s: &str) -> Option<ThemeContrastKind> {
 
 impl Default for ThemeContrastKind {
     fn default() -> Self {
-        Self::from_id(DEFAULT_THEME_CONTRAST)
-            .expect("DEFAULT_THEME_CONTRAST is always a valid id")
+        Self::from_id(DEFAULT_THEME_CONTRAST).expect("DEFAULT_THEME_CONTRAST is always a valid id")
     }
 }
 
@@ -865,8 +864,10 @@ impl SettingsApi {
             Some(p) => read_settings_at(&p),
             None => (AppSettings::default(), LoadStatus::Clean),
         };
-        self.degraded
-            .store(status == LoadStatus::Degraded, std::sync::atomic::Ordering::Relaxed);
+        self.degraded.store(
+            status == LoadStatus::Degraded,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         *self.inner.write() = data;
         for k in SettingKey::all() {
             self.notify(*k);
@@ -1487,11 +1488,14 @@ impl SettingsApi {
 }
 
 fn parse_u32(key: SettingKey, value: &str) -> SettingsResult<u32> {
-    value.trim().parse::<u32>().map_err(|e| SettingsError::Invalid {
-        key: key.id(),
-        value: value.to_string(),
-        reason: e.to_string(),
-    })
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| SettingsError::Invalid {
+            key: key.id(),
+            value: value.to_string(),
+            reason: e.to_string(),
+        })
 }
 
 fn parse_bool(key: SettingKey, value: &str) -> SettingsResult<bool> {
@@ -1566,7 +1570,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let api = SettingsApi::open_at(Some(path));
-        assert!(!api.is_degraded(), "missing file must be Clean not Degraded");
+        assert!(
+            !api.is_degraded(),
+            "missing file must be Clean not Degraded"
+        );
     }
 
     #[test]
@@ -1580,7 +1587,10 @@ mod tests {
         assert!(api.is_degraded(), "unreadable file must be Degraded");
         // A setter should back up the broken file and write a valid one.
         api.set_voice_codec(VoiceCodecKind::Opus).unwrap();
-        assert!(!api.is_degraded(), "degraded flag must clear after successful persist");
+        assert!(
+            !api.is_degraded(),
+            "degraded flag must clear after successful persist"
+        );
         // The new config file must be valid.
         let api2 = SettingsApi::open_at(Some(path.clone()));
         assert!(!api2.is_degraded());
@@ -1616,7 +1626,10 @@ mod tests {
         // Simulate user manually fixing the file.
         std::fs::write(&path, b"").unwrap(); // empty = valid defaults TOML
         api.reload();
-        assert!(!api.is_degraded(), "reload with valid file must clear degraded");
+        assert!(
+            !api.is_degraded(),
+            "reload with valid file must clear degraded"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1639,7 +1652,10 @@ mod tests {
                 let s = name.to_string_lossy();
                 s.starts_with(stem.as_ref()) && s.contains(".tmp")
             });
-        assert!(!has_tmp, "no .tmp sibling should remain after a successful persist");
+        assert!(
+            !has_tmp,
+            "no .tmp sibling should remain after a successful persist"
+        );
         let _ = std::fs::remove_file(&config);
     }
 
@@ -1667,8 +1683,8 @@ mod tests {
     #[cfg(unix)]
     fn listener_fires_even_when_persist_fails() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir()
-            .join(format!("voicetastic-notify-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("voicetastic-notify-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -1682,13 +1698,20 @@ mod tests {
         let result = api.set_voice_codec(VoiceCodecKind::AmrNb);
         // Restore permissions before any assertion so cleanup always runs.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(result.is_err(), "persist should have failed on read-only dir");
+        assert!(
+            result.is_err(),
+            "persist should have failed on read-only dir"
+        );
         assert_eq!(
             c.0.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "listener must fire even when persist errors"
         );
-        assert_eq!(api.voice_codec(), VoiceCodecKind::AmrNb, "memory must be updated");
+        assert_eq!(
+            api.voice_codec(),
+            VoiceCodecKind::AmrNb,
+            "memory must be updated"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

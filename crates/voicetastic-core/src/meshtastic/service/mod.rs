@@ -98,10 +98,7 @@ const RECONNECT_STABILITY_WINDOW: Duration = Duration::from_secs(60);
 /// Returns `true` if a connection established at `connected_at` was stable
 /// long enough to justify resetting the reconnect backoff campaign.
 #[cfg(any(feature = "serial-tokio", feature = "ble-btleplug"))]
-fn campaign_should_reset(
-    connected_at: Option<std::time::Instant>,
-    window: Duration,
-) -> bool {
+fn campaign_should_reset(connected_at: Option<std::time::Instant>, window: Duration) -> bool {
     connected_at.is_some_and(|t| t.elapsed() >= window)
 }
 
@@ -337,10 +334,7 @@ impl MeshtasticService {
                     // Reset backoff if the connection that just dropped had
                     // been stable long enough; otherwise continue the current
                     // campaign's longer delays (anti-flap).
-                    if campaign_should_reset(
-                        last_connected_at.take(),
-                        RECONNECT_STABILITY_WINDOW,
-                    ) {
+                    if campaign_should_reset(last_connected_at.take(), RECONNECT_STABILITY_WINDOW) {
                         policy.reset();
                     }
                     loop {
@@ -1202,7 +1196,10 @@ mod tests {
         // No prior connect: don't reset.
         assert!(!campaign_should_reset(None, window));
         // Connected just now: not stable yet.
-        assert!(!campaign_should_reset(Some(std::time::Instant::now()), window));
+        assert!(!campaign_should_reset(
+            Some(std::time::Instant::now()),
+            window
+        ));
         // Connected long enough ago: reset.
         let old = std::time::Instant::now()
             .checked_sub(window + Duration::from_millis(1))
@@ -1225,9 +1222,7 @@ mod tests {
     impl Transport for MockTransport {
         async fn write_to_radio(&self, _bytes: &[u8]) -> crate::error::Result<()> {
             if self.fail_writes {
-                return Err(crate::error::Error::Other(
-                    "mock write failure".to_string(),
-                ));
+                return Err(crate::error::Error::Other("mock write failure".to_string()));
             }
             Ok(())
         }
@@ -1344,8 +1339,10 @@ mod tests {
             .expect("connect");
 
         // Arm reconnect_config as connect_by_address/serial would.
-        *svc.inner.reconnect_config.lock().await =
-            Some(ReconnectConfig::Serial { path: "/dev/fake".into(), baud: 115200 });
+        *svc.inner.reconnect_config.lock().await = Some(ReconnectConfig::Serial {
+            path: "/dev/fake".into(),
+            baud: 115200,
+        });
 
         svc.disconnect().await.expect("disconnect");
 

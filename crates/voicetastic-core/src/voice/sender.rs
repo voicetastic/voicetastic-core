@@ -1066,8 +1066,7 @@ mod tests {
         use crate::voice::assembler::AssemblerConfig;
         use crate::voice::outgoing::DEFAULT_RETAIN_TTL;
         assert_eq!(
-            DEFAULT_LINGER,
-            DEFAULT_RETAIN_TTL,
+            DEFAULT_LINGER, DEFAULT_RETAIN_TTL,
             "sender linger must equal outgoing registry retain TTL"
         );
         assert_eq!(

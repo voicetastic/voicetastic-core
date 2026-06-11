@@ -373,7 +373,13 @@ mod tests {
         cfg.parity_count = 100;
         let err = build_message(&audio, &cfg).expect_err("should reject");
         assert!(
-            matches!(err, VoiceError::TooManyShards { data: 200, parity: 100 }),
+            matches!(
+                err,
+                VoiceError::TooManyShards {
+                    data: 200,
+                    parity: 100
+                }
+            ),
             "got {err:?}"
         );
     }

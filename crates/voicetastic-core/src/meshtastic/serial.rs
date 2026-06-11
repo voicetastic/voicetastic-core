@@ -105,7 +105,10 @@ impl SerialConnection {
     /// The caller sees [`Error::WriteTimeout`] and should retry or reconnect.
     pub async fn write_to_radio(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_PAYLOAD {
-            return Err(Error::PayloadTooLarge { len: bytes.len(), max: MAX_PAYLOAD });
+            return Err(Error::PayloadTooLarge {
+                len: bytes.len(),
+                max: MAX_PAYLOAD,
+            });
         }
         let len = bytes.len() as u16;
         let header = [START1, START2, (len >> 8) as u8, (len & 0xFF) as u8];

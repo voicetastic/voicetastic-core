@@ -1019,8 +1019,7 @@ mod tests {
         let peer_public =
             hex::decode("db18fc50eea47f00251cb784819a3cf5fc361882597f589f0d7ff820e8064457")
                 .unwrap();
-        let ciphertext =
-            hex::decode("40df24abfcc30a17a3d9046726099e796a1c036a792b").unwrap();
+        let ciphertext = hex::decode("40df24abfcc30a17a3d9046726099e796a1c036a792b").unwrap();
         let mut nodes = HashMap::new();
         nodes.insert(
             sender,

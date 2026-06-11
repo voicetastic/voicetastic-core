@@ -574,10 +574,7 @@ fn validate_template(state: &AssemblyState, header: &ChunkHeader) -> Result<()> 
 fn pin_chunk_size(state: &mut AssemblyState, len: usize) -> Result<()> {
     match state.chunk_size {
         Some(expected) if len != expected => {
-            return Err(VoiceError::BodyLenMismatch {
-                got: len,
-                expected,
-            });
+            return Err(VoiceError::BodyLenMismatch { got: len, expected });
         }
         None => {
             if !(MIN_CHUNK_SIZE..=MAX_BODY_SIZE).contains(&len) {
@@ -708,7 +705,10 @@ mod tests {
         assert!(
             matches!(
                 res,
-                AssemblyEvent::Rejected(VoiceError::TooManyShards { data: 200, parity: 100 })
+                AssemblyEvent::Rejected(VoiceError::TooManyShards {
+                    data: 200,
+                    parity: 100
+                })
             ),
             "got {res:?}"
         );
@@ -1100,8 +1100,11 @@ mod tests {
         // Fill the global table to capacity with valid first frames from
         // distinct senders (16 senders × 4 messages = 64 = the per-sender
         // cap × global cap).
-        let enc = build_message(&(0..(64 * 3)).map(|i| (i & 0xff) as u8).collect::<Vec<_>>(), &cfg(0))
-            .unwrap();
+        let enc = build_message(
+            &(0..(64 * 3)).map(|i| (i & 0xff) as u8).collect::<Vec<_>>(),
+            &cfg(0),
+        )
+        .unwrap();
         // Parse the template frame once (valid MAC) to read its fields and body.
         // Each fill frame is then built from a fresh ChunkHeader so the new MAC
         // is computed over the correct bytes; patching bytes [2..6] after
@@ -1113,7 +1116,10 @@ mod tests {
             let from = format!("!{s:08x}");
             for m in 0..MAX_IN_PROGRESS_PER_SENDER {
                 // Distinct non-zero message_id per (sender, slot).
-                let h = ChunkHeader { message_id: 0x0100_0000 | s << 8 | m as u32, ..tmpl };
+                let h = ChunkHeader {
+                    message_id: 0x0100_0000 | s << 8 | m as u32,
+                    ..tmpl
+                };
                 let mut rebuilt = h.serialize().to_vec();
                 rebuilt.extend_from_slice(&body_bytes);
                 let _ = asm.accept(&from, unicast_dest(), 0, &rebuilt);
@@ -1201,7 +1207,10 @@ mod tests {
         {
             let inner = asm.inner.lock();
             let state = inner.in_progress.values().next().unwrap();
-            assert!(state.data_shards[2].is_some(), "oversized final shard must be stored");
+            assert!(
+                state.data_shards[2].is_some(),
+                "oversized final shard must be stored"
+            );
             assert_eq!(state.received_data, 1);
             assert!(state.chunk_size.is_none(), "chunk_size not yet pinned");
         }
@@ -1212,10 +1221,23 @@ mod tests {
         {
             let inner = asm.inner.lock();
             let state = inner.in_progress.values().next().unwrap();
-            assert_eq!(state.chunk_size, Some(64), "chunk_size must be pinned after non-final chunk");
-            assert!(state.data_shards[2].is_none(), "oversized final shard must be evicted");
-            assert_eq!(state.received_data, 1, "received_data decremented after eviction");
-            assert!(state.last_data_len.is_none(), "last_data_len cleared after eviction");
+            assert_eq!(
+                state.chunk_size,
+                Some(64),
+                "chunk_size must be pinned after non-final chunk"
+            );
+            assert!(
+                state.data_shards[2].is_none(),
+                "oversized final shard must be evicted"
+            );
+            assert_eq!(
+                state.received_data, 1,
+                "received_data decremented after eviction"
+            );
+            assert!(
+                state.last_data_len.is_none(),
+                "last_data_len cleared after eviction"
+            );
         }
 
         // Deliver the remaining real chunks; message completes with the correct audio.
@@ -1227,6 +1249,9 @@ mod tests {
             other => panic!("expected Complete, got {other:?}"),
         };
         assert!(m.is_complete);
-        assert_eq!(m.audio, audio, "audio must round-trip correctly after shard eviction");
+        assert_eq!(
+            m.audio, audio,
+            "audio must round-trip correctly after shard eviction"
+        );
     }
 }

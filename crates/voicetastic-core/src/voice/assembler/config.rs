@@ -275,5 +275,4 @@ mod tests {
         assert!(cfg.dead_sender_timeout <= cfg.message_timeout);
         assert!(cfg.completion_memory >= cfg.message_timeout);
     }
-
 }

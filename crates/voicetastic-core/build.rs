@@ -14,16 +14,14 @@ fn build() -> BuildResult<()> {
     // Verify protoc is available before doing any work so the user gets a
     // friendly diagnostic instead of a panic from prost-build.
     if Command::new("protoc").arg("--version").output().is_err() {
-        return Err(
-            "`protoc` was not found in PATH.\n\
+        return Err("`protoc` was not found in PATH.\n\
              hint: install the Protocol Buffers compiler and initialise the proto submodule:\n\
              \n\
              Debian/Ubuntu:  sudo apt install protobuf-compiler\n\
              Homebrew:       brew install protobuf\n\
              \n\
              Then run: git submodule update --init --recursive"
-                .into(),
-        );
+            .into());
     }
 
     // When the `codecs` feature is enabled, the native AMR-NB encoder/decoder

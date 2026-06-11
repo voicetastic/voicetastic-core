@@ -362,7 +362,6 @@ impl AppSettings {
             _ => DEFAULT_THEME_CONTRAST,
         }
     }
-
 }
 
 /// Resolve `$XDG_CONFIG_HOME/voicetastic/config.toml`, falling back to

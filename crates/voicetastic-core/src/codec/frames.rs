@@ -220,7 +220,10 @@ mod tests {
     #[test]
     fn amrnb_frame_bytes_reserved_are_none() {
         for mode in 9..=14 {
-            assert!(AMRNB_FRAME_BYTES[mode].is_none(), "mode {mode} should be None");
+            assert!(
+                AMRNB_FRAME_BYTES[mode].is_none(),
+                "mode {mode} should be None"
+            );
         }
     }
 

@@ -4413,6 +4413,7 @@ dependencies = [
  "opus",
  "opus-decoder",
  "parking_lot 0.12.5",
+ "pkg-config",
  "prost",
  "prost-build",
  "reed-solomon-erasure",

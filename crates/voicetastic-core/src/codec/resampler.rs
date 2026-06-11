@@ -77,11 +77,19 @@ impl Resampler {
             let coeffs = hamming_sinc_coeffs(cutoff);
             let mut history = Vec::with_capacity(TAPS - 1);
             history.resize(TAPS - 1, 0.0f32);
-            Some(FirState { coeffs, history, scratch: Vec::new() })
+            Some(FirState {
+                coeffs,
+                history,
+                scratch: Vec::new(),
+            })
         } else {
             None
         };
-        Self { ratio, cursor: 0.0, fir }
+        Self {
+            ratio,
+            cursor: 0.0,
+            fir,
+        }
     }
 
     /// Resample `input` and *append* the output samples to `dst`.
