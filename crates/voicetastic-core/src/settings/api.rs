@@ -335,15 +335,19 @@ impl VoiceFecMode {
     /// rely on NACK recovery. `preset` is consulted only for `Auto` on
     /// unicast; manual modes ignore it.
     ///
-    /// Returned value is clamped to `[0, min(total_data, MAX_PARITY_PER_MESSAGE)]`
-    /// so callers never need to re-check the protocol cap.
+    /// Returned value is clamped to
+    /// `[0, min(total_data, MAX_PARITY_PER_MESSAGE, MAX_TOTAL_SHARDS - total_data)]`
+    /// so callers never need to re-check the protocol cap — including the
+    /// Reed-Solomon `data + parity <= 256` limit, which `total_data` near the
+    /// `MAX_CHUNKS_PER_MESSAGE` ceiling would otherwise blow past on a 50 %
+    /// (broadcast / Heavy) parity ratio.
     pub fn resolve(
         self,
         broadcast: bool,
         preset: Option<crate::voice::ModemPreset>,
         total_data: usize,
     ) -> u8 {
-        use crate::voice::{MAX_PARITY_PER_MESSAGE, ModemPreset};
+        use crate::voice::{MAX_PARITY_PER_MESSAGE, MAX_TOTAL_SHARDS, ModemPreset};
         let pct = match (self, broadcast) {
             (Self::Off, _) => 0,
             (Self::Light, _) => 10,
@@ -365,7 +369,10 @@ impl VoiceFecMode {
             },
         };
         let raw = (total_data * pct).div_ceil(100);
-        let cap = total_data.min(MAX_PARITY_PER_MESSAGE).min(u8::MAX as usize);
+        let cap = total_data
+            .min(MAX_PARITY_PER_MESSAGE)
+            .min(MAX_TOTAL_SHARDS.saturating_sub(total_data))
+            .min(u8::MAX as usize);
         raw.min(cap) as u8
     }
 }
@@ -646,12 +653,30 @@ mod policy_tests {
     }
 
     #[test]
-    fn fec_resolve_caps_at_max_parity() {
-        // 50% of 255 (max total_data) ceils to 128 — exactly the protocol
-        // cap. Any larger total_data is impossible (u8 wraps), so this is
-        // the edge that exercises the cap clamp.
+    fn fec_resolve_caps_at_rs_sum_limit() {
+        use crate::voice::MAX_TOTAL_SHARDS;
+        // At the max total_data, the RS `data + parity <= 256` limit leaves
+        // room for only one parity shard, even though Heavy asks for 50%.
         let p = VoiceFecMode::Heavy.resolve(false, None, 255);
-        assert_eq!(p as usize, crate::voice::MAX_PARITY_PER_MESSAGE);
+        assert_eq!(p, 1);
+        assert!(255 + p as usize <= MAX_TOTAL_SHARDS);
+    }
+
+    #[test]
+    fn fec_auto_broadcast_never_exceeds_rs_limit() {
+        use crate::voice::MAX_TOTAL_SHARDS;
+        // Auto broadcast forces 50% parity — the worst case for the RS sum.
+        // No total_data may produce data + parity > 256.
+        for total_data in 1..=255usize {
+            let p = VoiceFecMode::Auto.resolve(true, None, total_data) as usize;
+            assert!(
+                total_data + p <= MAX_TOTAL_SHARDS,
+                "total_data={total_data} parity={p} exceeds RS limit"
+            );
+        }
+        // Spot-check the historical failure point: 171 data + 50% would be 86
+        // (= 257), now clamped to 85.
+        assert_eq!(VoiceFecMode::Auto.resolve(true, None, 171), 85);
     }
 
     #[test]

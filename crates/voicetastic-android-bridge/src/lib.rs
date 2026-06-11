@@ -45,6 +45,8 @@ pub enum VoiceError {
     BadTotal,
     #[error("parity_count exceeds MAX_PARITY_PER_MESSAGE")]
     TooMuchParity,
+    #[error("data + parity shards exceed Reed-Solomon limit of 256")]
+    TooManyShards,
     #[error("chunk_index out of range")]
     BadIndex,
     #[error("audio too large for one message")]
@@ -96,6 +98,7 @@ impl From<v::VoiceError> for VoiceError {
             v::VoiceError::ZeroMessageId => Self::ZeroMessageId,
             v::VoiceError::BadTotal(_) => Self::BadTotal,
             v::VoiceError::TooMuchParity(_) => Self::TooMuchParity,
+            v::VoiceError::TooManyShards { .. } => Self::TooManyShards,
             v::VoiceError::BadIndex { .. } => Self::BadIndex,
             v::VoiceError::AudioTooLarge { .. } => Self::AudioTooLarge,
             v::VoiceError::ChunkTooSmall(_) => Self::ChunkTooSmall,

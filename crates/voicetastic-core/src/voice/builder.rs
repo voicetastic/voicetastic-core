@@ -4,7 +4,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use super::consts::{
     HEADER_SIZE, MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE,
-    MIN_CHUNK_SIZE,
+    MAX_TOTAL_SHARDS, MIN_CHUNK_SIZE,
 };
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
@@ -75,6 +75,12 @@ pub fn build_message(audio: &[u8], cfg: &BuildConfig) -> Result<EncodedMessage> 
     }
     if cfg.parity_count as usize > MAX_PARITY_PER_MESSAGE {
         return Err(VoiceError::TooMuchParity(cfg.parity_count));
+    }
+    if total_data_usize + cfg.parity_count as usize > MAX_TOTAL_SHARDS {
+        return Err(VoiceError::TooManyShards {
+            data: total_data_usize as u8,
+            parity: cfg.parity_count,
+        });
     }
 
     let total_data = total_data_usize as u8;
@@ -354,5 +360,35 @@ mod tests {
         let msg = build_message(&audio, &cfg).expect("should build");
 
         assert_eq!(msg.total_data as usize, MAX_CHUNKS_PER_MESSAGE - 1);
+    }
+
+    #[test]
+    fn error_data_plus_parity_exceeds_rs_limit() {
+        // 200 data chunks + 100 parity = 300 > 256: the RS coder cannot
+        // build this even though each count is individually in range.
+        let chunk_size = 16;
+        let audio = vec![42u8; chunk_size * 200];
+        let mut cfg = base_config();
+        cfg.chunk_size = chunk_size;
+        cfg.parity_count = 100;
+        let err = build_message(&audio, &cfg).expect_err("should reject");
+        assert!(
+            matches!(err, VoiceError::TooManyShards { data: 200, parity: 100 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn data_plus_parity_at_rs_limit_builds() {
+        // 128 data + 128 parity = 256: exactly the limit, must succeed.
+        let chunk_size = 16;
+        let audio = vec![42u8; chunk_size * 128];
+        let mut cfg = base_config();
+        cfg.chunk_size = chunk_size;
+        cfg.parity_count = 128;
+        let msg = build_message(&audio, &cfg).expect("256 shards is the limit");
+        assert_eq!(msg.total_data, 128);
+        assert_eq!(msg.parity_count, 128);
+        assert_eq!(msg.frames.len(), 256);
     }
 }

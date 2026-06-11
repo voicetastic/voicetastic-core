@@ -24,6 +24,8 @@ pub enum VoiceError {
     BadTotal(u8),
     #[error("parity_count {0} exceeds MAX_PARITY_PER_MESSAGE")]
     TooMuchParity(u8),
+    #[error("data + parity shards ({data} + {parity}) exceed Reed-Solomon limit of 256")]
+    TooManyShards { data: u8, parity: u8 },
     #[error("chunk_index {idx} out of range for total {total}")]
     BadIndex { idx: u8, total: u8 },
     #[error("audio too large: {bytes} B exceeds maximum {max} B per message")]

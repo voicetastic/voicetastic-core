@@ -21,7 +21,8 @@ use parking_lot::Mutex;
 use tracing::{debug, warn};
 
 use super::consts::{
-    MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MIN_CHUNK_SIZE,
+    MAX_BODY_SIZE, MAX_IN_PROGRESS_GLOBAL, MAX_IN_PROGRESS_PER_SENDER, MAX_TOTAL_SHARDS,
+    MIN_CHUNK_SIZE,
 };
 use super::error::{Result, VoiceError};
 use super::header::ChunkHeader;
@@ -174,6 +175,16 @@ impl VoiceAssembler {
             && !allow.contains(&header.codec)
         {
             return Err(VoiceError::UnsupportedCodec(header.codec));
+        }
+        // A header advertising data + parity > 256 can never be FEC-decoded
+        // (the RS coder rejects the combination). Reject every such frame
+        // before we create or touch a slot — this also guards the
+        // parity-growth resize branch below, since it runs on every frame.
+        if header.total_data as usize + header.parity_count as usize > MAX_TOTAL_SHARDS {
+            return Err(VoiceError::TooManyShards {
+                data: header.total_data,
+                parity: header.parity_count,
+            });
         }
 
         // V3 carries plaintext bodies (Meshtastic channel encryption
@@ -651,6 +662,36 @@ mod tests {
     /// `VoiceDestination::Broadcast` directly.
     fn unicast_dest() -> VoiceDestination {
         VoiceDestination::Node(NodeId::from_u32(0xDEAD_BEEF))
+    }
+
+    #[test]
+    fn rejects_frame_with_data_plus_parity_over_rs_limit() {
+        // A header advertising 200 + 100 = 300 shards can never be
+        // FEC-decoded; the frame must be rejected without creating a slot.
+        let header = ChunkHeader {
+            packet_type: PacketType::Data,
+            last_in_stream: false,
+            message_id: 0xCAFEBABE,
+            codec: VoiceCodec::Opus,
+            codec_param: 16,
+            stream_seq: 0,
+            chunk_index: 0,
+            total_data: 200,
+            parity_count: 100,
+        };
+        let mut frame = header.serialize().to_vec();
+        frame.extend_from_slice(&[0u8; 64]);
+
+        let asm = VoiceAssembler::new(AssemblerConfig::default());
+        let res = asm.accept("!cc", unicast_dest(), 0, &frame);
+        assert!(
+            matches!(
+                res,
+                AssemblyEvent::Rejected(VoiceError::TooManyShards { data: 200, parity: 100 })
+            ),
+            "got {res:?}"
+        );
+        assert!(asm.inner.lock().in_progress.is_empty());
     }
 
     #[test]

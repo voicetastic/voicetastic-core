@@ -116,6 +116,7 @@ enum VoiceError {
     "ZeroMessageId",
     "BadTotal",
     "TooMuchParity",
+    "TooManyShards",
     "BadIndex",
     "AudioTooLarge",
     "ChunkTooSmall",
