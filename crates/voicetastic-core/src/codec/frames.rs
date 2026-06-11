@@ -72,6 +72,8 @@ impl<'a> AmrnbFrames<'a> {
 
     /// Bytes not yet consumed. Non-zero after iteration only when the stream
     /// contained a reserved frame type or a truncated payload.
+    // Called from feature-gated decode code in imp.rs; suppress dead_code lint.
+    #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
@@ -118,6 +120,8 @@ impl<'a> OpusPackets<'a> {
     /// Bytes not yet consumed. Non-zero after full iteration only when the
     /// stream ended with a truncated packet (length prefix present but payload
     /// shorter than declared).
+    // Called from feature-gated decode code in imp.rs; suppress dead_code lint.
+    #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.data.len() - self.pos
     }
