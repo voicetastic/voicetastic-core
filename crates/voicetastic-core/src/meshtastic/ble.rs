@@ -43,6 +43,9 @@ pub const SERVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delay after `connect` before issuing `discover_services`. BlueZ needs a
 /// brief window to flip `ServicesResolved` after the link comes up.
 pub const POST_CONNECT_DELAY: Duration = Duration::from_millis(500);
+/// Give up draining after this many consecutive failures. Mirrors the serial
+/// reader tolerance in `serial.rs`.
+const MAX_CONSECUTIVE_DRAIN_ERRORS: usize = 5;
 
 /// A peripheral discovered during scanning.
 #[derive(Debug, Clone)]
@@ -55,6 +58,10 @@ pub struct DiscoveredDevice {
 /// Top-level BLE manager wrapper.
 pub struct BleManager {
     adapter: Adapter,
+    /// Monotonically-increasing counter bumped by [`Self::stop_scan`] so
+    /// every live forwarding task spawned by [`Self::scan`] can observe the
+    /// stop signal even if the underlying event stream doesn't drain promptly.
+    scan_stop: watch::Sender<u64>,
     /// Linux-only in-process BlueZ pairing agent. When present, the
     /// `prepare_link` path drives pairing over DBus on the same
     /// connection the agent is registered on, so passkey prompts come
@@ -85,8 +92,10 @@ impl BleManager {
             }
         };
 
+        let (scan_stop, _) = watch::channel(0u64);
         Ok(Self {
             adapter,
+            scan_stop,
             #[cfg(target_os = "linux")]
             pairing,
             #[cfg(target_os = "linux")]
@@ -161,35 +170,45 @@ impl BleManager {
         }
         let events = self.adapter.events().await?;
         let adapter = self.adapter.clone();
+        let mut stop_rx = self.scan_stop.subscribe();
         tokio::spawn(async move {
             let mut events = events;
-            while let Some(ev) = events.next().await {
-                let id = match ev {
-                    CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => id,
-                    _ => continue,
-                };
-                if !seen.insert(id.clone()) {
-                    continue;
-                }
-                let Ok(p) = adapter.peripheral(&id).await else {
-                    continue;
-                };
-                let props = p.properties().await.ok().flatten();
-                // The scan filter is best-effort on some BlueZ versions;
-                // double-check the service UUID is actually advertised.
-                let has_service = props
-                    .as_ref()
-                    .map(|p| p.services.contains(&SERVICE_UUID))
-                    .unwrap_or(false);
-                if !has_service {
-                    continue;
-                }
-                let name = props.as_ref().and_then(|p| p.local_name.clone());
-                let address = p.address().to_string();
-                let dev = DiscoveredDevice { id, name, address };
-                debug!(address = %dev.address, name = ?dev.name, "advertised Meshtastic peripheral");
-                if tx.send(dev).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    _ = stop_rx.changed() => break,
+                    ev = events.next() => {
+                        let Some(ev) = ev else { break };
+                        let id = match ev {
+                            CentralEvent::DeviceDiscovered(id)
+                            | CentralEvent::DeviceUpdated(id) => id,
+                            _ => continue,
+                        };
+                        if !seen.insert(id.clone()) {
+                            continue;
+                        }
+                        let Ok(p) = adapter.peripheral(&id).await else {
+                            continue;
+                        };
+                        let props = p.properties().await.ok().flatten();
+                        // The scan filter is best-effort on some BlueZ versions;
+                        // double-check the service UUID is actually advertised.
+                        let has_service = props
+                            .as_ref()
+                            .map(|p| p.services.contains(&SERVICE_UUID))
+                            .unwrap_or(false);
+                        if !has_service {
+                            continue;
+                        }
+                        let name = props.as_ref().and_then(|p| p.local_name.clone());
+                        let address = p.address().to_string();
+                        let dev = DiscoveredDevice { id, name, address };
+                        debug!(address = %dev.address, name = ?dev.name, "advertised Meshtastic peripheral");
+                        if tx.send(dev).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -200,6 +219,7 @@ impl BleManager {
     /// when no scan is running.
     pub async fn stop_scan(&self) -> Result<()> {
         let _ = self.adapter.stop_scan().await;
+        self.scan_stop.send_modify(|v| *v += 1);
         Ok(())
     }
 
@@ -481,38 +501,16 @@ impl Connection {
 
     /// Subscribe to inbound `FROMRADIO` payloads.
     ///
-    /// Spawns a background task that drains on every `FROMNUM` notify and
-    /// re-polls every [`POLL_INTERVAL`] as a safety net. Both spawned tasks
-    /// observe the [`Connection::disconnect`] signal and exit promptly.
+    /// Spawns a single background task that drains on every `FROMNUM` notify
+    /// and re-polls every [`POLL_INTERVAL`] as a safety net. Using one task
+    /// ensures ordering: `ConfigComplete` can never overtake config sections.
+    /// The task exits (dropping `tx`, causing reader EOF) after
+    /// [`MAX_CONSECUTIVE_DRAIN_ERRORS`] consecutive drain failures.
     pub async fn subscribe_inbound(self: Arc<Self>) -> Result<mpsc::Receiver<Vec<u8>>> {
         let (tx, rx) = mpsc::channel(64);
         let conn = self.clone();
         let mut notifs = conn.peripheral.notifications().await?;
-        let tx_notify = tx.clone();
-        let conn_notify = conn.clone();
-        let mut shutdown_notify = conn.shutdown.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = shutdown_notify.changed() => return,
-                    n = notifs.next() => {
-                        let Some(n) = n else { return };
-                        if n.uuid == FROMNUM_UUID
-                            && let Ok(payloads) = conn_notify.drain_from_radio().await
-                        {
-                            for p in payloads {
-                                if tx_notify.send(p).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        let conn_poll = conn;
-        let mut shutdown_poll = conn_poll.shutdown.subscribe();
+        let mut shutdown = conn.shutdown.subscribe();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(POLL_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -523,26 +521,45 @@ impl Connection {
             // pre-session read is answered with ATT 0x0e ("Unlikely Error")
             // and a link tear-down. Consume the immediate tick so the first
             // real poll happens one POLL_INTERVAL after subscribe_inbound
-            // returns — by which point the service layer has issued its
+            // returns - by which point the service layer has issued its
             // initial TORADIO write.
             interval.tick().await;
+            let mut consecutive_errors: usize = 0;
             loop {
-                tokio::select! {
+                let from_notify = tokio::select! {
                     biased;
-                    _ = shutdown_poll.changed() => return,
-                    _ = interval.tick() => {
-                        match conn_poll.drain_from_radio().await {
-                            Ok(payloads) => {
-                                for p in payloads {
-                                    if tx.send(p).await.is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                warn!(?e, "FROMRADIO poll failed");
+                    _ = shutdown.changed() => return,
+                    _ = tx.closed() => return,
+                    n = notifs.next() => {
+                        let Some(n) = n else { return };
+                        if n.uuid != FROMNUM_UUID {
+                            // Non-FROMNUM characteristic notify; nothing to drain.
+                            continue;
+                        }
+                        true
+                    }
+                    _ = interval.tick() => false,
+                };
+                match conn.drain_from_radio().await {
+                    Ok(payloads) => {
+                        consecutive_errors = 0;
+                        if from_notify {
+                            // Reset the safety-net timer so we don't immediately
+                            // poll again right after a notify-triggered drain.
+                            interval.reset();
+                        }
+                        for p in payloads {
+                            if tx.send(p).await.is_err() {
                                 return;
                             }
+                        }
+                    }
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        warn!(?e, consecutive_errors, "FROMRADIO drain failed");
+                        if consecutive_errors >= MAX_CONSECUTIVE_DRAIN_ERRORS {
+                            warn!("too many consecutive FROMRADIO drain errors, giving up");
+                            return;
                         }
                     }
                 }
