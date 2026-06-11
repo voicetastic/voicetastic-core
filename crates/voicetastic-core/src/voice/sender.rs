@@ -68,14 +68,16 @@ use crate::voice::nack::parse_nack_body;
 use crate::voice::outgoing::{DeferOutcome, OutgoingVoiceRegistry, RetransmitSkipReason};
 use crate::voice::types::{ModemPreset, PacketType, VoiceCodec};
 
-/// Default linger window after the initial burst. Matches the
-/// receiver-side `AssemblerConfig::message_timeout` default (10 min)
-/// so the sender stays alive to service NACK rounds for as long as the
-/// receiver is willing to try. The previous value of 60 s was too short
-/// for slow modem presets: on LongFast (900 ms pacing) a 155-frame burst
-/// alone takes ~140 s, leaving only a 60 s window for potentially dozens
-/// of NACK rounds, each subject to a multi-second retransmit cooldown.
-pub const DEFAULT_LINGER: Duration = Duration::from_secs(600);
+/// Default linger window after the initial burst. Kept in sync with
+/// `DEFAULT_RETAIN_TTL` (the outgoing registry's retain TTL) and the
+/// receiver-side `AssemblerConfig::message_timeout` default so the
+/// sender stays alive to service NACK rounds for as long as the receiver
+/// is willing to try, and the registry keeps the chunks available for the
+/// full duration. The previous value of 600 s was too short: on LongFast
+/// (900 ms pacing) a 155-frame burst alone takes ~140 s, and subsequent
+/// NACK recovery rounds with multi-second cooldowns can easily consume
+/// another 600 s before all missing chunks arrive.
+pub const DEFAULT_LINGER: Duration = crate::voice::outgoing::DEFAULT_RETAIN_TTL;
 
 /// Upper bound on how long `run_send` waits, after the linger window, for
 /// any still-scheduled retransmit batches to drain before emitting
@@ -1053,6 +1055,26 @@ mod tests {
     fn nack_source_allowed_broadcast_rejects_all() {
         assert!(!nack_source_allowed(None, 7));
         assert!(!nack_source_allowed(None, 0));
+    }
+
+    /// DEFAULT_LINGER, DEFAULT_RETAIN_TTL, and the AssemblerConfig
+    /// message_timeout default must all be equal so the sender stays alive
+    /// to service every NACK round the receiver will attempt, and the
+    /// outgoing registry keeps chunks available for the whole window.
+    #[test]
+    fn linger_retain_ttl_and_timeout_are_aligned() {
+        use crate::voice::assembler::AssemblerConfig;
+        use crate::voice::outgoing::DEFAULT_RETAIN_TTL;
+        assert_eq!(
+            DEFAULT_LINGER,
+            DEFAULT_RETAIN_TTL,
+            "sender linger must equal outgoing registry retain TTL"
+        );
+        assert_eq!(
+            DEFAULT_LINGER,
+            AssemblerConfig::default().message_timeout,
+            "sender linger must equal assembler default message_timeout"
+        );
     }
 
     #[test]

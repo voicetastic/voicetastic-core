@@ -36,14 +36,6 @@ pub const MAX_TOTAL_SHARDS: usize = 256;
 pub const MAX_IN_PROGRESS_GLOBAL: usize = 64;
 /// Per-sender cap on concurrent in-progress reassemblies.
 pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
-/// Default for [`crate::voice::AssemblerConfig::completion_memory`]:
-/// how long the receiver remembers that a given `(from, message_id)`
-/// already completed, so late chunks still rattling out of the sender's
-/// firmware queue (or arriving over a long retransmit tail) don't
-/// resurrect a phantom partial reassembly. Set comfortably above the
-/// realistic worst-case sender airtime — Long Slow on a near-MTU clip
-/// can take 2–3 minutes — so the blacklist outlives the actual TX.
-pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 /// Recently-completed blacklist max entries.
 pub const BLACKLIST_MAX: usize = 100;
 /// **Experimental (flood-control).** Heuristic safety valve, not a
