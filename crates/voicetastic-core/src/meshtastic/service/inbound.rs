@@ -30,6 +30,7 @@ impl MeshtasticService {
                 my_node_num: state.my_info.as_ref().map(|i| i.my_node_num),
                 our_private_key: state.our_private_key(),
                 nodes: &state.nodes,
+                pkc_seen: Some(&self.inner.pkc_seen),
             };
             decode_inbound(bytes, &ctx)?
         };

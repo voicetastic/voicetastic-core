@@ -205,6 +205,15 @@ struct Inner {
     /// [`MeshtasticService::disconnect`]. `None` means reconnect is not
     /// configured (e.g. caller used `connect_with_transport` directly).
     pub(super) reconnect_config: Mutex<Option<ReconnectConfig>>,
+    /// Dedup ring buffer for host-side PKC DM decryption. Stores the 64 most
+    /// recently decrypted `(from, packet_id)` pairs. Before decrypting a
+    /// rescued PKC DM the decoder checks this set; after a successful decrypt
+    /// it inserts the pair and evicts the oldest entry if needed. Guards
+    /// against firmware flood-retransmits causing the same plaintext DM to
+    /// be reported to the app multiple times. Kept separate from
+    /// `state` so it can be accessed from `try_pkc_decrypt` while
+    /// `state` is already locked.
+    pub(super) pkc_seen: parking_lot::Mutex<std::collections::VecDeque<(u32, u32)>>,
     /// Notified when the silence probe triggers a reconnect. A dedicated
     /// watcher task (spawned once in [`MeshtasticService::new`]) consumes this
     /// and calls [`MeshtasticService::connect_by_serial_baud`] so the reconnect
@@ -290,6 +299,7 @@ impl MeshtasticService {
             metadata_tx,
             reconnect_config: Mutex::new(None),
             reconnect_request: reconnect_request.clone(),
+            pkc_seen: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         });
         // Auto-reconnect watcher: notified by [`try_reconnect`] after the
         // inbound stream drops (transport tore down, silence-probe gave up,
