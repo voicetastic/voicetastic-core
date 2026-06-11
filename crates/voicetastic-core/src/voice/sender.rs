@@ -448,6 +448,15 @@ impl VoiceSender {
             .data_count(message_id)
             .unwrap_or(total_frames as u8);
         for (i, frame) in frames.into_iter().enumerate() {
+            // A give-up NACK arriving mid-burst removes the active entry and
+            // emits `GaveUp`. Stop enqueueing the rest of the burst rather
+            // than burning airtime the receiver explicitly asked us to stop
+            // (on slow presets the burst can run for minutes). The give-up
+            // handler already emitted the terminal status, so we just return.
+            if !self.active.lock().contains_key(&message_id) {
+                debug!(message_id, "voice: send cancelled mid-burst (give-up NACK)");
+                return;
+            }
             match self
                 .svc
                 .enqueue_voice_frame_with_id(frame, channel, to, want_ack, pacing)
@@ -514,13 +523,17 @@ impl VoiceSender {
             .await;
         }
 
-        // Check whether someone (a give_up NACK handler) already cleared
-        // us out. If so, the terminal status was emitted there.
-        let still_active = self.active.lock().contains_key(&message_id);
-        if still_active {
+        // Atomically claim the terminal status: whoever removes the active
+        // entry owns it. A give_up NACK handler running concurrently does the
+        // same `active.remove`, so exactly one of us emits a terminal status —
+        // this closes the check-then-act race that could emit both `GaveUp`
+        // and `Complete`. `registry.remove` is idempotent, so it is safe to
+        // call regardless of who claimed.
+        let claimed = self.active.lock().remove(&message_id).is_some();
+        if claimed {
             let _ = status_tx.send(SendStatus::Complete { message_id });
-            self.cleanup(message_id);
         }
+        self.registry.remove(message_id);
         // Prune expired outgoing entries to keep memory usage low.
         self.registry.prune_expired();
     }
@@ -597,6 +610,16 @@ impl VoiceSender {
 /// NACK frames addressed to one of our in-flight messages, and
 /// dispatches retransmits.
 ///
+/// A NACK is only trusted if it comes from the node we unicast to.
+///
+/// `to` is the destination of our send (`None` = broadcast). Broadcast
+/// sends are never NACKed by a conforming receiver, so any NACK against a
+/// broadcast send is dropped; for a unicast send only the destination node
+/// may NACK.
+fn nack_source_allowed(to: Option<u32>, nack_from: u32) -> bool {
+    matches!(to, Some(dest) if dest == nack_from)
+}
+
 /// Uses `Weak<VoiceSender>` so that dropping the last external sender
 /// clone terminates the task on the next message.
 async fn nack_listener_task(
@@ -647,6 +670,22 @@ async fn nack_listener_task(
         let Ok(nack) = parse_nack_body(&header, body) else {
             continue;
         };
+
+        // Only trust a NACK from the node we are unicasting to. Broadcast
+        // sends are never NACKed by a conforming receiver (the assembler
+        // suppresses broadcast NACKs), so any NACK against a broadcast send
+        // is forged or stale. Without this, any third node could observe an
+        // on-air message_id, compute the unkeyed header MAC, and forge a
+        // give-up NACK to cancel someone else's send (or drive retransmits).
+        if !nack_source_allowed(to, data.from) {
+            debug!(
+                message_id,
+                from = data.from,
+                ?to,
+                "voice: dropping NACK from untrusted source"
+            );
+            continue;
+        }
 
         if nack.give_up {
             info!(message_id = nack.message_id, "voice: receiver gave up");
@@ -1002,6 +1041,18 @@ mod tests {
             }
             .is_terminal()
         );
+    }
+
+    #[test]
+    fn nack_source_allowed_unicast_only_from_dest() {
+        assert!(nack_source_allowed(Some(7), 7));
+        assert!(!nack_source_allowed(Some(7), 8));
+    }
+
+    #[test]
+    fn nack_source_allowed_broadcast_rejects_all() {
+        assert!(!nack_source_allowed(None, 7));
+        assert!(!nack_source_allowed(None, 0));
     }
 
     #[test]
