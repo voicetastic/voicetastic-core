@@ -94,36 +94,8 @@ fn codec2_mode_from_byte(b: u8) -> Result<Codec2Mode, CodecError> {
 // AMR-NB helpers
 // ---------------------------------------------------------------------------
 
-const AMRNB_BYTES_PER_FRAME: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
-
-/// Total bytes (1-byte ToC + payload) for every AMR-NB frame type, indexed by
-/// the 4-bit frame type from the ToC byte. Types 0..=7 are the speech modes;
-/// type 8 is SID (comfort-noise, 5-byte payload); type 15 is NO_DATA (ToC
-/// only). Types 9..=14 are reserved with no defined size, so they're `None`
-/// and treated as undecodable. A DTX-enabled peer legitimately emits SID and
-/// NO_DATA frames (RFC 3267 / IF1), so the decoder must accept them rather
-/// than aborting the clip.
-const AMRNB_FRAME_BYTES: [Option<usize>; 16] = [
-    Some(13),
-    Some(14),
-    Some(16),
-    Some(18),
-    Some(20),
-    Some(21),
-    Some(27),
-    Some(32),
-    Some(6),
-    None,
-    None,
-    None,
-    None,
-    None,
-    None,
-    Some(1),
-];
-
 fn amrnb_validate_mode(b: u8) -> Result<i32, CodecError> {
-    if (b as usize) < AMRNB_BYTES_PER_FRAME.len() {
+    if b < 8 {
         Ok(b as i32)
     } else {
         Err(CodecError::Codec(format!("unknown amrnb mode index {b}")))
@@ -204,7 +176,9 @@ impl EncState {
             VoiceCodec::AmrNb => {
                 let mode = amrnb_validate_mode(codec_param)?;
                 let enc = AmrnbEncoder::new()?;
-                let bytes_per_frame = AMRNB_BYTES_PER_FRAME[mode as usize];
+                // mode is 0..7 (validated); all speech modes are Some(_).
+                let bytes_per_frame = super::frames::AMRNB_FRAME_BYTES[mode as usize]
+                    .expect("speech mode always has a defined frame size");
                 Ok(Self::AmrNb {
                     enc,
                     mode,
@@ -440,20 +414,16 @@ fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
     let mut dec = Decoder::new(SAMPLE_RATE_HZ, Channels::Mono)
         .map_err(|e| CodecError::Codec(e.to_string()))?;
     let mut pcm: Vec<i16> = Vec::new();
-    let mut i = 0;
     let mut frame = [0i16; OPUS_MAX_FRAME_SAMPLES];
-    while i + 2 <= payload.len() {
-        let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-        i += 2;
-        if i + len > payload.len() {
-            return Err(CodecError::Codec("truncated opus stream".into()));
-        }
-        let pkt = &payload[i..i + len];
-        i += len;
+    let mut packets = super::frames::OpusPackets::new(payload);
+    while let Some(pkt) = packets.next() {
         let n = dec
             .decode(pkt, &mut frame[..], false)
             .map_err(|e| CodecError::Codec(e.to_string()))?;
         pcm.extend_from_slice(&frame[..n]);
+    }
+    if packets.remaining() > 0 {
+        return Err(CodecError::Codec("truncated opus stream".into()));
     }
     Ok(pcm)
 }
@@ -491,29 +461,28 @@ fn decode_codec2(payload: &[u8], codec_param: u8) -> Result<Vec<i16>, CodecError
 fn decode_amrnb(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
     let dec = AmrnbDecoder::new()?;
     let mut pcm8k_i16: Vec<i16> = Vec::new();
-    let mut i = 0;
-    let mut frame = [0i16; AMRNB_SAMPLES_PER_FRAME];
-    while i < payload.len() {
-        let toc = payload[i];
-        // 4-bit frame type, so 0..=15 — always in bounds for the 16-entry table.
-        let mode = ((toc >> 3) & 0x0F) as usize;
-        let Some(size) = AMRNB_FRAME_BYTES[mode] else {
-            return Err(CodecError::Codec(format!(
-                "amrnb: unsupported ToC byte {toc:#x}"
-            )));
-        };
-        if i + size > payload.len() {
-            return Err(CodecError::Codec("amrnb: truncated frame".into()));
-        }
+    let mut out_frame = [0i16; AMRNB_SAMPLES_PER_FRAME];
+    let mut iter = super::frames::AmrnbFrames::new(payload);
+    while let Some(frame_bytes) = iter.next() {
         // The decoder reads the frame type from the ToC and produces one
         // 160-sample block for every type, including comfort noise for SID
         // and PLC/silence for NO_DATA, so feeding the frame as-is preserves
         // playback timing across DTX gaps.
         unsafe {
-            Decoder_Interface_Decode(dec.0, payload[i..].as_ptr(), frame.as_mut_ptr(), 0);
+            Decoder_Interface_Decode(dec.0, frame_bytes.as_ptr(), out_frame.as_mut_ptr(), 0);
         }
-        pcm8k_i16.extend_from_slice(&frame);
-        i += size;
+        pcm8k_i16.extend_from_slice(&out_frame);
+    }
+    if iter.remaining() > 0 {
+        let bad_pos = payload.len() - iter.remaining();
+        let toc = payload[bad_pos];
+        let mode = ((toc >> 3) & 0x0F) as usize;
+        if super::frames::AMRNB_FRAME_BYTES[mode].is_none() {
+            return Err(CodecError::Codec(format!(
+                "amrnb: unsupported ToC byte {toc:#x}"
+            )));
+        }
+        return Err(CodecError::Codec("amrnb: truncated frame".into()));
     }
     let pcm8k_f32: Vec<f32> = pcm8k_i16
         .into_iter()

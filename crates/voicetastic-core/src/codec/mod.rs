@@ -33,6 +33,8 @@
 //!   The actual encode/decode work goes through `libopencore-amrnb` over
 //!   raw FFI.
 
+pub(crate) mod frames;
+
 mod denoise;
 mod error;
 mod resampler;
@@ -127,49 +129,33 @@ fn codec2_frame_sizes(mode: u8) -> Option<(usize, usize)> {
     }
 }
 
-/// Total bytes (ToC + speech) per AMR-NB frame for each mode index `0..=7`.
-const AMRNB_BYTES_PER_FRAME_LOOKUP: [usize; 8] = [13, 14, 16, 18, 20, 21, 27, 32];
-
 /// Best-effort estimate of the wall-clock duration of an encoded payload,
 /// in milliseconds. Returns 0 for unknown codec parameters.
+///
+/// Opus duration is derived from the TOC byte of each packet (RFC 6716 §3.1)
+/// rather than assuming 20 ms per packet, so non-standard frame sizes are
+/// handled correctly. AMR-NB correctly counts SID and NO_DATA frames as 20 ms
+/// each (they produce one 160-sample block through the decoder).
 pub fn payload_duration_ms(payload: &[u8], codec: VoiceCodec, codec_param: u8) -> u32 {
     match codec {
         VoiceCodec::Opus => {
-            let mut i = 0;
-            let mut packets: u32 = 0;
-            while i + 2 <= payload.len() {
-                let len = u16::from_be_bytes([payload[i], payload[i + 1]]) as usize;
-                i += 2;
-                if i + len > payload.len() {
-                    break;
-                }
-                i += len;
-                packets += 1;
+            let mut total_samples: u64 = 0;
+            for pkt in frames::OpusPackets::new(payload) {
+                total_samples +=
+                    frames::opus_packet_samples_48k(pkt).unwrap_or(960) as u64;
             }
-            packets * 20
+            (total_samples / 48) as u32
         }
         VoiceCodec::Codec2 => {
             let Some((samples, bytes)) = codec2_frame_sizes(codec_param) else {
                 return 0;
             };
-            let frames = (payload.len() / bytes) as u32;
-            frames * (samples as u32) / 8
+            let frame_count = (payload.len() / bytes) as u32;
+            frame_count * (samples as u32) / 8
         }
         VoiceCodec::AmrNb => {
-            let mut i = 0;
-            let mut frames: u32 = 0;
-            while i < payload.len() {
-                let mode = ((payload[i] >> 3) & 0x0F) as usize;
-                let Some(&size) = AMRNB_BYTES_PER_FRAME_LOOKUP.get(mode) else {
-                    break;
-                };
-                if i + size > payload.len() {
-                    break;
-                }
-                i += size;
-                frames += 1;
-            }
-            frames * 20
+            // Each AMR-NB frame (speech, SID, or NO_DATA) covers 20 ms.
+            frames::AmrnbFrames::new(payload).count() as u32 * 20
         }
         _ => 0,
     }
