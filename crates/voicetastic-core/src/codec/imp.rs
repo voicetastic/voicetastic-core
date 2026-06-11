@@ -396,12 +396,46 @@ pub fn decode(
     codec_id: VoiceCodec,
     codec_param: u8,
 ) -> Result<Vec<i16>, CodecError> {
+    decode_with_gaps(payload, &[], codec_id, codec_param)
+}
+
+/// Decode a (possibly partial) payload, concealing the byte ranges in `gaps`
+/// (zero-padded missing chunks) instead of decoding the padding as audio.
+///
+/// `gaps` is the [`crate::voice::VoiceMessage::gaps`] list. When it is empty
+/// this is identical to [`decode`].
+///
+/// Concealment is per-codec:
+/// - **Codec2** emits true silence for frames overlapping a gap (fixed frame
+///   size ⇒ frame boundaries are deterministic regardless of the zero bytes).
+/// - **AMR-NB** feeds one NO_DATA frame per lost frame, so the decoder runs
+///   its packet-loss concealment and playback timing is preserved. Frame size
+///   comes from `codec_param` (the fixed encoder mode), not the zero bytes.
+/// - **Opus** is **deprecated** for this protocol (variable-rate, length-
+///   prefixed packets are too heavy and cannot be concealed by this fixed-
+///   frame scheme); `gaps` is ignored and the present packets are decoded
+///   best-effort. Callers should gate Opus partials off (`gaps.is_empty()`).
+pub fn decode_with_gaps(
+    payload: &[u8],
+    gaps: &[std::ops::Range<usize>],
+    codec_id: VoiceCodec,
+    codec_param: u8,
+) -> Result<Vec<i16>, CodecError> {
     match codec_id {
+        // Opus: deprecated; no fixed-frame concealment. Decode what arrived.
         VoiceCodec::Opus => decode_opus(payload),
-        VoiceCodec::Codec2 => decode_codec2(payload, codec_param),
-        VoiceCodec::AmrNb => decode_amrnb(payload),
+        VoiceCodec::Codec2 => decode_codec2(payload, codec_param, gaps),
+        VoiceCodec::AmrNb => decode_amrnb(payload, codec_param, gaps),
         other => Err(CodecError::UnsupportedCodec(other)),
     }
+}
+
+/// True if the `[start, start + len)` frame overlaps any gap range. A frame
+/// straddling a present/gap boundary counts as a gap (concealed), since part
+/// of its bytes are zero padding.
+fn frame_overlaps_gap(start: usize, len: usize, gaps: &[std::ops::Range<usize>]) -> bool {
+    let end = start + len;
+    gaps.iter().any(|g| start < g.end && g.start < end)
 }
 
 fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
@@ -428,7 +462,11 @@ fn decode_opus(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
     Ok(pcm)
 }
 
-fn decode_codec2(payload: &[u8], codec_param: u8) -> Result<Vec<i16>, CodecError> {
+fn decode_codec2(
+    payload: &[u8],
+    codec_param: u8,
+    gaps: &[std::ops::Range<usize>],
+) -> Result<Vec<i16>, CodecError> {
     let mode = codec2_mode_from_byte(codec_param)?;
     let mut c2 = Codec2::new(mode);
     let samples_per_frame = c2.samples_per_frame();
@@ -441,8 +479,13 @@ fn decode_codec2(payload: &[u8], codec_param: u8) -> Result<Vec<i16>, CodecError
     let mut frame = vec![0i16; samples_per_frame];
     let mut i = 0;
     while i + bytes_per_frame <= payload.len() {
-        c2.decode(&mut frame, &payload[i..i + bytes_per_frame]);
-        pcm8k_i16.extend_from_slice(&frame);
+        if frame_overlaps_gap(i, bytes_per_frame, gaps) {
+            // Missing chunk → true silence, one frame's worth, to keep timing.
+            pcm8k_i16.resize(pcm8k_i16.len() + samples_per_frame, 0);
+        } else {
+            c2.decode(&mut frame, &payload[i..i + bytes_per_frame]);
+            pcm8k_i16.extend_from_slice(&frame);
+        }
         i += bytes_per_frame;
     }
     let pcm8k_f32: Vec<f32> = pcm8k_i16
@@ -458,32 +501,68 @@ fn decode_codec2(payload: &[u8], codec_param: u8) -> Result<Vec<i16>, CodecError
         .collect())
 }
 
-fn decode_amrnb(payload: &[u8]) -> Result<Vec<i16>, CodecError> {
+/// NO_DATA octet (frame type 15, Q=1): one ToC byte, no payload. Fed to the
+/// decoder for each lost frame so it runs PLC and emits a 20 ms block.
+const AMRNB_NO_DATA_ARR: [u8; 1] = [0x7C];
+
+fn decode_amrnb(
+    payload: &[u8],
+    codec_param: u8,
+    gaps: &[std::ops::Range<usize>],
+) -> Result<Vec<i16>, CodecError> {
     let dec = AmrnbDecoder::new()?;
     let mut pcm8k_i16: Vec<i16> = Vec::new();
     let mut out_frame = [0i16; AMRNB_SAMPLES_PER_FRAME];
-    let mut iter = super::frames::AmrnbFrames::new(payload);
-    while let Some(frame_bytes) = iter.next() {
-        // The decoder reads the frame type from the ToC and produces one
-        // 160-sample block for every type, including comfort noise for SID
-        // and PLC/silence for NO_DATA, so feeding the frame as-is preserves
-        // playback timing across DTX gaps.
-        unsafe {
-            Decoder_Interface_Decode(dec.0, frame_bytes.as_ptr(), out_frame.as_mut_ptr(), 0);
+
+    if gaps.is_empty() {
+        // Complete payload: walk the self-describing IF1 stream as before.
+        let mut iter = super::frames::AmrnbFrames::new(payload);
+        while let Some(frame_bytes) = iter.next() {
+            // The decoder reads the frame type from the ToC and produces one
+            // 160-sample block for every type, including comfort noise for SID
+            // and PLC/silence for NO_DATA, so feeding the frame as-is preserves
+            // playback timing across DTX gaps.
+            unsafe {
+                Decoder_Interface_Decode(dec.0, frame_bytes.as_ptr(), out_frame.as_mut_ptr(), 0);
+            }
+            pcm8k_i16.extend_from_slice(&out_frame);
         }
-        pcm8k_i16.extend_from_slice(&out_frame);
-    }
-    if iter.remaining() > 0 {
-        let bad_pos = payload.len() - iter.remaining();
-        let toc = payload[bad_pos];
-        let mode = ((toc >> 3) & 0x0F) as usize;
-        if super::frames::AMRNB_FRAME_BYTES[mode].is_none() {
-            return Err(CodecError::Codec(format!(
-                "amrnb: unsupported ToC byte {toc:#x}"
-            )));
+        if iter.remaining() > 0 {
+            let bad_pos = payload.len() - iter.remaining();
+            let toc = payload[bad_pos];
+            let mode = ((toc >> 3) & 0x0F) as usize;
+            if super::frames::AMRNB_FRAME_BYTES[mode].is_none() {
+                return Err(CodecError::Codec(format!(
+                    "amrnb: unsupported ToC byte {toc:#x}"
+                )));
+            }
+            return Err(CodecError::Codec("amrnb: truncated frame".into()));
         }
-        return Err(CodecError::Codec("amrnb: truncated frame".into()));
+    } else {
+        // Partial payload: gap bytes are zeros and would be miswalked as
+        // mode-0 frames, losing frame sync past the first gap. Because the
+        // encoder runs a single fixed mode (DTX off), every frame is the same
+        // size, so frame boundaries are deterministic at multiples of
+        // `frame_bytes`. Step in fixed strides; feed real frames through and a
+        // NO_DATA frame for any frame overlapping a gap.
+        let mode = amrnb_validate_mode(codec_param)?;
+        let frame_bytes = super::frames::AMRNB_FRAME_BYTES[mode as usize]
+            .expect("validated speech mode always has a defined frame size");
+        let mut i = 0;
+        while i + frame_bytes <= payload.len() {
+            let ptr = if frame_overlaps_gap(i, frame_bytes, gaps) {
+                AMRNB_NO_DATA_ARR.as_ptr()
+            } else {
+                payload[i..].as_ptr()
+            };
+            unsafe {
+                Decoder_Interface_Decode(dec.0, ptr, out_frame.as_mut_ptr(), 0);
+            }
+            pcm8k_i16.extend_from_slice(&out_frame);
+            i += frame_bytes;
+        }
     }
+
     let pcm8k_f32: Vec<f32> = pcm8k_i16
         .into_iter()
         .map(|s| s as f32 / i16::MAX as f32)

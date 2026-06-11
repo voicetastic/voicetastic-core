@@ -43,6 +43,11 @@ pub(super) fn finalize(
     //   would then read garbage. Instead, emit the bytes we have without
     //   leading zero-padding and rely on `is_complete=false` to signal the
     //   caller that the message is partial.
+    // Byte ranges in `audio` that are zero-padding for missing chunks.
+    // Coalesced as we go: runs of adjacent missing chunks merge into one
+    // range. Only meaningful when chunk_size is known (the None branch can't
+    // place gaps deterministically, so it leaves this empty).
+    let mut gaps: Vec<std::ops::Range<usize>> = Vec::new();
     let audio = match state.chunk_size {
         Some(chunk_size) => {
             let mut audio = Vec::with_capacity(chunk_size * state.data_shards.len());
@@ -50,9 +55,15 @@ pub(super) fn finalize(
                 match slot {
                     Some(payload) => audio.extend_from_slice(payload),
                     None => {
-                        // Missing chunk → fill with zeros (codec-specific silence
-                        // is the responsibility of the decoder/playback layer).
-                        audio.resize(audio.len() + chunk_size, 0);
+                        // Missing chunk → fill with zeros (codec-specific
+                        // concealment is the playback layer's job, driven by
+                        // the `gaps` ranges recorded here).
+                        let start = audio.len();
+                        audio.resize(start + chunk_size, 0);
+                        match gaps.last_mut() {
+                            Some(last) if last.end == start => last.end = audio.len(),
+                            _ => gaps.push(start..audio.len()),
+                        }
                     }
                 }
             }
@@ -85,6 +96,7 @@ pub(super) fn finalize(
         codec: state.header_template.codec,
         codec_param: state.header_template.codec_param,
         audio,
+        gaps,
         timestamp: state.first_seen,
         is_complete: complete,
         total_data: state.header_template.total_data,
@@ -200,6 +212,7 @@ mod tests {
         assert_eq!(msg.total_data, 2);
         assert_eq!(msg.received_data, 2);
         assert_eq!(msg.codec, codec);
+        assert!(msg.gaps.is_empty(), "complete message has no gaps");
     }
 
     #[test]
@@ -244,6 +257,48 @@ mod tests {
         assert_eq!(
             msg.audio[chunk_size * 2..chunk_size * 2 + 32],
             vec![3u8; 32][..]
+        );
+        // The single missing middle shard is recorded as one gap range.
+        assert_eq!(msg.gaps, vec![chunk_size..chunk_size * 2]);
+    }
+
+    #[test]
+    fn finalize_coalesces_adjacent_missing_chunks() {
+        let chunk_size = 64;
+        let codec = super::super::super::types::VoiceCodec::AmrNb;
+        let destination = super::super::super::types::VoiceDestination::Broadcast;
+
+        let mut state = AssemblyState::new(
+            super::super::super::header::ChunkHeader {
+                packet_type: super::super::super::types::PacketType::Data,
+                last_in_stream: false,
+                message_id: 7,
+                codec,
+                codec_param: 5,
+                stream_seq: 0,
+                chunk_index: 0,
+                total_data: 4,
+                parity_count: 0,
+            },
+            Some(chunk_size),
+            destination,
+            0,
+        );
+
+        // present, missing, missing, present → one coalesced gap [64..192).
+        state.data_shards[0] = Some(vec![1u8; chunk_size]);
+        state.data_shards[1] = None;
+        state.data_shards[2] = None;
+        state.data_shards[3] = Some(vec![3u8; chunk_size]);
+        state.received_data = 2;
+
+        let key = (Arc::from("test_sender"), 7u32);
+        let msg = finalize("test_sender", &key, state, false);
+
+        assert_eq!(
+            msg.gaps,
+            vec![chunk_size..chunk_size * 3],
+            "adjacent missing chunks coalesce into one range"
         );
     }
 

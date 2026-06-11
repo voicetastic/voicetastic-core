@@ -13,7 +13,7 @@ use voicetastic_core::node::NodeId;
 use voicetastic_core::ports::{BROADCAST_ADDR, PRIVATE_APP};
 use voicetastic_core::settings::SettingsApi;
 use voicetastic_core::voice::{
-    AssemblyEvent, ModemPreset as VoiceModemPreset, PROTOCOL_VERSION, VoiceAssembler,
+    AssemblyEvent, ModemPreset as VoiceModemPreset, PROTOCOL_VERSION, VoiceAssembler, VoiceCodec,
     VoiceDestination, VoiceMessage, detect_version,
 };
 
@@ -565,12 +565,25 @@ fn push_voice_entry(s: &Arc<Mutex<SharedState>>, c: &egui::Context, msg: &VoiceM
             msg.audio.len()
         )
     };
-    let duration_ms = crate::audio::payload_duration_ms(&msg.audio, msg.codec, msg.codec_param);
-    let voice = if msg.is_complete && msg.codec.is_known() && !msg.audio.is_empty() {
+    let duration_ms = crate::audio::payload_duration_ms_with_gaps(
+        &msg.audio,
+        &msg.gaps,
+        msg.codec,
+        msg.codec_param,
+    );
+    // A partial message is playable when the codec supports gap concealment
+    // (fixed-frame Codec2 / AMR-NB). Opus is deprecated for this protocol and
+    // its variable-rate packets can't be concealed by the gap scheme, so Opus
+    // partials stay non-playable (label only) until a clip arrives complete.
+    let codec_conceals_gaps = matches!(msg.codec, VoiceCodec::Codec2 | VoiceCodec::AmrNb);
+    let playable =
+        msg.codec.is_known() && !msg.audio.is_empty() && (msg.is_complete || codec_conceals_gaps);
+    let voice = if playable {
         Some(VoicePayload {
             codec: msg.codec,
             codec_param: msg.codec_param,
             bytes: msg.audio.clone(),
+            gaps: msg.gaps.clone(),
             duration_ms,
         })
     } else {

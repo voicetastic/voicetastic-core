@@ -17,6 +17,10 @@ use crate::app::{PlaybackSource, VoicetasticApp};
 use crate::audio::{self, PlaybackHandle, RecordedClip, Recorder};
 use crate::state::{ChatEntry, DeliveryStatus, SharedState, VoicePayload};
 
+/// A queued request to play a chat-log voice entry: its log index, audio
+/// bytes, gap ranges (missing-chunk padding), codec, and codec parameter.
+type PlayRequest = (usize, Vec<u8>, Vec<std::ops::Range<usize>>, VoiceCodec, u8);
+
 /// Voice-message compose state machine driven by the Chat tab UI.
 ///
 /// Variants:
@@ -557,7 +561,7 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
         .max_height(ui.available_height() - 80.0)
         .show(ui, |ui| {
             let mut any = false;
-            let mut play_request: Option<(usize, Vec<u8>, VoiceCodec, u8)> = None;
+            let mut play_request: Option<PlayRequest> = None;
             let mut stop_request = false;
             for (idx, entry) in log.iter().enumerate() {
                 if entry_thread(entry, my_num) != Some(active) {
@@ -597,7 +601,13 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                                 stop_request = true;
                             }
                         } else if ui.small_button("▶ Play").clicked() {
-                            play_request = Some((idx, v.bytes.clone(), v.codec, v.codec_param));
+                            play_request = Some((
+                                idx,
+                                v.bytes.clone(),
+                                v.gaps.clone(),
+                                v.codec,
+                                v.codec_param,
+                            ));
                         }
                     }
                 });
@@ -611,10 +621,11 @@ pub fn show(app: &mut VoicetasticApp, ui: &mut egui::Ui) {
                 }
                 app.playback_source = None;
             }
-            if let Some((idx, bytes, codec, codec_param)) = play_request {
+            if let Some((idx, bytes, gaps, codec, codec_param)) = play_request {
                 start_playback(
                     app,
                     &bytes,
+                    &gaps,
                     codec,
                     codec_param,
                     PlaybackSource::LogEntry(idx),
@@ -753,6 +764,7 @@ fn resolve_destination(
 fn start_playback(
     app: &mut VoicetasticApp,
     bytes: &[u8],
+    gaps: &[std::ops::Range<usize>],
     codec: VoiceCodec,
     codec_param: u8,
     source: PlaybackSource,
@@ -761,7 +773,7 @@ fn start_playback(
     if let Some(h) = app.voice_playback.take() {
         h.stop();
     }
-    match audio::play_clip(bytes, codec, codec_param) {
+    match audio::play_clip(bytes, gaps, codec, codec_param) {
         Ok(handle) => {
             app.voice_playback = Some(handle);
             app.playback_source = Some(source);
@@ -934,9 +946,11 @@ fn render_preview(
     if play_clicked {
         let codec = clip.codec;
         let codec_param = clip.codec_param;
+        // Local recording preview: complete by construction, no gaps.
         start_playback(
             app,
             &clip.payload,
+            &[],
             codec,
             codec_param,
             PlaybackSource::Preview,
@@ -1077,6 +1091,8 @@ fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest
                             codec: clip_codec,
                             codec_param: clip_codec_param,
                             bytes: bytes.clone(),
+                            // Locally-recorded outgoing clip: always complete.
+                            gaps: Vec::new(),
                             duration_ms,
                         });
                     }

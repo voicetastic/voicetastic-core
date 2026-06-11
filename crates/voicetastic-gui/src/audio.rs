@@ -15,7 +15,9 @@ use voicetastic_core::codec::CodecError;
 use voicetastic_core::voice::VoiceCodec;
 
 /// Re-exported so existing import sites (`crate::audio::*`) keep working.
-pub use voicetastic_core::codec::{OpusBandwidth, RecordedClip, is_available, payload_duration_ms};
+pub use voicetastic_core::codec::{
+    OpusBandwidth, RecordedClip, is_available, payload_duration_ms_with_gaps,
+};
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -430,10 +432,11 @@ mod imp {
 
     pub fn play_clip(
         payload: &[u8],
+        gaps: &[std::ops::Range<usize>],
         codec_id: VoiceCodec,
         codec_param: u8,
     ) -> Result<PlaybackHandle, AudioError> {
-        let pcm_i16 = codec::decode(payload, codec_id, codec_param)?;
+        let pcm_i16 = codec::decode_with_gaps(payload, gaps, codec_id, codec_param)?;
         if pcm_i16.is_empty() {
             return Err(AudioError::Codec(CodecError::Empty));
         }
@@ -582,6 +585,7 @@ mod imp {
 
     pub fn play_clip(
         _payload: &[u8],
+        _gaps: &[std::ops::Range<usize>],
         _codec: VoiceCodec,
         _codec_param: u8,
     ) -> Result<PlaybackHandle, AudioError> {

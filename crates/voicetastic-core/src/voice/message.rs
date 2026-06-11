@@ -14,7 +14,17 @@ pub struct VoiceMessage {
     pub codec: VoiceCodec,
     pub codec_param: u8,
     /// Codec frame bytes (no container header). Caller wraps for playback.
+    ///
+    /// Missing chunks are zero-padded in place so byte offsets stay stable
+    /// for fixed-frame codecs; [`Self::gaps`] records which byte ranges are
+    /// that padding (rather than received audio).
     pub audio: Vec<u8>,
+    /// Byte ranges within [`Self::audio`] that correspond to missing chunks
+    /// (zero padding, not received audio). Always empty when `is_complete`
+    /// is true, or when `chunk_size` could not be pinned (see `finalize`).
+    /// Coalesced and sorted ascending. Consumers use this to conceal the
+    /// gaps on playback (silence / PLC) instead of decoding zero bytes.
+    pub gaps: Vec<std::ops::Range<usize>>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub is_complete: bool,
     pub total_data: u8,
