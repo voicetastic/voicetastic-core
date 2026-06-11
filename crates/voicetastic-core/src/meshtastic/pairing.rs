@@ -112,11 +112,15 @@ struct AgentGuard {
 
 impl Drop for AgentGuard {
     fn drop(&mut self) {
-        // Fire-and-forget unregister on a detached task. BlueZ will also
-        // GC on bus-owner disappearance, so this is a politeness, not a
-        // correctness requirement.
+        // Fire-and-forget unregister on a detached task. BlueZ also GCs
+        // on bus-owner disappearance, so this is a politeness, not a
+        // correctness requirement. Skip when no runtime is available
+        // (e.g. sync test teardown) so Drop never panics.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let conn = self.conn.clone();
-        tokio::spawn(async move {
+        handle.spawn(async move {
             if let Ok(proxy) = AgentManager1Proxy::new(&conn).await {
                 let path = OwnedObjectPath::try_from(AGENT_PATH).unwrap();
                 let _ = proxy.unregister_agent(&path).await;
