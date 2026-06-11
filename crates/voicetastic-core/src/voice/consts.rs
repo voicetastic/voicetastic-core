@@ -41,9 +41,13 @@ pub const MAX_IN_PROGRESS_PER_SENDER: usize = 4;
 pub const BLACKLIST_TTL: Duration = Duration::from_secs(600);
 /// Recently-completed blacklist max entries.
 pub const BLACKLIST_MAX: usize = 100;
-/// If no real data (data/parity chunks) arrive within this window the
-/// sender is presumed dead and NACKs are suppressed until the message
-/// timeout fires.
+/// **Experimental (flood-control).** Heuristic safety valve, not a
+/// wire-format value: tuned empirically and may change between releases
+/// without a protocol-version bump. If no real data (data/parity chunks)
+/// arrive within this window the sender is presumed dead and NACKs are
+/// suppressed until the message timeout fires, so the receiver stops
+/// flooding the channel with cap-multiplied NACKs aimed at a sender that
+/// has dropped off the mesh.
 pub const DEAD_SENDER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Maximum NACK rounds per message before the receiver gives up. Each

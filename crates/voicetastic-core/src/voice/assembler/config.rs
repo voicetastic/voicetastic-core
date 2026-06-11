@@ -5,10 +5,13 @@ use std::time::Duration;
 use super::super::consts::{DEAD_SENDER_TIMEOUT, NACK_MAX_ROUNDS, NACK_WINDOW_MS};
 use super::super::types::VoiceCodec;
 
-/// After this many post-template validation failures (codec / total_data /
-/// stream_seq mismatch) on the same in-progress entry, the entry is
-/// evicted and blacklisted. Keeps a chatty bad sender from holding a
-/// per-sender slot for the full message timeout.
+/// **Experimental (resource-bounding).** Heuristic safety valve, not a
+/// wire-format value: tuned empirically and may change between releases
+/// without a protocol-version bump. After this many post-template
+/// validation failures (codec / total_data / stream_seq mismatch) on the
+/// same in-progress entry, the entry is evicted and blacklisted. Keeps a
+/// chatty bad sender from holding a per-sender slot for the full message
+/// timeout.
 pub(super) const MAX_VALIDATION_STRIKES: u8 = 3;
 
 /// User-tunable assembler config.
