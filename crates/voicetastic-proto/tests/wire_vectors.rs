@@ -14,6 +14,7 @@
 //!     VT_UPDATE_VECTORS=1 cargo test -p voicetastic-proto --test wire_vectors
 //! then copy `wire_vectors.txt` to the firmware's vendored copy in the same PR.
 
+use reed_solomon_erasure::galois_8::ReedSolomon;
 use voicetastic_proto::builder::{BuildConfig, build_message};
 use voicetastic_proto::header::ChunkHeader;
 use voicetastic_proto::types::{PacketType, VoiceCodec};
@@ -133,6 +134,37 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         out.push((label, bytes));
     }
 
+    // --- raw Reed-Solomon parity (locks the FEC layer byte-for-byte) ---
+    // Encode a deterministic ramp split into shards, exactly as build_message
+    // does (zero-padded parity shards, then ReedSolomon::encode), and golden
+    // the resulting parity bytes. The firmware's rs::encode (vendored shard-RS
+    // over GF(2^8), generator alpha=2, poly 0x11d) must reproduce these - that
+    // is the scariest drift to catch, since a mismatch silently breaks FEC
+    // recovery across implementations.
+    let rs_cases: [(&str, usize, usize, usize); 2] = [
+        ("rs/2data-2parity-32", 2, 2, 32),
+        ("rs/4data-3parity-16", 4, 3, 16),
+    ];
+    for (label, data_n, parity_n, shard_sz) in rs_cases {
+        let mut shards: Vec<Vec<u8>> = (0..data_n)
+            .map(|s| {
+                (0..shard_sz)
+                    .map(|i| ((s * shard_sz + i) & 0xff) as u8)
+                    .collect()
+            })
+            .collect();
+        for _ in 0..parity_n {
+            shards.push(vec![0u8; shard_sz]);
+        }
+        let rs = ReedSolomon::new(data_n, parity_n).expect("ReedSolomon::new");
+        rs.encode(&mut shards).expect("rs encode");
+        let mut parity = Vec::new();
+        for p in &shards[data_n..] {
+            parity.extend_from_slice(p);
+        }
+        out.push((label, parity));
+    }
+
     out
 }
 
@@ -160,5 +192,27 @@ fn wire_vectors_match_golden() {
          If this change is INTENTIONAL, regenerate with:\n  \
          VT_UPDATE_VECTORS=1 cargo test -p voicetastic-proto --test wire_vectors\n\
          then sync tests/wire_vectors.txt to the firmware's vendored copy in the same PR.\n"
+    );
+}
+
+#[test]
+fn rs_parity_is_recoverable() {
+    // Confirms reed-solomon-erasure (default-features=false, as proto uses it)
+    // produces FUNCTIONAL parity: encode 2+2, drop a data shard, reconstruct.
+    use reed_solomon_erasure::galois_8::ReedSolomon;
+    let sz = 32usize;
+    let d0: Vec<u8> = (0..sz).map(|i| i as u8).collect();
+    let d1: Vec<u8> = (0..sz).map(|i| (sz + i) as u8).collect();
+    let mut shards: Vec<Vec<u8>> = vec![d0.clone(), d1.clone(), vec![0; sz], vec![0; sz]];
+    let rs = ReedSolomon::new(2, 2).unwrap();
+    rs.encode(&mut shards).unwrap();
+    // drop data shard 0
+    let mut opt: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+    opt[0] = None;
+    rs.reconstruct(&mut opt).unwrap();
+    assert_eq!(
+        opt[0].as_ref().unwrap(),
+        &d0,
+        "RS failed to recover dropped data shard"
     );
 }

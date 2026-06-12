@@ -24,3 +24,8 @@ thiserror = { version = "2", default-features = false }
 # default-features=false drops the `std`/`parking_lot` path so RS is no_std.
 reed-solomon-erasure = { version = "6.0", default-features = false }
 getrandom = { version = "0.4.2", optional = true }
+
+[dev-dependencies]
+# tests/wire_vectors.rs goldens raw RS parity with the same encoder
+# build_message uses, so the firmware's rs::encode can be locked to it.
+reed-solomon-erasure = { version = "6.0", default-features = false }
