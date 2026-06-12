@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/voicetastic-proto",
     "crates/voicetastic-core",
     "crates/voicetastic-cli",
     "crates/voicetastic-gui",

@@ -1,11 +1,11 @@
 //! 16-byte chunk header parse/serialize: 12 logical bytes + 4-byte trailing MAC.
 
-use super::consts::{
+use crate::consts::{
     HEADER_MAC_LEN, HEADER_SIZE, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE, PROTOCOL_VERSION,
 };
-use super::error::{Result, VoiceError};
-use super::mac;
-use super::types::{PacketType, VoiceCodec};
+use crate::error::{Result, VoiceError};
+use crate::mac;
+use crate::types::{PacketType, VoiceCodec};
 
 /// Parsed view of a chunk header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +44,7 @@ impl ChunkHeader {
 
     /// Serialise to a fixed [`HEADER_SIZE`]-byte buffer, computing the
     /// trailing 4-byte SHA-256 integrity tag.
-    pub(crate) fn serialize(&self) -> [u8; HEADER_SIZE] {
+    pub fn serialize(&self) -> [u8; HEADER_SIZE] {
         let mut out = [0u8; HEADER_SIZE];
         self.write_logical(&mut out);
         let tag = mac::compute_tag(&out[..HEADER_SIZE - HEADER_MAC_LEN]);
@@ -160,7 +160,7 @@ impl ChunkHeader {
 
 #[cfg(test)]
 mod tests {
-    use super::super::consts::HEADER_SIZE;
+    use crate::consts::HEADER_SIZE;
     use super::*;
 
     fn sample_header() -> ChunkHeader {
@@ -233,3 +233,4 @@ mod tests {
         assert!(matches!(ChunkHeader::parse(&buf), Err(VoiceError::BadMac)));
     }
 }
+

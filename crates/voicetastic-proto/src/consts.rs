@@ -1,17 +1,17 @@
 //! Protocol-wide constants. See the [Voice-Protocol wiki page](https://github.com/voicetastic/voicetastic-core/wiki/Voice-Protocol) Appendix A.
 
-use std::time::Duration;
+use core::time::Duration;
 
 /// On-wire version byte. v3 removes the envelope encryption layer
 /// (confidentiality now relies on Meshtastic channel encryption) and the
 /// keyed-MAC variant of the trailing header tag. The 4-byte tag is
-/// always SHA-256 truncated — see [`super::mac`].
+/// always SHA-256 truncated — see [`crate::mac`].
 pub const PROTOCOL_VERSION: u8 = 0x03;
 /// Fixed header length preceding every frame: 12 logical bytes +
 /// [`HEADER_MAC_LEN`]-byte integrity tag.
 pub const HEADER_SIZE: usize = 16;
 /// Width of the trailing header MAC tag — unkeyed SHA-256 truncated.
-/// See [`super::mac`].
+/// See [`crate::mac`].
 pub const HEADER_MAC_LEN: usize = 4;
 /// Maximum total frame size (header + body) — Meshtastic LoRa MTU.
 pub const MAX_PACKET_SIZE: usize = 231;

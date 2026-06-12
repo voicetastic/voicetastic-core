@@ -1,0 +1,26 @@
+[package]
+name = "voicetastic-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "no_std wire-protocol core (header/MAC, chunker, Reed-Solomon FEC) shared by all Voicetastic clients."
+
+[features]
+# `host-rng` provides `random_message_id()` via getrandom. On by default so std
+# clients (and `cargo test`) are unchanged; bare-metal firmware builds with
+# `default-features = false` and injects the message id from the host RNG.
+default = ["host-rng"]
+host-rng = ["dep:getrandom"]
+
+[dependencies]
+# Pinned directly (not workspace-inherited): proto needs the no_std / no-default
+# variants, and cargo forbids overriding an inherited dep's default-features.
+# Versions kept in lockstep with the workspace pins.
+sha2 = { version = "0.11.0", default-features = false }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "alloc"] }
+thiserror = { version = "2", default-features = false }
+# default-features=false drops the `std`/`parking_lot` path so RS is no_std.
+reed-solomon-erasure = { version = "6.0", default-features = false }
+getrandom = { version = "0.4.2", optional = true }

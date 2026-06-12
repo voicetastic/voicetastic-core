@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 
-use super::consts::MIN_CHUNK_SIZE;
-use super::types::VoiceCodec;
+use crate::consts::MIN_CHUNK_SIZE;
+use crate::types::VoiceCodec;
 
 /// Errors raised by the voice protocol layer.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -65,4 +65,6 @@ pub enum VoiceError {
 }
 
 /// Convenience alias for voice protocol results.
-pub type Result<T> = std::result::Result<T, VoiceError>;
+pub type Result<T> = core::result::Result<T, VoiceError>;
+
+use alloc::string::String;
