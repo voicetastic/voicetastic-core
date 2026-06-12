@@ -1,15 +1,10 @@
 //! C ABI bridge: voicetastic-proto -> ESP32 firmware (PlatformIO).
 //!
-//! Cross-compiled for `xtensa-esp32s3-none-elf` (`-Zbuild-std=core,alloc`) and
-//! linked into the Arduino-ESP32 firmware as a static archive. On the
-//! bare-metal target this crate provides the global allocator (firmware libc
-//! heap) and a panic handler; on a std host they gate out so
-//! `cargo build`/`clippy --workspace` work. The FFI surface is identical.
-//!
-//! The self-test is split into three calls (alloc / header+MAC / chunk+FEC) so
-//! the firmware can `LOG_INFO` between them on the visible (USB-CDC) console -
-//! the last log before a crash localizes any fault, without relying on
-//! `esp_rom_printf` (which targets UART0, not the USB console).
+//! no_std on `xtensa-esp32s3-none-elf` (`-Zbuild-std=core,alloc`); provides a
+//! global allocator (firmware libc heap) + panic handler there, gated out on a
+//! std host. Self-test is split into FFI stages the firmware logs between, so
+//! the last visible line localizes any fault. Panics route to the firmware's
+//! `vt_host_log` (visible USB-CDC console), not `esp_rom_printf` (UART0).
 #![cfg_attr(target_os = "none", no_std)]
 
 extern crate alloc;
@@ -19,13 +14,14 @@ use core::ffi::{c_char, c_int};
 #[cfg(target_os = "none")]
 mod embedded_rt {
     use core::alloc::{GlobalAlloc, Layout};
-    use core::ffi::{c_char, c_int, c_void};
+    use core::ffi::{c_char, c_void};
 
     unsafe extern "C" {
         fn malloc(size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
-        fn esp_rom_printf(fmt: *const c_char, ...) -> c_int;
         fn abort() -> !;
+        // Provided by the firmware; routes to the visible LOG console.
+        fn vt_host_log(msg: *const c_char);
     }
 
     struct FirmwareHeap;
@@ -48,7 +44,7 @@ mod embedded_rt {
     #[panic_handler]
     fn panic(_info: &core::panic::PanicInfo) -> ! {
         unsafe {
-            esp_rom_printf(c"\n[vt-core] RUST PANIC in voicetastic-proto\n".as_ptr());
+            vt_host_log(c"RUST PANIC in voicetastic-proto".as_ptr());
             abort()
         }
     }
@@ -60,8 +56,7 @@ pub extern "C" fn vt_core_version() -> *const c_char {
     concat!("voicetastic-proto ", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
 }
 
-/// Stage 1: the global allocator alone. Allocates + writes a small `Vec`,
-/// returns its length (1) on success, -1 otherwise.
+/// Stage 1: global allocator alone. Returns 1 on success, -1 otherwise.
 #[unsafe(no_mangle)]
 pub extern "C" fn vt_alloc_smoke() -> c_int {
     let mut v = alloc::vec::Vec::<u8>::with_capacity(32);
@@ -73,8 +68,7 @@ pub extern "C" fn vt_alloc_smoke() -> c_int {
     }
 }
 
-/// Stage 2: header + MAC round-trip (sha2; ~no heap, no Reed-Solomon).
-/// Returns 0 on success, -1 on mismatch/parse failure.
+/// Stage 2: header + MAC round-trip (sha2). Returns 0 on success, -1 on fail.
 #[unsafe(no_mangle)]
 pub extern "C" fn vt_header_smoke() -> c_int {
     use voicetastic_proto::header::ChunkHeader;
@@ -98,24 +92,37 @@ pub extern "C" fn vt_header_smoke() -> c_int {
     }
 }
 
-/// Stage 3: chunk + Reed-Solomon encode via the shared protocol. Returns the
-/// frame count (> 0) on success, -1 on error.
-#[unsafe(no_mangle)]
-pub extern "C" fn vt_proto_selftest() -> c_int {
-    use voicetastic_proto::builder::{BuildConfig, build_message};
+// Shared chunker config; only `parity_count` differs between the two stages.
+fn build_cfg(parity_count: u8) -> voicetastic_proto::builder::BuildConfig {
     use voicetastic_proto::types::VoiceCodec;
-
-    let audio = [0u8; 64];
-    let cfg = BuildConfig {
+    voicetastic_proto::builder::BuildConfig {
         message_id: 0xDEAD_BEEF,
         stream_seq: 7,
         codec: VoiceCodec::Codec2,
         codec_param: 5,
         chunk_size: 32,
-        parity_count: 2,
+        parity_count,
         last_in_stream: true,
-    };
-    match build_message(&audio, &cfg) {
+    }
+}
+
+/// Stage 3a: chunker + framing, NO Reed-Solomon (parity_count = 0).
+/// Returns the frame count (expect 2 data frames), -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn vt_chunk_smoke() -> c_int {
+    let audio = [0u8; 64];
+    match voicetastic_proto::builder::build_message(&audio, &build_cfg(0)) {
+        Ok(enc) => enc.frames.len() as c_int,
+        Err(_) => -1,
+    }
+}
+
+/// Stage 3b: chunker + Reed-Solomon (parity_count = 2). Returns frame count
+/// (expect 4 = 2 data + 2 parity), -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn vt_proto_selftest() -> c_int {
+    let audio = [0u8; 64];
+    match voicetastic_proto::builder::build_message(&audio, &build_cfg(2)) {
         Ok(enc) => enc.frames.len() as c_int,
         Err(_) => -1,
     }
