@@ -18,21 +18,29 @@ use core::ffi::{c_char, c_int};
 #[cfg(target_os = "none")]
 mod embedded_rt {
     use core::alloc::{GlobalAlloc, Layout};
-    use core::ffi::c_void;
+    use core::ffi::{c_char, c_int, c_void};
 
     unsafe extern "C" {
-        fn memalign(align: usize, size: usize) -> *mut c_void;
+        fn malloc(size: usize) -> *mut c_void;
         fn free(ptr: *mut c_void);
+        fn esp_rom_printf(fmt: *const c_char, ...) -> c_int;
+        fn abort() -> !;
     }
 
     struct FirmwareHeap;
 
     unsafe impl GlobalAlloc for FirmwareHeap {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            // memalign needs a power-of-two align >= sizeof(void*); Layout
-            // guarantees power-of-two. Allocations here are small.
-            let align = layout.align().max(core::mem::size_of::<usize>());
-            unsafe { memalign(align, layout.size()) as *mut u8 }
+            // ESP-IDF overrides malloc/free to use its heap, which returns
+            // 8-byte-aligned blocks (MALLOC_CAP_8BIT). proto only allocates
+            // <=8-aligned types (Vec<u8>, small structs), so malloc is correct.
+            // We deliberately avoid memalign: ESP-IDF does not always route it
+            // through its heap, so it can fall through to a newlib/_sbrk stub
+            // and fault - which bootloops the device on the first allocation.
+            if layout.align() > 8 {
+                return core::ptr::null_mut();
+            }
+            unsafe { malloc(layout.size()) as *mut u8 }
         }
         unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
             unsafe { free(ptr as *mut c_void) }
@@ -42,9 +50,14 @@ mod embedded_rt {
     #[global_allocator]
     static HEAP: FirmwareHeap = FirmwareHeap;
 
+    // Report instead of looping silently: print a marker over the ROM UART and
+    // abort (ESP-IDF then prints a backtrace + resets) so a panic is visible.
     #[panic_handler]
     fn panic(_info: &core::panic::PanicInfo) -> ! {
-        loop {}
+        unsafe {
+            esp_rom_printf(c"\n[vt-core] RUST PANIC in voicetastic-proto\n".as_ptr());
+            abort();
+        }
     }
 }
 
