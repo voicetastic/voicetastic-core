@@ -1,35 +1,80 @@
-//! Minimal C ABI bridge: voicetastic-core -> ESP32 firmware (PlatformIO).
+//! C ABI bridge: voicetastic-proto -> ESP32 firmware (PlatformIO).
 //!
-//! Slice 1 of the "firmware builds on core" migration: prove the toolchain
-//! (Xtensa cross-compile + static link + FFI call) end to end before moving
-//! any protocol logic across. Two entry points: a version string and a Codec2
-//! smoke test that forces core's pure-Rust codec2 path to compile + link.
-//!
-//! The surface intentionally stays tiny here. Once the link is proven on
-//! hardware it grows to the sans-IO protocol behind the same ABI:
-//! `decode_inbound`, `VoiceAssembler` (reassembly + NACK tick),
-//! `OutgoingVoiceRegistry` (retransmit), the chunker/FEC, and the codec -
-//! the same logic the web and Android drivers already consume.
+//! Cross-compiled for `xtensa-esp32s3-none-elf` (`-Zbuild-std=core,alloc`) and
+//! linked into the Arduino-ESP32 firmware as a static archive. On the
+//! bare-metal target the firmware's C/C++ runtime owns neither a Rust
+//! allocator nor a panic handler, so this crate provides both (allocator
+//! backed by the firmware libc heap via `memalign`/`free`). On a std host
+//! (so `cargo build`/`clippy --workspace` work) those are gated out and the
+//! crate uses std's - the FFI surface compiles identically either way.
+#![cfg_attr(target_os = "none", no_std)]
+
+extern crate alloc;
 
 use core::ffi::{c_char, c_int};
 
-/// Static, NUL-terminated build identifier. Never null; valid for the whole
-/// program lifetime. Lets the firmware log-confirm the core bridge linked.
-#[unsafe(no_mangle)]
-pub extern "C" fn vt_core_version() -> *const c_char {
-    concat!("voicetastic-core-bridge ", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+// Bare-metal runtime: global allocator (firmware heap) + panic handler.
+// Only on `target_os = "none"`; on a std host these come from std.
+#[cfg(target_os = "none")]
+mod embedded_rt {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+
+    unsafe extern "C" {
+        fn memalign(align: usize, size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+    }
+
+    struct FirmwareHeap;
+
+    unsafe impl GlobalAlloc for FirmwareHeap {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // memalign needs a power-of-two align >= sizeof(void*); Layout
+            // guarantees power-of-two. Allocations here are small.
+            let align = layout.align().max(core::mem::size_of::<usize>());
+            unsafe { memalign(align, layout.size()) as *mut u8 }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+            unsafe { free(ptr as *mut c_void) }
+        }
+    }
+
+    #[global_allocator]
+    static HEAP: FirmwareHeap = FirmwareHeap;
+
+    #[panic_handler]
+    fn panic(_info: &core::panic::PanicInfo) -> ! {
+        loop {}
+    }
 }
 
-/// Smoke test that core's Codec2 encoder links + runs through the bridge:
-/// encodes one 40 ms frame of 8 kHz silence at `codec_param` and returns the
-/// encoded byte count (> 0 on success, -1 on error). This forces the `codec2`
-/// feature to compile + link for the target, not just the trivial string path.
+/// Static NUL-terminated build identifier; never null.
 #[unsafe(no_mangle)]
-pub extern "C" fn vt_codec2_smoke(codec_param: u8) -> c_int {
-    // 320 samples = 40 ms @ 8 kHz: at least one Codec2 frame for any mode.
-    let pcm = [0.0f32; 320];
-    match voicetastic_core::codec::codec2_encode(&pcm, 8_000, codec_param) {
-        Ok(bytes) => bytes.len() as c_int,
+pub extern "C" fn vt_core_version() -> *const c_char {
+    concat!("voicetastic-proto ", env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+}
+
+/// End-to-end self-test of the shared wire protocol on-device: chunk a small
+/// buffer with FEC parity via `voicetastic_proto::build_message`, exercising
+/// the chunker, header + MAC, Reed-Solomon encode, and the global allocator.
+/// Returns the number of frames produced (> 0) on success, -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn vt_proto_selftest() -> c_int {
+    use voicetastic_proto::builder::{BuildConfig, build_message};
+    use voicetastic_proto::types::VoiceCodec;
+
+    let audio = [0u8; 64];
+    let cfg = BuildConfig {
+        message_id: 0xDEAD_BEEF, // host injects the real id; fixed here for the test
+        stream_seq: 7,
+        codec: VoiceCodec::Codec2,
+        codec_param: 5,
+        chunk_size: 32,
+        parity_count: 2,
+        last_in_stream: true,
+    };
+    match build_message(&audio, &cfg) {
+        Ok(enc) => enc.frames.len() as c_int,
         Err(_) => -1,
     }
 }

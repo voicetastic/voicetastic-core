@@ -1,14 +1,11 @@
 /*
- * C ABI for voicetastic-esp32-bridge (a static archive built from
- * voicetastic-core). Include from the firmware C++ and link the
- * libvoicetastic_esp32_bridge.a produced by:
+ * C ABI for voicetastic-esp32-bridge (a no_std static archive built from
+ * voicetastic-proto). Link the libvoicetastic_esp32_bridge.a produced by:
  *
  *   cargo build --release -p voicetastic-esp32-bridge \
- *       --target xtensa-esp32s3-espidf
+ *       -Z build-std=core,alloc --target xtensa-esp32s3-none-elf
  *
- * Slice 1 surface only (toolchain proof). Grows to the sans-IO protocol once
- * the link is verified on hardware. Hand-maintained for now; switch to a
- * cbindgen-generated header when the surface expands.
+ * The firmware must provide `memalign` and `free` (newlib/esp-idf do).
  */
 #ifndef VOICETASTIC_CORE_H
 #define VOICETASTIC_CORE_H
@@ -21,11 +18,10 @@ extern "C" {
 const char *vt_core_version(void);
 
 /*
- * Encode one 40 ms frame of 8 kHz silence at `codec_param` via core's Codec2.
- * Returns the encoded byte count (> 0) on success, -1 on error. Smoke test
- * that the codec2 path linked.
+ * Self-test of the shared wire protocol: chunk + FEC-encode a small buffer via
+ * voicetastic-proto. Returns the frame count (> 0) on success, -1 on error.
  */
-int vt_codec2_smoke(unsigned char codec_param);
+int vt_proto_selftest(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

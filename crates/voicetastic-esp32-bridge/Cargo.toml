@@ -5,16 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "C ABI bridge exposing voicetastic-core to the ESP32 firmware (PlatformIO / Arduino-ESP32)."
+description = "no_std C ABI bridge exposing voicetastic-proto to the ESP32 firmware (PlatformIO / Arduino-ESP32)."
 
 [lib]
-# Static archive (.a) for the firmware linker. Slice 1 proves cross-compile +
-# static link + FFI call end to end; the surface grows to the full sans-IO
-# protocol once the toolchain is proven on hardware.
+# Static archive (.a) cross-compiled for xtensa-esp32s3-none-elf
+# (-Zbuild-std=core,alloc) and linked into the Arduino-ESP32 firmware.
 crate-type = ["staticlib"]
 
 [dependencies]
-# Pure-Rust subset only: no Opus (C/CMake, won't cross-compile, same blocker as
-# wasm), no tokio service (the firmware owns the Meshtastic radio + audio I/O).
-# codec2 is pure Rust and embeds fine.
-voicetastic-core = { path = "../voicetastic-core", default-features = false, features = ["codec2"] }
+# no_std wire protocol only. default-features=false drops host-rng/getrandom
+# (the firmware injects the message id). No codec2/denoiser here - those stay
+# the firmware's C libraries.
+voicetastic-proto = { path = "../voicetastic-proto", default-features = false }
