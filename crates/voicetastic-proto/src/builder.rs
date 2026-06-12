@@ -401,4 +401,3 @@ mod tests {
         assert_eq!(msg.frames.len(), 256);
     }
 }
-
