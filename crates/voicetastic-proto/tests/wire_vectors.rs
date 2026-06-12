@@ -84,7 +84,7 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
     // Concatenate all frames so the vector covers chunk boundaries, padding,
     // and parity layout. Audio is a deterministic ramp.
     let ramp: Vec<u8> = (0..200u32).map(|i| (i & 0xff) as u8).collect();
-    let msg_cases: [(&str, &[u8], BuildConfig); 3] = [
+    let msg_cases: [(&str, &[u8], BuildConfig); 4] = [
         (
             "msg/64b-chunk32-fec0",
             &ramp[..64],
@@ -122,6 +122,24 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
                 chunk_size: 48,
                 parity_count: 3,
                 last_in_stream: false,
+            },
+        ),
+        // Preset-aligned: matches the firmware's buildOutbound() for the
+        // VERY_LONG_SLOW preset (chunk_size 48) on 100 B of audio. total_data
+        // = ceil(100/48) = 3, parity = defaultParityCount(3) = 3/5 -> min 1.
+        // The firmware reproduces these exact frames (chunker + RS + per-shard
+        // framing with the final DATA chunk trimmed to 4 real bytes).
+        (
+            "msg/vls-100b-chunk48-fec1",
+            &ramp[..100],
+            BuildConfig {
+                message_id: 0xCAFE_0001,
+                stream_seq: 3,
+                codec: VoiceCodec::Codec2,
+                codec_param: 5,
+                chunk_size: 48,
+                parity_count: 1,
+                last_in_stream: true,
             },
         ),
     ];
