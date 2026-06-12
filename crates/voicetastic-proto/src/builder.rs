@@ -1,5 +1,7 @@
 //! Sender-side message chunker / Reed-Solomon encoder / framer.
 
+use alloc::{string::ToString, vec::Vec};
+
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
 use crate::consts::{
@@ -400,4 +402,3 @@ mod tests {
     }
 }
 
-use alloc::{string::ToString, vec::Vec};
