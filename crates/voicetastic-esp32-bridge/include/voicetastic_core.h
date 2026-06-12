@@ -1,11 +1,6 @@
 /*
- * C ABI for voicetastic-esp32-bridge (a no_std static archive built from
- * voicetastic-proto). Link the libvoicetastic_esp32_bridge.a produced by:
- *
- *   cargo build --release -p voicetastic-esp32-bridge \
- *       -Z build-std=core,alloc --target xtensa-esp32s3-none-elf
- *
- * The firmware must provide `memalign` and `free` (newlib/esp-idf do).
+ * C ABI for voicetastic-esp32-bridge (no_std static archive over
+ * voicetastic-proto). The firmware provides `malloc`/`free` (newlib/esp-idf).
  */
 #ifndef VOICETASTIC_CORE_H
 #define VOICETASTIC_CORE_H
@@ -17,11 +12,10 @@ extern "C" {
 /* Static NUL-terminated build identifier; never NULL. */
 const char *vt_core_version(void);
 
-/*
- * Self-test of the shared wire protocol: chunk + FEC-encode a small buffer via
- * voicetastic-proto. Returns the frame count (> 0) on success, -1 on error.
- */
-int vt_proto_selftest(void);
+/* Staged self-test (log between each to localize faults on the USB console). */
+int vt_alloc_smoke(void);    /* global allocator: Vec alloc+write -> len (1), or -1 */
+int vt_header_smoke(void);   /* header + MAC round-trip -> 0 ok, -1 fail */
+int vt_proto_selftest(void); /* chunk + Reed-Solomon -> frame count (>0), or -1 */
 
 #ifdef __cplusplus
 } /* extern "C" */
