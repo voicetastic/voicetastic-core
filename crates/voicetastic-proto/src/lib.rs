@@ -17,9 +17,9 @@
 #[macro_use]
 extern crate alloc;
 
-pub mod consts;
-pub mod types;
-pub mod error;
-pub mod mac;
-pub mod header;
 pub mod builder;
+pub mod consts;
+pub mod error;
+pub mod header;
+pub mod mac;
+pub mod types;

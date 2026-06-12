@@ -132,4 +132,3 @@ impl ModemPreset {
         Duration::from_millis(500)
     }
 }
-

@@ -160,8 +160,8 @@ impl ChunkHeader {
 
 #[cfg(test)]
 mod tests {
-    use crate::consts::HEADER_SIZE;
     use super::*;
+    use crate::consts::HEADER_SIZE;
 
     fn sample_header() -> ChunkHeader {
         ChunkHeader {
@@ -233,4 +233,3 @@ mod tests {
         assert!(matches!(ChunkHeader::parse(&buf), Err(VoiceError::BadMac)));
     }
 }
-
