@@ -6,7 +6,6 @@ members = [
     "crates/voicetastic-cli",
     "crates/voicetastic-gui",
     "crates/voicetastic-android-bridge",
-    "crates/voicetastic-esp32-bridge",
     "crates/voicetastic-tokens",
 ]
 
