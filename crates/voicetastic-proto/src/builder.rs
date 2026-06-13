@@ -1,14 +1,16 @@
 //! Sender-side message chunker / Reed-Solomon encoder / framer.
 
+use alloc::{string::ToString, vec::Vec};
+
 use reed_solomon_erasure::galois_8::ReedSolomon;
 
-use super::consts::{
+use crate::consts::{
     HEADER_SIZE, MAX_BODY_SIZE, MAX_CHUNKS_PER_MESSAGE, MAX_PACKET_SIZE, MAX_PARITY_PER_MESSAGE,
     MAX_TOTAL_SHARDS, MIN_CHUNK_SIZE,
 };
-use super::error::{Result, VoiceError};
-use super::header::ChunkHeader;
-use super::types::{PacketType, VoiceCodec};
+use crate::error::{Result, VoiceError};
+use crate::header::ChunkHeader;
+use crate::types::{PacketType, VoiceCodec};
 
 /// Configuration for [`build_message`].
 #[derive(Debug, Clone)]
@@ -39,6 +41,7 @@ pub struct EncodedMessage {
 /// that want a panic-on-failure semantics can `.expect()` the result; the
 /// fallible signature exists so sandboxed / seccomp'd hosts surface a
 /// clean error instead of aborting the process.
+#[cfg(feature = "host-rng")]
 pub fn random_message_id() -> Result<u32> {
     let mut buf = [0u8; 4];
     getrandom::fill(&mut buf).map_err(|e| VoiceError::Rng(e.to_string()))?;

@@ -18,11 +18,11 @@
 
 use sha2::{Digest, Sha256};
 
-use super::consts::{HEADER_MAC_LEN, HEADER_SIZE};
-use super::error::{Result, VoiceError};
+use crate::consts::{HEADER_MAC_LEN, HEADER_SIZE};
+use crate::error::{Result, VoiceError};
 
 /// Compute the 4-byte trailing MAC over the first 12 bytes of a header.
-pub(crate) fn compute_tag(header_no_mac: &[u8]) -> [u8; HEADER_MAC_LEN] {
+pub fn compute_tag(header_no_mac: &[u8]) -> [u8; HEADER_MAC_LEN] {
     let mut out = [0u8; HEADER_MAC_LEN];
     let mut h = Sha256::new();
     h.update(header_no_mac);
@@ -34,7 +34,7 @@ pub(crate) fn compute_tag(header_no_mac: &[u8]) -> [u8; HEADER_MAC_LEN] {
 /// mismatch.
 ///
 /// `header_with_mac` MUST be exactly [`HEADER_SIZE`] bytes; the caller
-/// has already validated this in [`super::ChunkHeader::parse`].
+/// has already validated this in [`crate::ChunkHeader::parse`].
 pub(crate) fn verify(header_with_mac: &[u8]) -> Result<()> {
     debug_assert_eq!(header_with_mac.len(), HEADER_SIZE);
     let expected = compute_tag(&header_with_mac[..HEADER_SIZE - HEADER_MAC_LEN]);

@@ -4425,18 +4425,12 @@ dependencies = [
  "toml 1.1.2+spec-1.1.0",
  "tracing",
  "uuid",
+ "voicetastic-proto",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
  "x25519-dalek",
  "zbus",
-]
-
-[[package]]
-name = "voicetastic-esp32-bridge"
-version = "0.0.0-git"
-dependencies = [
- "voicetastic-core",
 ]
 
 [[package]]
@@ -4454,6 +4448,17 @@ dependencies = [
  "tracing-subscriber",
  "voicetastic-core",
  "voicetastic-tokens",
+]
+
+[[package]]
+name = "voicetastic-proto"
+version = "0.0.0-git"
+dependencies = [
+ "getrandom 0.4.2",
+ "reed-solomon-erasure",
+ "serde",
+ "sha2",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

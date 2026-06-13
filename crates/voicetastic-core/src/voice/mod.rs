@@ -32,11 +32,11 @@
 #![allow(clippy::result_large_err)]
 
 pub mod assembler;
-pub mod builder;
-pub mod consts;
-pub mod error;
-pub mod header;
-pub mod mac;
+// Wire protocol (header/MAC, chunker + FEC, consts, errors) now lives in the
+// no_std `voicetastic-proto` crate so it can also run on firmware. Re-exported
+// here so existing `crate::voice::{builder,consts,error,header,mac}` paths and
+// downstream clients are unchanged - one implementation, many drivers.
+pub use voicetastic_proto::{builder, consts, error, header, mac};
 pub mod message;
 pub mod nack;
 pub mod outgoing;

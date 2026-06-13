@@ -8,6 +8,9 @@ repository.workspace = true
 description = "Shared core library for voicetastic-desktop: BLE transport, Meshtastic protobuf I/O, voice protocol."
 
 [dependencies]
+# Shared no_std wire protocol (header/MAC, chunker, FEC). Re-exported under
+# `crate::voice::*`; host-rng gives std clients `random_message_id()`.
+voicetastic-proto = { path = "../voicetastic-proto", features = ["host-rng"] }
 futures = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
