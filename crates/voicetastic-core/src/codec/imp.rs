@@ -587,7 +587,9 @@ mod tests {
     fn tone_48k(secs: f32) -> Vec<f32> {
         let n = (SAMPLE_RATE_HZ as f32 * secs) as usize;
         (0..n)
-            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE_HZ as f32).sin() * 0.3)
+            .map(|i| {
+                (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE_HZ as f32).sin() * 0.3
+            })
             .collect()
     }
 
@@ -663,8 +665,9 @@ mod tests {
         let payload = encode(VoiceCodec::Codec2, 5, &tone_48k(1.0));
         let full = decode(&payload, VoiceCodec::Codec2, 5).expect("decode full");
         // Conceal frame index 1 (bytes 6..12 for the 6-byte mode-5 frame).
-        let gapped =
-            decode_with_gaps(&payload, &[6..12], VoiceCodec::Codec2, 5).expect("decode gapped");
+        let gap = 6..12;
+        let gapped = decode_with_gaps(&payload, std::slice::from_ref(&gap), VoiceCodec::Codec2, 5)
+            .expect("decode gapped");
         assert_eq!(full.len(), gapped.len(), "gap must not alter the timeline");
     }
 
@@ -673,10 +676,19 @@ mod tests {
         let mode = AMRNB_MR122;
         let fb = super::super::frames::AMRNB_FRAME_BYTES[mode as usize].unwrap();
         let payload = encode(VoiceCodec::AmrNb, mode, &tone_48k(1.0));
-        assert!(payload.len() >= 2 * fb, "need at least two frames for the gap test");
+        assert!(
+            payload.len() >= 2 * fb,
+            "need at least two frames for the gap test"
+        );
         let full = decode(&payload, VoiceCodec::AmrNb, mode).expect("decode full");
-        let gapped =
-            decode_with_gaps(&payload, &[fb..2 * fb], VoiceCodec::AmrNb, mode).expect("decode gapped");
+        let gap = fb..2 * fb;
+        let gapped = decode_with_gaps(
+            &payload,
+            std::slice::from_ref(&gap),
+            VoiceCodec::AmrNb,
+            mode,
+        )
+        .expect("decode gapped");
         assert_eq!(full.len(), gapped.len(), "gap must not alter the timeline");
     }
 
@@ -684,14 +696,15 @@ mod tests {
 
     #[test]
     fn frame_overlaps_gap_boundaries() {
-        let gaps = [10..20];
+        let gap = 10..20;
+        let gaps = std::slice::from_ref(&gap);
         // Disjoint before / after.
-        assert!(!frame_overlaps_gap(0, 10, &gaps)); // [0,10) touches but doesn't cross 10
-        assert!(!frame_overlaps_gap(20, 10, &gaps)); // [20,30) starts at gap end
+        assert!(!frame_overlaps_gap(0, 10, gaps)); // [0,10) touches but doesn't cross 10
+        assert!(!frame_overlaps_gap(20, 10, gaps)); // [20,30) starts at gap end
         // Straddling either boundary counts as overlap (partial zero padding).
-        assert!(frame_overlaps_gap(5, 10, &gaps)); // [5,15)
-        assert!(frame_overlaps_gap(15, 10, &gaps)); // [15,25)
-        assert!(frame_overlaps_gap(12, 4, &gaps)); // fully inside
+        assert!(frame_overlaps_gap(5, 10, gaps)); // [5,15)
+        assert!(frame_overlaps_gap(15, 10, gaps)); // [15,25)
+        assert!(frame_overlaps_gap(12, 4, gaps)); // fully inside
         // No gaps => never an overlap.
         assert!(!frame_overlaps_gap(0, 100, &[]));
     }
