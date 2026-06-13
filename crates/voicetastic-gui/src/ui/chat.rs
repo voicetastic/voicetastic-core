@@ -980,7 +980,7 @@ fn render_preview(
 
 fn spawn_send_voice(app: &VoicetasticApp, clip: RecordedClip, channel: u32, dest: Option<u32>) {
     // Pick chunk_size + pacing from the live modem preset. Sending at
-    // MAX_BODY_SIZE (219 B) on slow presets like LongFast/LongModerate
+    // MAX_BODY_SIZE (215 B) on slow presets like LongFast/LongModerate
     // pushes each frame's airtime past 1 s, so a fixed 500 ms pacing
     // overruns the firmware queue and most chunks are dropped before they
     // ever hit the air. The recommended pairing comes from the Voice-Protocol
