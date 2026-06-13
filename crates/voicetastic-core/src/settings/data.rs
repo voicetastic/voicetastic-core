@@ -376,3 +376,241 @@ pub(super) fn config_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config/voicetastic/config.toml"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A settings value with every field populated to a non-default.
+    fn fully_populated() -> AppSettings {
+        AppSettings {
+            last_device: Some("AA:BB:CC:DD:EE:FF".into()),
+            max_voice_duration_secs: Some(45),
+            reassembly_timeout_secs: Some(600),
+            voice_codec: Some(VOICE_CODEC_CODEC2.into()),
+            voice_codec2_mode: Some(CODEC2_MODE_2400),
+            voice_amrnb_mode: Some(AMRNB_MODE_795),
+            voice_opus_bitrate_kbps: Some(10),
+            voice_opus_bandwidth: Some(OPUS_BANDWIDTH_NARROW.into()),
+            voice_denoise_enabled: Some(true),
+            voice_partial_play_on_timeout: Some(false),
+            voice_fec_mode: Some(VOICE_FEC_MODE_HEAVY.into()),
+            voice_nack_mode: Some(VOICE_NACK_MODE_AGGRESSIVE.into()),
+            theme_mode: Some(THEME_MODE_LIGHT.into()),
+            theme_contrast: Some(THEME_CONTRAST_HIGH.into()),
+        }
+    }
+
+    // --- TOML round trip ---
+
+    #[test]
+    fn toml_roundtrip_is_stable() {
+        let original = fully_populated();
+        let serialized = toml::to_string(&original).expect("serialize");
+        let parsed: AppSettings = toml::from_str(&serialized).expect("deserialize");
+        // AppSettings has no PartialEq; re-serializing the parsed value must
+        // reproduce the same TOML byte-for-byte (a fixed-point check).
+        assert_eq!(serialized, toml::to_string(&parsed).expect("reserialize"));
+    }
+
+    #[test]
+    fn default_serializes_to_empty_toml() {
+        // Every field is `Option` with `skip_serializing_if = is_none`, so a
+        // default value must produce an empty document (nothing on disk until
+        // the user changes something).
+        let s = toml::to_string(&AppSettings::default()).expect("serialize");
+        assert!(s.trim().is_empty(), "expected empty TOML, got: {s:?}");
+    }
+
+    #[test]
+    fn empty_toml_yields_defaults() {
+        let s: AppSettings = toml::from_str("").expect("deserialize empty");
+        assert_eq!(s.voice_max_secs(), DEFAULT_VOICE_MAX_SECS);
+        assert_eq!(s.reassembly_timeout_secs(), DEFAULT_REASSEMBLY_TIMEOUT_SECS);
+        assert_eq!(s.voice_codec(), DEFAULT_VOICE_CODEC);
+        assert_eq!(s.voice_codec2_mode(), DEFAULT_CODEC2_MODE);
+        assert_eq!(s.voice_amrnb_mode(), DEFAULT_AMRNB_MODE);
+        assert_eq!(s.voice_opus_bitrate_kbps(), DEFAULT_OPUS_BITRATE_KBPS);
+        assert_eq!(s.voice_opus_bandwidth(), DEFAULT_OPUS_BANDWIDTH);
+        assert_eq!(s.voice_denoise_enabled(), DEFAULT_VOICE_DENOISE_ENABLED);
+        assert_eq!(
+            s.voice_partial_play_on_timeout(),
+            DEFAULT_VOICE_PARTIAL_PLAY_ON_TIMEOUT
+        );
+        assert_eq!(s.voice_fec_mode(), DEFAULT_VOICE_FEC_MODE);
+        assert_eq!(s.voice_nack_mode(), DEFAULT_VOICE_NACK_MODE);
+        assert_eq!(s.theme_mode(), DEFAULT_THEME_MODE);
+        assert_eq!(s.theme_contrast(), DEFAULT_THEME_CONTRAST);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        // Forward compatibility: a config written by a newer build with extra
+        // keys must still load (serde ignores unknown fields by default).
+        let s: AppSettings =
+            toml::from_str("last_device = \"x\"\nfuture_setting = 42\n").expect("deserialize");
+        assert_eq!(s.last_device.as_deref(), Some("x"));
+        assert_eq!(s.voice_codec(), DEFAULT_VOICE_CODEC);
+    }
+
+    #[test]
+    fn partial_toml_fills_the_rest_with_defaults() {
+        let s: AppSettings = toml::from_str("voice_codec = \"opus\"\n").expect("deserialize");
+        assert_eq!(s.voice_codec(), VOICE_CODEC_OPUS);
+        assert_eq!(s.voice_amrnb_mode(), DEFAULT_AMRNB_MODE);
+    }
+
+    // --- clamping / validation accessors ---
+
+    #[test]
+    fn voice_max_secs_is_clamped() {
+        assert_eq!(
+            AppSettings {
+                max_voice_duration_secs: Some(0),
+                ..Default::default()
+            }
+            .voice_max_secs(),
+            1,
+            "zero clamps up to 1"
+        );
+        assert_eq!(
+            AppSettings {
+                max_voice_duration_secs: Some(10_000),
+                ..Default::default()
+            }
+            .voice_max_secs(),
+            VOICE_MAX_SECS_UPPER
+        );
+    }
+
+    #[test]
+    fn reassembly_timeout_is_clamped() {
+        assert_eq!(
+            AppSettings {
+                reassembly_timeout_secs: Some(1),
+                ..Default::default()
+            }
+            .reassembly_timeout_secs(),
+            REASSEMBLY_TIMEOUT_LOWER_SECS
+        );
+        assert_eq!(
+            AppSettings {
+                reassembly_timeout_secs: Some(u32::MAX),
+                ..Default::default()
+            }
+            .reassembly_timeout_secs(),
+            REASSEMBLY_TIMEOUT_UPPER_SECS
+        );
+    }
+
+    #[test]
+    fn out_of_range_codec_modes_fall_back_to_default() {
+        assert_eq!(
+            AppSettings {
+                voice_codec2_mode: Some(99),
+                ..Default::default()
+            }
+            .voice_codec2_mode(),
+            DEFAULT_CODEC2_MODE
+        );
+        assert_eq!(
+            AppSettings {
+                voice_amrnb_mode: Some(99),
+                ..Default::default()
+            }
+            .voice_amrnb_mode(),
+            DEFAULT_AMRNB_MODE
+        );
+    }
+
+    #[test]
+    fn opus_bitrate_is_clamped_both_ends() {
+        assert_eq!(
+            AppSettings {
+                voice_opus_bitrate_kbps: Some(1),
+                ..Default::default()
+            }
+            .voice_opus_bitrate_kbps(),
+            OPUS_BITRATE_KBPS_MIN
+        );
+        assert_eq!(
+            AppSettings {
+                voice_opus_bitrate_kbps: Some(255),
+                ..Default::default()
+            }
+            .voice_opus_bitrate_kbps(),
+            OPUS_BITRATE_KBPS_MAX
+        );
+    }
+
+    #[test]
+    fn unknown_string_ids_fall_back_to_defaults() {
+        let bogus = |f: fn(&AppSettings) -> &'static str, set: AppSettings, want: &str| {
+            assert_eq!(f(&set), want);
+        };
+        bogus(
+            AppSettings::voice_codec,
+            AppSettings {
+                voice_codec: Some("garbage".into()),
+                ..Default::default()
+            },
+            DEFAULT_VOICE_CODEC,
+        );
+        bogus(
+            AppSettings::voice_opus_bandwidth,
+            AppSettings {
+                voice_opus_bandwidth: Some("ultrawide".into()),
+                ..Default::default()
+            },
+            DEFAULT_OPUS_BANDWIDTH,
+        );
+        bogus(
+            AppSettings::voice_fec_mode,
+            AppSettings {
+                voice_fec_mode: Some("turbo".into()),
+                ..Default::default()
+            },
+            DEFAULT_VOICE_FEC_MODE,
+        );
+        bogus(
+            AppSettings::voice_nack_mode,
+            AppSettings {
+                voice_nack_mode: Some("turbo".into()),
+                ..Default::default()
+            },
+            DEFAULT_VOICE_NACK_MODE,
+        );
+        bogus(
+            AppSettings::theme_mode,
+            AppSettings {
+                theme_mode: Some("sepia".into()),
+                ..Default::default()
+            },
+            DEFAULT_THEME_MODE,
+        );
+        bogus(
+            AppSettings::theme_contrast,
+            AppSettings {
+                theme_contrast: Some("medium".into()),
+                ..Default::default()
+            },
+            DEFAULT_THEME_CONTRAST,
+        );
+    }
+
+    // --- config_path resolution ---
+
+    #[test]
+    fn config_path_prefers_xdg_then_home() {
+        // We can't safely mutate process env in parallel tests, so just assert
+        // the function yields a path ending in the expected suffix under
+        // whatever env the runner provides (one of the two must be set in CI).
+        if let Some(p) = config_path() {
+            assert!(
+                p.ends_with("voicetastic/config.toml"),
+                "unexpected config path: {}",
+                p.display()
+            );
+        }
+    }
+}
