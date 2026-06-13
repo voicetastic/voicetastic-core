@@ -115,7 +115,7 @@ impl ModemPreset {
     /// Recommended `chunk_size` per modem preset (see spec §4).
     pub fn recommended_chunk_size(self) -> usize {
         match self {
-            Self::ShortTurbo | Self::ShortFast => MAX_BODY_SIZE, // 219
+            Self::ShortTurbo | Self::ShortFast => MAX_BODY_SIZE, // 215
             Self::ShortSlow | Self::MediumFast => 160,
             Self::MediumSlow => 96,
             // 199 = MAX_BODY_SIZE - GCM_NONCE_LEN - GCM_TAG_LEN, the
