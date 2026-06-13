@@ -577,3 +577,122 @@ fn decode_amrnb(
         .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One second of a 440 Hz tone at 48 kHz mono, the rate the streaming
+    /// `Encoder` expects on its input.
+    fn tone_48k(secs: f32) -> Vec<f32> {
+        let n = (SAMPLE_RATE_HZ as f32 * secs) as usize;
+        (0..n)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE_HZ as f32).sin() * 0.3)
+            .collect()
+    }
+
+    /// Push a whole clip through a fresh encoder and finish it.
+    fn encode(codec: VoiceCodec, param: u8, pcm: &[f32]) -> Vec<u8> {
+        let mut enc = Encoder::new(codec, param, OpusBandwidth::Wide).expect("encoder");
+        enc.push(pcm).expect("push");
+        enc.finish().expect("finish")
+    }
+
+    // --- round trips: encode -> non-empty payload -> decode -> ~1 s of audio ---
+
+    #[test]
+    fn codec2_roundtrip_is_plausible() {
+        let pcm = tone_48k(1.0);
+        let payload = encode(VoiceCodec::Codec2, 5, &pcm);
+        assert!(!payload.is_empty());
+        // Mode 5 packs 6 bytes per frame; raw concatenation, no framing.
+        assert_eq!(payload.len() % 6, 0, "payload must be whole 6-byte frames");
+
+        let out = decode(&payload, VoiceCodec::Codec2, 5).expect("decode");
+        // Decoded back up to 48 kHz; should be within ~10% of the 1 s input.
+        let len = out.len() as f32 / SAMPLE_RATE_HZ as f32;
+        assert!((0.85..=1.15).contains(&len), "decoded {len} s, want ~1 s");
+    }
+
+    /// AMR-NB MR122 (12.2 kbps), the highest-rate speech mode.
+    const AMRNB_MR122: u8 = 7;
+
+    #[test]
+    fn amrnb_roundtrip_is_plausible() {
+        let pcm = tone_48k(1.0);
+        let payload = encode(VoiceCodec::AmrNb, AMRNB_MR122, &pcm);
+        assert!(!payload.is_empty());
+
+        let out = decode(&payload, VoiceCodec::AmrNb, AMRNB_MR122).expect("decode");
+        let len = out.len() as f32 / SAMPLE_RATE_HZ as f32;
+        assert!((0.85..=1.15).contains(&len), "decoded {len} s, want ~1 s");
+    }
+
+    #[test]
+    fn opus_roundtrip_is_plausible() {
+        let pcm = tone_48k(1.0);
+        // codec_param 0 => default bitrate.
+        let payload = encode(VoiceCodec::Opus, 0, &pcm);
+        assert!(!payload.is_empty());
+        let out = decode(&payload, VoiceCodec::Opus, 0).expect("decode");
+        let len = out.len() as f32 / SAMPLE_RATE_HZ as f32;
+        assert!((0.85..=1.15).contains(&len), "decoded {len} s, want ~1 s");
+    }
+
+    // --- error paths ---
+
+    #[test]
+    fn unknown_codec2_mode_rejected() {
+        assert!(Encoder::new(VoiceCodec::Codec2, 9, OpusBandwidth::Wide).is_err());
+        assert!(decode(&[0u8; 6], VoiceCodec::Codec2, 9).is_err());
+    }
+
+    #[test]
+    fn unknown_amrnb_mode_rejected() {
+        assert!(Encoder::new(VoiceCodec::AmrNb, 8, OpusBandwidth::Wide).is_err());
+    }
+
+    // --- gap concealment preserves the timeline ---
+    //
+    // A frame-aligned gap must NOT change the decoded sample count: the
+    // missing frame is concealed (Codec2 silence / AMR-NB PLC) but still
+    // occupies its 20/40 ms slot, so playback timing is preserved.
+
+    #[test]
+    fn codec2_gap_preserves_frame_count() {
+        let payload = encode(VoiceCodec::Codec2, 5, &tone_48k(1.0));
+        let full = decode(&payload, VoiceCodec::Codec2, 5).expect("decode full");
+        // Conceal frame index 1 (bytes 6..12 for the 6-byte mode-5 frame).
+        let gapped =
+            decode_with_gaps(&payload, &[6..12], VoiceCodec::Codec2, 5).expect("decode gapped");
+        assert_eq!(full.len(), gapped.len(), "gap must not alter the timeline");
+    }
+
+    #[test]
+    fn amrnb_gap_preserves_frame_count() {
+        let mode = AMRNB_MR122;
+        let fb = super::super::frames::AMRNB_FRAME_BYTES[mode as usize].unwrap();
+        let payload = encode(VoiceCodec::AmrNb, mode, &tone_48k(1.0));
+        assert!(payload.len() >= 2 * fb, "need at least two frames for the gap test");
+        let full = decode(&payload, VoiceCodec::AmrNb, mode).expect("decode full");
+        let gapped =
+            decode_with_gaps(&payload, &[fb..2 * fb], VoiceCodec::AmrNb, mode).expect("decode gapped");
+        assert_eq!(full.len(), gapped.len(), "gap must not alter the timeline");
+    }
+
+    // --- frame_overlaps_gap boundary logic ---
+
+    #[test]
+    fn frame_overlaps_gap_boundaries() {
+        let gaps = [10..20];
+        // Disjoint before / after.
+        assert!(!frame_overlaps_gap(0, 10, &gaps)); // [0,10) touches but doesn't cross 10
+        assert!(!frame_overlaps_gap(20, 10, &gaps)); // [20,30) starts at gap end
+        // Straddling either boundary counts as overlap (partial zero padding).
+        assert!(frame_overlaps_gap(5, 10, &gaps)); // [5,15)
+        assert!(frame_overlaps_gap(15, 10, &gaps)); // [15,25)
+        assert!(frame_overlaps_gap(12, 4, &gaps)); // fully inside
+        // No gaps => never an overlap.
+        assert!(!frame_overlaps_gap(0, 100, &[]));
+    }
+}

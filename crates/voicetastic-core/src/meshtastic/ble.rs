@@ -47,6 +47,31 @@ pub const POST_CONNECT_DELAY: Duration = Duration::from_millis(500);
 /// reader tolerance in `serial.rs`.
 const MAX_CONSECUTIVE_DRAIN_ERRORS: usize = 5;
 
+/// Usable single-write body size for a given negotiated ATT MTU.
+///
+/// Subtracts the 3-byte ATT header (1 opcode + 2 handle) and floors the MTU
+/// at the 23-byte BLE default — an unnegotiated link reports 23, yielding a
+/// safe 20-byte body. The Meshtastic firmware does not implement GATT Long
+/// Write, so anything past this is silently dropped; never report more.
+fn tx_payload_limit(mtu: u16) -> usize {
+    const BLE_DEFAULT_MTU: u16 = 23;
+    usize::from(mtu.max(BLE_DEFAULT_MTU)).saturating_sub(3)
+}
+
+/// Pick the GATT write flavour from the characteristic's declared properties.
+///
+/// Real firmware advertises only plain `WRITE` (= WriteWithResponse) on
+/// `TORADIO`; using WithoutResponse there makes BlueZ accept the call locally
+/// but never deliver an op the radio recognises, so its inactivity timer tears
+/// the link down. Match whichever flag the firmware exposes.
+fn write_type_for(props: btleplug::api::CharPropFlags) -> WriteType {
+    if props.contains(btleplug::api::CharPropFlags::WRITE) {
+        WriteType::WithResponse
+    } else {
+        WriteType::WithoutResponse
+    }
+}
+
 /// A peripheral discovered during scanning.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDevice {
@@ -456,15 +481,7 @@ impl Connection {
             });
         }
         let _g = self.write_lock.lock().await;
-        let kind = if self
-            .to_radio
-            .properties
-            .contains(btleplug::api::CharPropFlags::WRITE)
-        {
-            WriteType::WithResponse
-        } else {
-            WriteType::WithoutResponse
-        };
+        let kind = write_type_for(self.to_radio.properties);
         debug!(addr = %self.peripheral.address(), len = bytes.len(), ?kind, "TORADIO write begin");
         let res = timeout(
             WRITE_TIMEOUT,
@@ -630,8 +647,70 @@ impl crate::Transport for Connection {
         // that yields a safe 20-byte body for a send that fires before
         // negotiation completes, instead of optimistically assuming a
         // 255-byte link that may never materialize on a low-MTU peer.
-        const BLE_DEFAULT_MTU: u16 = 23;
-        let mtu = self.peripheral.mtu().max(BLE_DEFAULT_MTU);
-        usize::from(mtu).saturating_sub(3)
+        tx_payload_limit(self.peripheral.mtu())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btleplug::api::CharPropFlags;
+
+    #[test]
+    fn tx_payload_limit_floors_at_ble_default() {
+        // Unnegotiated / sub-default MTUs are floored at 23 => 20-byte body.
+        assert_eq!(tx_payload_limit(0), 20);
+        assert_eq!(tx_payload_limit(23), 20);
+        // Negotiated MTUs subtract the 3-byte ATT header.
+        assert_eq!(tx_payload_limit(247), 244);
+        assert_eq!(tx_payload_limit(512), 509);
+        assert_eq!(tx_payload_limit(u16::MAX), 65_532);
+    }
+
+    #[test]
+    fn write_type_prefers_with_response_when_write_is_advertised() {
+        assert!(matches!(
+            write_type_for(CharPropFlags::WRITE),
+            WriteType::WithResponse
+        ));
+        // WRITE present alongside other flags still wins.
+        assert!(matches!(
+            write_type_for(CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE),
+            WriteType::WithResponse
+        ));
+    }
+
+    #[test]
+    fn write_type_falls_back_to_without_response() {
+        assert!(matches!(
+            write_type_for(CharPropFlags::WRITE_WITHOUT_RESPONSE),
+            WriteType::WithoutResponse
+        ));
+        assert!(matches!(
+            write_type_for(CharPropFlags::empty()),
+            WriteType::WithoutResponse
+        ));
+    }
+
+    #[test]
+    fn gatt_uuids_match_the_meshtastic_protocol() {
+        // Guards against an accidental edit to the u128 grouping: assert the
+        // canonical hyphenated form of each well-known Meshtastic UUID.
+        assert_eq!(
+            SERVICE_UUID.to_string(),
+            "6ba1b218-15a8-461f-9fa8-5dcae273eafd"
+        );
+        assert_eq!(
+            TORADIO_UUID.to_string(),
+            "f75c76d2-129e-4dad-a1dd-7866124401e7"
+        );
+        assert_eq!(
+            FROMRADIO_UUID.to_string(),
+            "2c55e69e-4993-11ed-b878-0242ac120002"
+        );
+        assert_eq!(
+            FROMNUM_UUID.to_string(),
+            "ed9da18c-a800-4f66-a670-aa7547e34453"
+        );
     }
 }
